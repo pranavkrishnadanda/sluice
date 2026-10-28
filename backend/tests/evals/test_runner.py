@@ -247,7 +247,7 @@ LOCK = {
 def test_render_results_tables_and_footer() -> None:
     md = render_results([_summary()], LOCK)
     assert "| System | Split | n | Trials | Cell accuracy | Fabrication | Row recall |" in md
-    assert "| rules | dev | 2 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 84.2] |"  # exact 0/2 in md
+    assert "| rules | dev | 2 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 84.2] |" in md  # exact 0/2
     assert "| rules | dev | hard | 1 | — | — | — | — | — |" in md
     assert "abc123" in md
     assert "duckdb 2.0.0" in md and "polars 2.1.0" in md
