@@ -41,6 +41,7 @@ describe("reduceRunEvents", () => {
       type: "node_started",
       nodeId: "n1",
       attempt: 1,
+      maxAttempts: 3,
     };
     const once = reduceAll([started, plan, third]);
     const twice = reduceRunEvents(once, third);
@@ -56,7 +57,14 @@ describe("reduceRunEvents", () => {
     const s1 = reduceAll([
       started,
       plan,
-      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+      {
+        seq: 3,
+        at: AT,
+        type: "node_started",
+        nodeId: "n1",
+        attempt: 1,
+        maxAttempts: 3,
+      },
     ]);
     expect(s1?.nodes[0]).toMatchObject({ status: "running", attempt: 1 });
 
@@ -84,6 +92,7 @@ describe("reduceRunEvents", () => {
       type: "node_started",
       nodeId: "n1",
       attempt: 2,
+      maxAttempts: 3,
     });
     expect(s3.nodes[0]).toMatchObject({
       status: "retrying",
@@ -121,7 +130,14 @@ describe("reduceRunEvents", () => {
     const s1 = reduceAll([
       started,
       plan,
-      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+      {
+        seq: 3,
+        at: AT,
+        type: "node_started",
+        nodeId: "n1",
+        attempt: 1,
+        maxAttempts: 3,
+      },
     ]);
     expect(s1?.nodes[0]?.attemptsReported).toBe(0);
     const s2 = reduceRunEvents(s1, {
@@ -142,6 +158,7 @@ describe("reduceRunEvents", () => {
       type: "node_started",
       nodeId: "n1",
       attempt: 2,
+      maxAttempts: 3,
     });
     expect(s3.nodes[0]?.attemptsReported).toBe(1);
     const s4 = reduceRunEvents(s3, {
@@ -163,7 +180,14 @@ describe("reduceRunEvents", () => {
     const s = reduceAll([
       started,
       plan,
-      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+      {
+        seq: 3,
+        at: AT,
+        type: "node_started",
+        nodeId: "n1",
+        attempt: 1,
+        maxAttempts: 3,
+      },
       {
         seq: 4,
         at: AT,
@@ -181,7 +205,14 @@ describe("reduceRunEvents", () => {
 
     const done = reduceAll([
       ...[started, plan],
-      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+      {
+        seq: 3,
+        at: AT,
+        type: "node_started",
+        nodeId: "n1",
+        attempt: 1,
+        maxAttempts: 3,
+      },
       {
         seq: 4,
         at: AT,
@@ -193,7 +224,14 @@ describe("reduceRunEvents", () => {
         tokens: 1480,
         costUsd: 0.0011,
       },
-      { seq: 5, at: AT, type: "node_started", nodeId: "n1", attempt: 2 },
+      {
+        seq: 5,
+        at: AT,
+        type: "node_started",
+        nodeId: "n1",
+        attempt: 2,
+        maxAttempts: 3,
+      },
       {
         seq: 6,
         at: AT,
@@ -217,7 +255,14 @@ describe("reduceRunEvents", () => {
     const s = reduceAll([
       started,
       plan,
-      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 3 },
+      {
+        seq: 3,
+        at: AT,
+        type: "node_started",
+        nodeId: "n1",
+        attempt: 3,
+        maxAttempts: 3,
+      },
       {
         seq: 4,
         at: AT,

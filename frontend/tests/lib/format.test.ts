@@ -30,6 +30,12 @@ describe("format", () => {
     expect(formatCI(null)).toBe("—");
   });
 
+  test("formatCI can format latency intervals", () => {
+    expect(formatCI({ mean: 1_120, lo: 940, hi: 1_310 }, "ms")).toBe(
+      "1.1 s [940 ms, 1.3 s]",
+    );
+  });
+
   test("formatCI can format USD intervals", () => {
     expect(formatCI({ mean: 0.12, lo: 0.1, hi: 0.15 }, "usd")).toBe(
       "$0.12 [$0.10, $0.15]",

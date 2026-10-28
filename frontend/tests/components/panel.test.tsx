@@ -43,6 +43,24 @@ function renderPanel(
   );
 }
 
+/** A fully loaded (single-page) preview of `n` rows, half of them changed. */
+function bigPreview(n: number): DataPreview {
+  return {
+    columns: ["a", "b"],
+    totalRows: n,
+    nextOffset: null,
+    rows: Array.from({ length: n }, (_, i) => ({
+      pk: String(i + 1),
+      quarantined: false,
+      reason: null,
+      cells: {
+        a: { before: `${i},0`, after: `${i}.0`, flagged: false },
+        b: { before: "x", after: i % 2 ? "x" : "y", flagged: false },
+      },
+    })),
+  };
+}
+
 function withPreview(preview: DataPreview): ApiClient {
   const base = new MockApiClient({ delayMs: 0 });
   return {
@@ -75,10 +93,11 @@ describe("side panel tabs", () => {
 });
 
 describe("data tab", () => {
-  test("data tab virtualises 50k rows", async () => {
+  test("data tab virtualises a large preview", async () => {
     const { container } = renderPanel(
-      "run-repaired",
-      stateOf(RUN_REPAIRED_EVENTS),
+      "x",
+      null,
+      withPreview(bigPreview(10_000)),
     );
     const table = await screen.findByRole("table", {
       name: /before and after/i,
@@ -102,13 +121,18 @@ describe("data tab", () => {
       withPreview({
         columns: ["c"],
         totalRows: 2,
+        nextOffset: null,
         rows: [
           {
             pk: "1",
+            quarantined: false,
+            reason: null,
             cells: { c: { before: "1,000", after: "1000", flagged: false } },
           },
           {
             pk: "2",
+            quarantined: false,
+            reason: null,
             cells: { c: { before: "5", after: "5", flagged: false } },
           },
         ],
@@ -152,7 +176,7 @@ describe("data tab", () => {
   });
 
   test("the table's margins stand in exactly for the off-window rows", async () => {
-    renderPanel("run-repaired", stateOf(RUN_REPAIRED_EVENTS));
+    renderPanel("x", null, withPreview(bigPreview(10_000)));
     const region = await screen.findByRole("region", {
       name: "Before and after values, scrollable",
     });
@@ -209,9 +233,12 @@ describe("data tab", () => {
       withPreview({
         columns: ["o_totalprice"],
         totalRows: 1,
+        nextOffset: null,
         rows: [
           {
             pk: "42",
+            quarantined: false,
+            reason: null,
             cells: {
               o_totalprice: { before: "N/A", after: null, flagged: true },
             },
@@ -228,22 +255,143 @@ describe("data tab", () => {
     expect(within(row as HTMLElement).getByText("null")).toBeInTheDocument();
   });
 
+  test("pages through the preview as the window needs rows", async () => {
+    const base = new MockApiClient({ delayMs: 0 });
+    const getPreview = vi.fn<ApiClient["getPreview"]>((id, page) =>
+      base.getPreview(id, page),
+    );
+    const client: ApiClient = {
+      ...withPreview(bigPreview(1)),
+      getPreview,
+    };
+    renderPanel("run-repaired", stateOf(RUN_REPAIRED_EVENTS), client);
+    const region = await screen.findByRole("region", {
+      name: "Before and after values, scrollable",
+    });
+    const table = within(region).getByRole("table");
+    expect(getPreview).toHaveBeenCalledTimes(1);
+    expect(getPreview.mock.calls[0]?.[1]).toEqual({ offset: 0, limit: 1_000 });
+    // More pages exist, so the full count is not known yet.
+    expect(table).toHaveAttribute("aria-rowcount", "-1");
+    expect(screen.getByText(/1,000 of 48,210 rows loaded/)).toBeInTheDocument();
+    // Each body row in the DOM is one of the loaded rows; still windowed.
+    expect(table.querySelectorAll("tr").length).toBeLessThan(200);
+
+    // Scroll to the end of what is loaded: the next page is requested.
+    let scrollTop = 0;
+    Object.defineProperty(region, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+    act(() => {
+      scrollTop = 1_000_000;
+      fireEvent.scroll(region);
+    });
+    await waitFor(() => expect(getPreview).toHaveBeenCalledTimes(2));
+    expect(getPreview.mock.calls[1]?.[1]).toEqual({
+      offset: 1_000,
+      limit: 1_000,
+    });
+    expect(
+      await screen.findByText(/2,000 of 48,210 rows loaded/),
+    ).toBeInTheDocument();
+    expect(table.querySelectorAll("tr").length).toBeLessThan(200);
+  });
+
+  test("quarantined rows show a pill with the reason", async () => {
+    renderPanel(
+      "x",
+      null,
+      withPreview({
+        columns: ["l_orderkey"],
+        totalRows: 1,
+        nextOffset: null,
+        rows: [
+          {
+            pk: "7|2",
+            quarantined: true,
+            reason: "l_orderkey 7 is not in orders",
+            cells: { l_orderkey: { before: "7", after: "7", flagged: false } },
+          },
+        ],
+      }),
+    );
+    const table = await screen.findByRole("table", {
+      name: /before and after/i,
+    });
+    const row = (await within(table).findByText("7|2")).closest("tr");
+    const pill = within(row as HTMLElement).getByText("quarantined");
+    expect(pill).toHaveAttribute("title", "l_orderkey 7 is not in orders");
+    const caption = document.getElementById(
+      table.getAttribute("aria-describedby") ?? "",
+    );
+    expect(caption).toHaveTextContent(/1 quarantined/);
+  });
+
+  test("before the data has loaded the preview is not requested", async () => {
+    const getPreview = vi.fn<ApiClient["getPreview"]>();
+    const client = { ...withPreview(bigPreview(1)), getPreview };
+    const loadedAt = RUN_REPAIRED_EVENTS.findIndex((e) => e.type === "loaded");
+    renderPanel(
+      "run-repaired",
+      stateOf(RUN_REPAIRED_EVENTS.slice(0, loadedAt)),
+      client,
+    );
+    expect(
+      screen.getByText(/preview appears once the data has loaded/i),
+    ).toBeInTheDocument();
+    expect(getPreview).not.toHaveBeenCalled();
+  });
+
+  test("a run that finished without loading has no preview", () => {
+    const getPreview = vi.fn<ApiClient["getPreview"]>();
+    const client = { ...withPreview(bigPreview(1)), getPreview };
+    const failed = stateOf([
+      ...RUN_REPAIRED_EVENTS.slice(0, 6),
+      {
+        seq: 7,
+        at: "2026-10-27T10:14:09.000Z",
+        type: "run_finished",
+        status: "failed",
+        summary: "Gave up",
+        costUsd: 0.0011,
+        tokens: 1_480,
+      },
+    ]);
+    renderPanel("run-repaired", failed, client);
+    expect(screen.getByText(/didn.t load any data/i)).toBeInTheDocument();
+    expect(getPreview).not.toHaveBeenCalled();
+  });
+
   test("an empty preview says so", async () => {
     renderPanel(
       "x",
       null,
-      withPreview({ columns: [], totalRows: 0, rows: [] }),
+      withPreview({ columns: [], totalRows: 0, rows: [], nextOffset: null }),
     );
     expect(await screen.findByText(/no changed cells/i)).toBeInTheDocument();
   });
 
   test("a failed preview offers a retry", async () => {
     const user = userEvent.setup();
-    const client = withPreview({ columns: [], totalRows: 0, rows: [] });
+    const client = withPreview({
+      columns: [],
+      totalRows: 0,
+      rows: [],
+      nextOffset: null,
+    });
     const getPreview = vi
       .fn<ApiClient["getPreview"]>()
       .mockRejectedValueOnce(new Error("boom"))
-      .mockResolvedValue({ columns: [], totalRows: 0, rows: [] });
+      .mockResolvedValue({
+        columns: [],
+        totalRows: 0,
+        rows: [],
+        nextOffset: null,
+      });
     renderPanel("x", null, { ...client, getPreview });
     await user.click(await screen.findByRole("button", { name: "Retry" }));
     expect(await screen.findByText(/no changed cells/i)).toBeInTheDocument();
@@ -308,7 +456,7 @@ describe("code tab", () => {
       base.getTransforms(id),
     );
     const client: ApiClient = {
-      ...withPreview({ columns: [], totalRows: 0, rows: [] }),
+      ...withPreview({ columns: [], totalRows: 0, rows: [], nextOffset: null }),
       getTransforms,
     };
     let state = INITIAL_RUN_VIEW_STATE;

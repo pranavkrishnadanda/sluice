@@ -47,7 +47,11 @@ function nodeStep(node: NodeViewState): Step {
     case "pending":
       return { ...base, status: "pending" };
     case "running":
-      return { ...base, status: "active", meta: "Writing a transform…" };
+      return {
+        ...base,
+        status: "active",
+        meta: `Writing a transform… · attempt ${node.attempt}${of}`,
+      };
     case "retrying":
       return {
         ...base,

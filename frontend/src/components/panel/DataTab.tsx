@@ -4,7 +4,7 @@ import {
   useVirtualizer,
   type VirtualizerOptions,
 } from "@tanstack/react-virtual";
-import { type Key, useId, useMemo, useRef, useState } from "react";
+import { type Key, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { DataPreview, PreviewCell } from "@/lib/api/types";
 import { formatCount } from "@/lib/format";
 
@@ -14,11 +14,16 @@ interface CellRow {
   column: string;
   cell: PreviewCell;
   changed: boolean;
+  /** The cell's whole row was quarantined. */
+  quarantined: boolean;
+  reason: string | null;
 }
 
 /** Fixed data-row height in px (the virtualiser does not measure rows). */
 export const DATA_ROW_HEIGHT = 36;
 const OVERSCAN = 8;
+/** Request the next page when the window is this close to the loaded end. */
+const LOOKAHEAD = 50;
 /** Column widths; `table-fixed` keeps them stable as rows scroll in and out. */
 const COLUMNS = ["3.5rem", "5.75rem", "auto", "auto"] as const;
 const CELL = "truncate border-black/5 border-b px-1.5 dark:border-white/5";
@@ -30,8 +35,16 @@ function flatten(preview: DataPreview): CellRow[] {
   for (const row of preview.rows) {
     for (const column of preview.columns) {
       const cell = row.cells[column];
-      if (cell)
-        out.push({ pk: row.pk, column, cell, changed: isChanged(cell) });
+      if (!cell) continue;
+      out.push({
+        pk: row.pk,
+        column,
+        cell,
+        // A quarantined row is never "unchanged": it was held back.
+        changed: row.quarantined || isChanged(cell),
+        quarantined: row.quarantined,
+        reason: row.reason,
+      });
     }
   }
   return out;
@@ -64,15 +77,20 @@ function BeforeCell({ row }: { row: CellRow }) {
   );
 }
 
+const PILL =
+  "shrink-0 rounded-full bg-chip px-1.5 font-sans font-medium text-[0.6875rem] text-warn leading-[1.125rem]";
+
 function AfterCell({ row }: { row: CellRow }) {
   return (
     <span className="flex min-w-0 items-center gap-1.5">
       <span className={`truncate ${row.changed ? "font-medium" : ""}`}>
         <Value value={row.cell.after} />
       </span>
-      {row.cell.flagged && (
-        <span className="shrink-0 rounded-full bg-chip px-1.5 font-sans font-medium text-[0.6875rem] text-warn leading-[1.125rem]">
-          flagged
+      {row.cell.flagged && <span className={PILL}>flagged</span>}
+      {row.quarantined && (
+        <span className={PILL} title={row.reason ?? undefined}>
+          quarantined
+          {row.reason && <span className="sr-only">: {row.reason}</span>}
         </span>
       )}
     </span>
@@ -82,7 +100,14 @@ function AfterCell({ row }: { row: CellRow }) {
 const title = (v: string | null) => (v === null ? "null" : v);
 
 export interface DataTabProps {
+  /** Every page loaded so far; `nextOffset` non-null means more exist. */
   preview: DataPreview;
+  /** A next-page request is in flight. */
+  loadingMore?: boolean;
+  /** The last next-page request failed (a Retry is offered). */
+  moreError?: unknown;
+  /** Asks for the next page as the window nears the loaded end. */
+  onLoadMore?: () => void;
   /** Fixed viewport height in px; tests only (jsdom has no layout). */
   viewportHeight?: number;
 }
@@ -93,8 +118,19 @@ export interface DataTabProps {
  * which only the visible window (plus overscan) is in the DOM. ARIA table
  * semantics with `aria-rowcount` / `aria-rowindex` keep the full size
  * discoverable; the scroll box is focusable for keyboard scrolling.
+ *
+ * The preview arrives in pages: when the window comes within
+ * {@link LOOKAHEAD} rows of the last loaded row (or a filter leaves nothing
+ * to show), `onLoadMore` asks for the next one. Until the last page is in,
+ * the row count is unknown (`aria-rowcount="-1"`).
  */
-export function DataTab({ preview, viewportHeight }: DataTabProps) {
+export function DataTab({
+  preview,
+  loadingMore = false,
+  moreError = null,
+  onLoadMore,
+  viewportHeight,
+}: DataTabProps) {
   const [changedOnly, setChangedOnly] = useState(true);
   const scrollRef = useRef<HTMLElement>(null);
   const captionId = useId();
@@ -107,8 +143,9 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
       if (r.changed) changed++;
       if (r.cell.flagged) flagged++;
     }
-    return { changed, flagged };
-  }, [all]);
+    const quarantined = preview.rows.filter((r) => r.quarantined).length;
+    return { changed, flagged, quarantined };
+  }, [all, preview.rows]);
   const rows = useMemo(
     () => (changedOnly ? all.filter((r) => r.changed) : all),
     [all, changedOnly],
@@ -130,7 +167,18 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
         }),
   });
 
-  const partial = preview.rows.length < preview.totalRows;
+  const hasMore = preview.nextOffset != null;
+  const partial = hasMore || preview.rows.length < preview.totalRows;
+  const items = virtualizer.getVirtualItems();
+  const lastIndex = items.at(-1)?.index ?? -1;
+  const wantMore =
+    hasMore &&
+    !loadingMore &&
+    moreError == null &&
+    lastIndex >= rows.length - 1 - LOOKAHEAD;
+  useEffect(() => {
+    if (wantMore) onLoadMore?.();
+  }, [wantMore, onLoadMore]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
@@ -149,9 +197,18 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
               flagged
             </>
           )}
+          {stats.quarantined > 0 && (
+            <>
+              {" · "}
+              <span className="font-medium text-warn">
+                {formatCount(stats.quarantined)}
+              </span>{" "}
+              quarantined
+            </>
+          )}
           {" · "}
           {partial
-            ? `first ${formatCount(preview.rows.length)} of ${formatCount(preview.totalRows)} rows`
+            ? `${formatCount(preview.rows.length)} of ${formatCount(preview.totalRows)} rows loaded`
             : `${formatCount(preview.totalRows)} rows`}
         </p>
         <button
@@ -171,7 +228,7 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
         </button>
       </div>
 
-      {rows.length === 0 ? (
+      {rows.length === 0 && !hasMore ? (
         <p className="grid min-h-40 place-items-center rounded-xl bg-chip px-4 text-center text-muted text-sm">
           {changedOnly
             ? "No changed cells — every value passed through as is."
@@ -194,11 +251,15 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
         >
           <VirtualRows
             rows={rows}
-            items={virtualizer.getVirtualItems()}
+            items={items}
             totalSize={virtualizer.getTotalSize()}
             captionId={captionId}
+            complete={!hasMore}
           />
         </section>
+      )}
+      {(loadingMore || moreError != null) && (
+        <MoreStatus failed={moreError != null} onRetry={onLoadMore} />
       )}
     </div>
   );
@@ -211,16 +272,44 @@ interface WindowItem {
   end: number;
 }
 
+/** Below the table: "Loading more rows…" or a failed page with Retry. */
+function MoreStatus({
+  failed,
+  onRetry,
+}: {
+  failed: boolean;
+  onRetry?: () => void;
+}) {
+  if (!failed) {
+    return <output className="text-muted text-xs">Loading more rows…</output>;
+  }
+  return (
+    <div role="alert" className="flex items-center gap-3 text-xs">
+      <span className="text-error">Couldn’t load more rows.</span>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="min-h-8 rounded-full bg-chip px-3 font-medium text-fg transition-colors duration-150 hover:bg-raised"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
 function VirtualRows({
   rows,
   items,
   totalSize,
   captionId,
+  complete,
 }: {
   rows: readonly CellRow[];
   items: readonly WindowItem[];
   totalSize: number;
   captionId: string;
+  /** Every page is loaded, so the row count is final. */
+  complete: boolean;
 }) {
   const top = items[0]?.start ?? 0;
   const bottom = Math.max(0, totalSize - (items.at(-1)?.end ?? 0));
@@ -231,7 +320,7 @@ function VirtualRows({
       style={{ marginTop: top, marginBottom: bottom }}
       aria-label="Before and after values"
       aria-describedby={captionId}
-      aria-rowcount={rows.length + 1}
+      aria-rowcount={complete ? rows.length + 1 : -1}
       className="w-full min-w-78 table-fixed border-separate border-spacing-0 font-mono text-[0.6875rem]"
     >
       <colgroup>

@@ -1,5 +1,5 @@
 import type { CI, EvalSummary } from "@/lib/api/types";
-import { formatCI, formatPct } from "@/lib/format";
+import { formatCI } from "@/lib/format";
 
 type SystemRow = EvalSummary["systems"][number];
 
@@ -13,7 +13,7 @@ function NotMeasured() {
   );
 }
 
-function Interval({ ci, unit }: { ci: CI | null; unit?: "usd" }) {
+function Interval({ ci, unit }: { ci: CI | null; unit?: "usd" | "ms" }) {
   if (!ci) return <NotMeasured />;
   return <span className="whitespace-nowrap">{formatCI(ci, unit)}</span>;
 }
@@ -21,7 +21,9 @@ function Interval({ ci, unit }: { ci: CI | null; unit?: "usd" }) {
 const COLUMNS: ReadonlyArray<{ label: string; hint: string }> = [
   { label: "Cell accuracy", hint: "higher is better" },
   { label: "Fabrication rate", hint: "lower is better" },
+  { label: "Contract pass rate", hint: "higher is better" },
   { label: "pass^4", hint: "higher is better" },
+  { label: "p95 latency", hint: "lower is better" },
   { label: "Cost / 1k rows", hint: "lower is better" },
 ];
 
@@ -44,11 +46,13 @@ function Row({ row }: { row: SystemRow }) {
         <Interval ci={row.fabricationRate} />
       </td>
       <td className={TD}>
-        {row.passHat4 === null ? (
-          <NotMeasured />
-        ) : (
-          <span>{formatPct(row.passHat4)}</span>
-        )}
+        <Interval ci={row.contractPassRate} />
+      </td>
+      <td className={TD}>
+        <Interval ci={row.passHat4} />
+      </td>
+      <td className={TD}>
+        <Interval ci={row.p95LatencyMs} unit="ms" />
       </td>
       <td className={TD}>
         <Interval ci={row.costPer1kRowsUsd} unit="usd" />
@@ -92,7 +96,7 @@ export function ResultsTable({ summary }: ResultsTableProps) {
         // positioned and would otherwise escape this scroller's clipping.
         className="relative -mx-1 overflow-x-auto rounded-xl px-1 focus-visible:outline-offset-0"
       >
-        <table className="w-full min-w-[38rem] border-collapse text-sm">
+        <table className="w-full min-w-[56rem] border-collapse text-sm">
           <caption className="pb-2 text-left font-medium text-muted text-xs uppercase tracking-[0.08em]">
             {`${summary.split} · n = ${summary.n}`}
           </caption>

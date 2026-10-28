@@ -20,6 +20,7 @@ import type {
   ApiClient,
   DataPreview,
   EvalSummary,
+  PreviewPage,
   RunEvent,
   RunSummary,
   TableName,
@@ -42,7 +43,12 @@ interface MockRun {
   previewOf: string;
   /** Created through {@link MockApiClient.createRun}: replays a fixture. */
   sample: boolean;
+  /** `loaded` has been streamed (fixture runs are complete from the start). */
+  loaded: boolean;
 }
+
+/** `listRuns` returns at most this many runs, like the server. */
+const MAX_LISTED_RUNS = 100;
 
 const FIXTURE_RUNS: readonly MockRun[] = [
   {
@@ -51,6 +57,7 @@ const FIXTURE_RUNS: readonly MockRun[] = [
     transforms: RUN_REPAIRED_TRANSFORMS,
     previewOf: RUN_REPAIRED.id,
     sample: false,
+    loaded: true,
   },
   {
     summary: RUN_QUARANTINED,
@@ -58,6 +65,7 @@ const FIXTURE_RUNS: readonly MockRun[] = [
     transforms: RUN_QUARANTINED_TRANSFORMS,
     previewOf: RUN_QUARANTINED.id,
     sample: false,
+    loaded: true,
   },
   {
     summary: RUN_CLEAN,
@@ -65,6 +73,7 @@ const FIXTURE_RUNS: readonly MockRun[] = [
     transforms: RUN_CLEAN_TRANSFORMS,
     previewOf: RUN_CLEAN.id,
     sample: false,
+    loaded: true,
   },
 ];
 
@@ -82,7 +91,14 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** Re-stamps run-repaired's log as a brand-new run starting at `createdAt`. */
+/** A created run's copy of a fixture transform id (ids are globally unique). */
+const transformIdFor = (runId: string, fixtureId: string) =>
+  `${runId}_${fixtureId}`;
+
+/**
+ * Re-stamps run-repaired's log as a brand-new run starting at `createdAt`,
+ * with this run's own transform ids.
+ */
 function replayAs(summary: RunSummary): RunEvent[] {
   const origin = Date.parse(RUN_REPAIRED_EVENTS[0]?.at ?? summary.createdAt);
   const start = Date.parse(summary.createdAt);
@@ -97,6 +113,13 @@ function replayAs(summary: RunSummary): RunEvent[] {
         table: summary.table,
         // The file was never read: don't present the fixture's count as its.
         rows: null,
+      };
+    }
+    if (e.type === "node_finished") {
+      return {
+        ...e,
+        at,
+        transformId: transformIdFor(summary.id, e.transformId),
       };
     }
     return { ...e, at };
@@ -122,7 +145,8 @@ export class MockApiClient implements ApiClient {
   async listRuns(): Promise<RunSummary[]> {
     return [...this.#runs.values()]
       .map((r) => ({ ...r.summary }))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, MAX_LISTED_RUNS);
   }
 
   async createRun(file: File, table: TableName): Promise<RunSummary> {
@@ -139,9 +163,13 @@ export class MockApiClient implements ApiClient {
     this.#runs.set(summary.id, {
       summary,
       events: replayAs(summary),
-      transforms: RUN_REPAIRED_TRANSFORMS,
+      transforms: RUN_REPAIRED_TRANSFORMS.map((t) => ({
+        ...t,
+        id: transformIdFor(summary.id, t.id),
+      })),
       previewOf: RUN_REPAIRED.id,
       sample: true,
+      loaded: false,
     });
     return { ...summary };
   }
@@ -168,10 +196,16 @@ export class MockApiClient implements ApiClient {
     return this.#get(runId).transforms.map((t) => ({ ...t }));
   }
 
-  async getPreview(runId: string, limit: number): Promise<DataPreview> {
+  async getPreview(runId: string, page: PreviewPage): Promise<DataPreview> {
     const run = this.#get(runId);
+    if (!run.loaded) {
+      const detail = "The preview is available once the run has loaded.";
+      throw new ApiError(409, `mock:/runs/${runId}/preview`, `409 ${detail}`, {
+        detail,
+      });
+    }
     const fixture = this.#get(run.previewOf);
-    return generatePreview(run.previewOf, fixture.summary.rows ?? 0, limit);
+    return generatePreview(run.previewOf, fixture.summary.rows ?? 0, page);
   }
 
   async getEvalSummary(): Promise<EvalSummary> {
@@ -189,10 +223,24 @@ export class MockApiClient implements ApiClient {
     return run;
   }
 
-  /** Keeps a created run's summary in step with what has been streamed. */
+  /**
+   * Keeps a created run's summary in step with what has been streamed:
+   * status, and `costUsd` as a running total until `run_finished`.
+   */
   #track(run: MockRun, event: RunEvent): void {
+    if (!run.sample) return;
     if (event.type === "run_started" && run.summary.status === "queued") {
       run.summary = { ...run.summary, status: "running" };
+    } else if (
+      event.type === "attempt_failed" ||
+      event.type === "node_finished"
+    ) {
+      run.summary = {
+        ...run.summary,
+        costUsd: run.summary.costUsd + event.costUsd,
+      };
+    } else if (event.type === "loaded") {
+      run.loaded = true;
     } else if (event.type === "run_finished") {
       run.summary = {
         ...run.summary,

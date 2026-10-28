@@ -2,7 +2,8 @@ import type { EvalSummary } from "../types";
 
 /**
  * Illustrative demo numbers only (the UI labels them "Demo data"). The
- * `sluice` system row matches the router point at lambda = 0.5.
+ * `sluice` system row is the router's default operating point, lambda = 0.5
+ * (its cell accuracy and cost equal that Pareto point's quality and cost).
  */
 export const EVAL_SUMMARY: EvalSummary = {
   split: "holdout",
@@ -13,21 +14,27 @@ export const EVAL_SUMMARY: EvalSummary = {
       system: "rules",
       cellAccuracy: { mean: 0.712, lo: 0.69, hi: 0.733 },
       fabricationRate: { mean: 0, lo: 0, hi: 0.009 },
+      contractPassRate: { mean: 0.618, lo: 0.57, hi: 0.664 },
       passHat4: null,
+      p95LatencyMs: { mean: 210, lo: 180, hi: 245 },
       costPer1kRowsUsd: { mean: 0, lo: 0, hi: 0 },
     },
     {
       system: "always-strong",
       cellAccuracy: { mean: 0.874, lo: 0.856, hi: 0.891 },
       fabricationRate: { mean: 0.021, lo: 0.014, hi: 0.03 },
-      passHat4: 0.78,
+      contractPassRate: { mean: 0.968, lo: 0.948, hi: 0.981 },
+      passHat4: { mean: 0.78, lo: 0.73, hi: 0.825 },
+      p95LatencyMs: { mean: 4_380, lo: 3_960, hi: 4_870 },
       costPer1kRowsUsd: { mean: 0.94, lo: 0.88, hi: 1.01 },
     },
     {
       system: "sluice",
       cellAccuracy: { mean: 0.861, lo: 0.842, hi: 0.879 },
       fabricationRate: { mean: 0.012, lo: 0.007, hi: 0.019 },
-      passHat4: 0.81,
+      contractPassRate: { mean: 0.975, lo: 0.96, hi: 0.986 },
+      passHat4: { mean: 0.81, lo: 0.76, hi: 0.85 },
+      p95LatencyMs: { mean: 1_120, lo: 940, hi: 1_310 },
       costPer1kRowsUsd: { mean: 0.12, lo: 0.1, hi: 0.15 },
     },
   ],

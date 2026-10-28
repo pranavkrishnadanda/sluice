@@ -1,7 +1,10 @@
-import type { DataPreview, PreviewCell } from "../types";
-
-/** Hard cap on generated preview rows (the Data tab's virtualisation target). */
-export const MOCK_PREVIEW_MAX_ROWS = 50_000;
+import {
+  type DataPreview,
+  PREVIEW_MAX_LIMIT,
+  type PreviewCell,
+  type PreviewPage,
+  type PreviewRow,
+} from "../types";
 
 /**
  * mulberry32 seeded per row, so row `i` depends only on `(seed, i)`: output
@@ -48,7 +51,7 @@ function indianGrouping(amount: string): string {
 interface PreviewSpec {
   seed: number;
   columns: string[];
-  row(index: number, rand: () => number): DataPreview["rows"][number];
+  row(index: number, rand: () => number): PreviewRow;
 }
 
 const SPECS: Record<string, PreviewSpec> = {
@@ -82,6 +85,8 @@ const SPECS: Record<string, PreviewSpec> = {
       }
       return {
         pk: String(orderKey),
+        quarantined: false,
+        reason: null,
         cells: {
           o_custkey: same(String(custKey)),
           o_orderdate: same(date),
@@ -99,6 +104,8 @@ const SPECS: Record<string, PreviewSpec> = {
       const date = isoDate(Math.floor(rand() * 30) - 30);
       return {
         pk: String(1 + i * 4),
+        quarantined: false,
+        reason: null,
         cells: {
           o_clerk: padded
             ? { before: `  ${clerk} `, after: clerk, flagged: false }
@@ -120,7 +127,10 @@ const SPECS: Record<string, PreviewSpec> = {
       const mode = modes[Math.floor(rand() * modes.length)] ?? "AIR";
       const lower = rand() < 0.1;
       return {
-        pk: `${orderKey}-${lineNumber}`,
+        // Composite key: l_orderkey|l_linenumber.
+        pk: `${orderKey}|${lineNumber}`,
+        quarantined: orphan,
+        reason: orphan ? `l_orderkey ${orderKey} is not in orders` : null,
         cells: {
           l_orderkey: orphan
             ? { before: String(orderKey), after: null, flagged: true }
@@ -143,20 +153,31 @@ export function hasPreview(runId: string): boolean {
   return runId in SPECS;
 }
 
-/** Generates the preview on demand; nothing is precomputed at import time. */
+/**
+ * Generates one page of the preview on demand; nothing is precomputed at
+ * import time. Like the server, `limit` is capped at
+ * {@link PREVIEW_MAX_LIMIT} and `nextOffset` is `null` after the last page.
+ */
 export function generatePreview(
   runId: string,
   totalRows: number,
-  limit: number,
+  { offset, limit }: PreviewPage,
 ): DataPreview {
   const spec = SPECS[runId];
   if (!spec) throw new Error(`No preview fixture for ${runId}`);
+  const start = Math.max(0, Math.min(Math.floor(offset), totalRows));
   const count = Math.max(
     0,
-    Math.min(Math.floor(limit), MOCK_PREVIEW_MAX_ROWS, totalRows),
+    Math.min(Math.floor(limit), PREVIEW_MAX_LIMIT, totalRows - start),
   );
   const rows = Array.from({ length: count }, (_, i) =>
-    spec.row(i, rowRandom(spec.seed, i)),
+    spec.row(start + i, rowRandom(spec.seed, start + i)),
   );
-  return { columns: [...spec.columns], rows, totalRows };
+  const end = start + count;
+  return {
+    columns: [...spec.columns],
+    rows,
+    totalRows,
+    nextOffset: end < totalRows ? end : null,
+  };
 }

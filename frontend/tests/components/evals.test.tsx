@@ -110,7 +110,9 @@ describe("ResultsTable", () => {
     const row = screen.getByRole("row", { name: /sluice/ });
     expect(within(row).getByText("86.1% [84.2, 87.9]")).toBeInTheDocument();
     expect(within(row).getByText("1.2% [0.7, 1.9]")).toBeInTheDocument();
-    expect(within(row).getByText("81.0%")).toBeInTheDocument();
+    expect(within(row).getByText("81.0% [76.0, 85.0]")).toBeInTheDocument();
+    expect(within(row).getByText("97.5% [96.0, 98.6]")).toBeInTheDocument();
+    expect(within(row).getByText("1.1 s [940 ms, 1.3 s]")).toBeInTheDocument();
     expect(within(row).getByText("$0.12 [$0.10, $0.15]")).toBeInTheDocument();
   });
 
@@ -118,8 +120,25 @@ describe("ResultsTable", () => {
     render(<ResultsTable summary={EVAL_SUMMARY} />);
     const row = screen.getByRole("row", { name: /^rules/ });
     const cells = within(row).getAllByRole("cell");
-    // System is the row header; cells: accuracy, fabrication, pass^4, cost.
-    expect(cells[2]).toHaveTextContent("—");
+    // System is the row header; cells: accuracy, fabrication, contract
+    // pass rate, pass^4, p95 latency, cost.
+    expect(cells[3]).toHaveTextContent("—");
+  });
+
+  test("has contract pass rate and p95 latency columns", () => {
+    render(<ResultsTable summary={EVAL_SUMMARY} />);
+    const headers = screen
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent);
+    expect(headers).toEqual([
+      "System",
+      "Cell accuracyhigher is better",
+      "Fabrication ratelower is better",
+      "Contract pass ratehigher is better",
+      "pass^4higher is better",
+      "p95 latencylower is better",
+      "Cost / 1k rowslower is better",
+    ]);
   });
 
   test("explains pass^4 as the tau-bench all-runs-succeed estimate", () => {

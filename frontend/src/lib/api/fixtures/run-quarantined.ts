@@ -72,7 +72,7 @@ export const RUN_QUARANTINED_EVENTS = buildEvents(RUN_QUARANTINED.createdAt, [
       ],
     },
   ],
-  [40, { type: "node_started", nodeId: "n1", attempt: 1 }],
+  [40, { type: "node_started", nodeId: "n1", attempt: 1, maxAttempts: 3 }],
   [
     1_050,
     {

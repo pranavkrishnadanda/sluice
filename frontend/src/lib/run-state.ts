@@ -1,11 +1,12 @@
-import type {
-  Issue,
-  ModelTier,
-  PlanNode,
-  RunEvent,
-  RunEventOf,
-  RunStatus,
-  TableName,
+import {
+  type Issue,
+  MAX_ATTEMPT_ERROR_CHARS,
+  type ModelTier,
+  type PlanNode,
+  type RunEvent,
+  type RunEventOf,
+  type RunStatus,
+  type TableName,
 } from "@/lib/api/types";
 
 export type NodeStatus = "pending" | "running" | "retrying" | "done" | "failed";
@@ -24,7 +25,7 @@ export interface NodeViewState {
    * does not move it, so it is the count of attempts with a transform.
    */
   attemptsReported: number;
-  /** Known once the backend reports a failed attempt; `null` until then. */
+  /** Attempt budget, known from the node's first `node_started`. */
   maxAttempts: number | null;
   /** Planned tier, replaced by the tier that actually produced the result. */
   tier: ModelTier;
@@ -161,7 +162,8 @@ function onAttemptFailed(
       attempt: e.attempt,
       attemptsReported: Math.max(n.attemptsReported, e.attempt),
       maxAttempts: e.maxAttempts,
-      lastError: e.error,
+      // The contract caps this; clamp anyway so a long trace can't flood the UI.
+      lastError: e.error.slice(0, MAX_ATTEMPT_ERROR_CHARS),
       costUsd: n.costUsd + e.costUsd,
       tokens: n.tokens + e.tokens,
     })),
@@ -201,6 +203,7 @@ function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
         nodes: updateNode(state, e.nodeId, () => ({
           status: e.attempt > 1 ? "retrying" : "running",
           attempt: e.attempt,
+          maxAttempts: e.maxAttempts,
         })),
       };
     case "attempt_failed":

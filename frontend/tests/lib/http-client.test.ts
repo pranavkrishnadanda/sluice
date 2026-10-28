@@ -59,14 +59,17 @@ describe("HttpApiClient", () => {
     expect(form.get("file")).toBeInstanceOf(File);
   });
 
-  test("getPreview passes limit and encodes run id", async () => {
+  test("getPreview passes offset and limit and encodes run id", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () =>
-      jsonResponse({ columns: [], rows: [], totalRows: 0 }),
+      jsonResponse({ columns: [], rows: [], totalRows: 0, nextOffset: null }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    await new HttpApiClient("http://api.test").getPreview("run/1", 50);
+    await new HttpApiClient("http://api.test").getPreview("run/1", {
+      offset: 0,
+      limit: 50,
+    });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "http://api.test/runs/run%2F1/preview?limit=50",
+      "http://api.test/runs/run%2F1/preview?offset=0&limit=50",
     );
   });
 

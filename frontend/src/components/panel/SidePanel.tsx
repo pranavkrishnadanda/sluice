@@ -11,10 +11,8 @@ import type { RunViewState } from "@/lib/run-state";
 import { CodeTab } from "./CodeTab";
 import { DataTab, DataTabSkeleton } from "./DataTab";
 import { PlanTab } from "./PlanTab";
+import { type PreviewPages, usePreviewPages } from "./use-preview-pages";
 import { type Resource, useResource } from "./use-resource";
-
-/** Rows requested for the Data tab (the mock caps at the run's row count). */
-export const PREVIEW_LIMIT = 50_000;
 
 type Tab = "data" | "code" | "plan";
 const TABS: ReadonlyArray<{ value: Tab; label: string }> = [
@@ -115,6 +113,65 @@ function Loaded<T>({
   }
 }
 
+function Note({ children }: { children: ReactNode }) {
+  return (
+    <p className="grid min-h-40 place-items-center rounded-xl bg-chip px-4 text-center text-muted text-sm">
+      {children}
+    </p>
+  );
+}
+
+/**
+ * The Data tab body. The preview exists only once the run has loaded (the
+ * API answers 409 before), so a live run shows a note instead of fetching.
+ */
+function DataPanel({
+  state,
+  pages,
+  viewportHeight,
+}: {
+  state: RunViewState | null;
+  pages: PreviewPages;
+  viewportHeight?: number;
+}) {
+  if (state && !state.loaded) {
+    return (
+      <Note>
+        {state.finished
+          ? "No preview — this run didn’t load any data."
+          : "The before/after preview appears once the data has loaded."}
+      </Note>
+    );
+  }
+  switch (pages.status) {
+    case "idle":
+    case "loading":
+      return (
+        <output aria-label="Loading the data preview" className="contents">
+          <DataTabSkeleton />
+        </output>
+      );
+    case "error":
+      return (
+        <Unavailable
+          what="the data preview"
+          error={pages.error}
+          retry={pages.retry}
+        />
+      );
+    case "ready":
+      return (
+        <DataTab
+          preview={pages.preview}
+          loadingMore={pages.loadingMore}
+          moreError={pages.moreError}
+          onLoadMore={pages.loadMore}
+          viewportHeight={viewportHeight}
+        />
+      );
+  }
+}
+
 const CODE_SKELETON = (
   <div aria-hidden="true" className="space-y-2.5">
     <span className="block h-4 w-3/4 animate-pulse rounded-full bg-chip" />
@@ -135,8 +192,8 @@ export interface SidePanelProps {
  * Run details: Data (before/after preview), Code (generated transforms and
  * repair diffs) and Plan (step DAG) tabs. Each tab's data is fetched the
  * first time the tab is opened and kept while switching tabs; the preview
- * refetches when the run finishes, transforms once per attempt that fails
- * or finishes.
+ * loads once the run has loaded (page by page, as the table scrolls),
+ * transforms once per attempt that fails or finishes.
  */
 export function SidePanel({
   runId,
@@ -149,10 +206,11 @@ export function SidePanel({
     () => new Set(["data"]),
   );
 
-  const finished = state?.finished ?? true;
-  const preview = useResource(
-    opened.has("data") ? `${runId}|${finished}` : null,
-    () => api.getPreview(runId, PREVIEW_LIMIT),
+  // Outside a run stream (state null) the run is taken as complete.
+  const loaded = state === null || state.loaded !== null;
+  const pages = usePreviewPages(
+    opened.has("data") && loaded ? runId : null,
+    (offset, limit) => api.getPreview(runId, { offset, limit }),
   );
   const transforms = useResource(
     opened.has("code") ? `${runId}|${transformsKey(state)}` : null,
@@ -203,15 +261,11 @@ export function SidePanel({
         value="data"
         className="flex min-h-0 flex-1 flex-col focus-visible:outline-offset-4"
       >
-        <Loaded
-          resource={preview}
-          what="the data preview"
-          fallback={<DataTabSkeleton />}
-        >
-          {(data) => (
-            <DataTab preview={data} viewportHeight={dataViewportHeight} />
-          )}
-        </Loaded>
+        <DataPanel
+          state={state}
+          pages={pages}
+          viewportHeight={dataViewportHeight}
+        />
       </Tabs.Content>
 
       <Tabs.Content value="code" className="focus-visible:outline-offset-4">

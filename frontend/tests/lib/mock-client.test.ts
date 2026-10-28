@@ -135,15 +135,17 @@ describe("MockApiClient", () => {
 
   test("getPreview is deterministic and capped", async () => {
     const client = new MockApiClient();
-    const a = await client.getPreview("run-repaired", 25);
-    const b = await client.getPreview("run-repaired", 25);
+    const a = await client.getPreview("run-repaired", { offset: 0, limit: 25 });
+    const b = await client.getPreview("run-repaired", { offset: 0, limit: 25 });
     expect(a.rows).toHaveLength(25);
     expect(a).toEqual(b);
     expect(a.totalRows).toBe(48_210);
 
-    const big = await client.getPreview("run-repaired", 1_000_000);
-    expect(big.rows.length).toBeLessThanOrEqual(50_000);
-    expect(big.rows.length).toBe(Math.min(50_000, big.totalRows));
+    const big = await client.getPreview("run-repaired", {
+      offset: 0,
+      limit: 1_000_000,
+    });
+    expect(big.rows).toHaveLength(1_000);
     expect(big.rows.slice(0, 25)).toEqual(a.rows);
     for (const row of big.rows.slice(0, 200)) {
       expect(Object.keys(row.cells).sort()).toEqual([...big.columns].sort());
@@ -167,10 +169,13 @@ describe("MockApiClient", () => {
     );
   });
 
-  test("unknown run ids reject", async () => {
+  test("unknown run ids reject with a 404", async () => {
     await expect(new MockApiClient().getTransforms("run-nope")).rejects.toThrow(
       "Unknown run: run-nope",
     );
+    await expect(
+      new MockApiClient().getTransforms("run-nope"),
+    ).rejects.toMatchObject({ status: 404 });
   });
 });
 
@@ -192,7 +197,7 @@ describe("getApiClient", () => {
   });
 
   test("returns the HTTP client when env is a URL", () => {
-    vi.stubEnv("NEXT_PUBLIC_SLUICE_API_URL", "http://localhost:8000");
+    vi.stubEnv("NEXT_PUBLIC_SLUICE_API_URL", "http://localhost:8080");
     const client = getApiClient();
     expect(client).toBeInstanceOf(HttpApiClient);
     expect(client.isDemo).toBe(false);

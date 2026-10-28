@@ -3,6 +3,7 @@ import type {
   ApiClient,
   DataPreview,
   EvalSummary,
+  PreviewPage,
   RunEvent,
   RunSummary,
   TableName,
@@ -120,8 +121,11 @@ export class HttpApiClient implements ApiClient {
     return this.#json(`/runs/${encodeURIComponent(runId)}/transforms`);
   }
 
-  getPreview(runId: string, limit: number): Promise<DataPreview> {
-    const query = new URLSearchParams({ limit: String(limit) });
+  getPreview(runId: string, page: PreviewPage): Promise<DataPreview> {
+    const query = new URLSearchParams({
+      offset: String(page.offset),
+      limit: String(page.limit),
+    });
     return this.#json(`/runs/${encodeURIComponent(runId)}/preview?${query}`);
   }
 

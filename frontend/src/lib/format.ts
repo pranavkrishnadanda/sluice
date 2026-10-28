@@ -45,13 +45,20 @@ export function formatPct(x: number): string {
 }
 
 /**
- * Mean with its interval: "81.4% [79.0, 83.6]" for fractions, or
- * "$0.12 [$0.10, $0.15]" with `unit: "usd"`. `null` (not measured) is "—".
+ * Mean with its interval: "81.4% [79.0, 83.6]" for fractions,
+ * "$0.12 [$0.10, $0.15]" with `unit: "usd"`, or "1.1 s [940 ms, 1.3 s]"
+ * with `unit: "ms"`. `null` (not measured) is "—".
  */
-export function formatCI(ci: CI | null, unit: "pct" | "usd" = "pct"): string {
+export function formatCI(
+  ci: CI | null,
+  unit: "pct" | "usd" | "ms" = "pct",
+): string {
   if (!ci) return "—";
   if (unit === "usd") {
     return `${formatUsd(ci.mean)} [${formatUsd(ci.lo)}, ${formatUsd(ci.hi)}]`;
+  }
+  if (unit === "ms") {
+    return `${formatMs(ci.mean)} [${formatMs(ci.lo)}, ${formatMs(ci.hi)}]`;
   }
   return `${formatPct(ci.mean)} [${pctNumber(ci.lo)}, ${pctNumber(ci.hi)}]`;
 }

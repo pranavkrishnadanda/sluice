@@ -3,6 +3,11 @@
  * models (camelCase JSON). See `docs/api/contract.md` before changing.
  */
 
+/** Server maximum for `GET /runs/{id}/preview?limit=`. */
+export const PREVIEW_MAX_LIMIT = 1_000;
+/** `attempt_failed.error` is truncated to this many characters. */
+export const MAX_ATTEMPT_ERROR_CHARS = 2_000;
+
 export type TableName = "orders" | "lineitem";
 export type RunStatus =
   | "queued"
@@ -66,12 +71,19 @@ export type RunEvent = EventBase &
     | { type: "profiled"; issues: Issue[] }
     | { type: "rules_applied"; actions: string[] }
     | { type: "plan_created"; nodes: PlanNode[] }
-    | { type: "node_started"; nodeId: string; attempt: number }
+    | {
+        type: "node_started";
+        nodeId: string;
+        attempt: number;
+        /** Attempt budget for this node, known from its first attempt. */
+        maxAttempts: number;
+      }
     | {
         type: "attempt_failed";
         nodeId: string;
         attempt: number;
         maxAttempts: number;
+        /** At most {@link MAX_ATTEMPT_ERROR_CHARS} characters. */
         error: string;
         /** Spend of the failed attempt; counted in `run_finished` totals. */
         tokens: number;
@@ -115,10 +127,29 @@ export interface PreviewCell {
   after: string | null;
   flagged: boolean;
 }
+export interface PreviewRow {
+  /** Primary key; composite keys join their parts with "|" ("1|3"). */
+  pk: string;
+  /** The whole row was held back from the load. */
+  quarantined: boolean;
+  /** Why it was quarantined; `null` when `quarantined` is false. */
+  reason: string | null;
+  /** Keyed by target contract column. */
+  cells: Record<string, PreviewCell>;
+}
 export interface DataPreview {
+  /** Target contract columns, in contract order. */
   columns: string[];
-  rows: { pk: string; cells: Record<string, PreviewCell> }[];
+  rows: PreviewRow[];
+  /** Rows in the uploaded file. */
   totalRows: number;
+  /** `offset` for the next page; `null` after the last page. */
+  nextOffset: number | null;
+}
+export interface PreviewPage {
+  offset: number;
+  /** Capped by the server at {@link PREVIEW_MAX_LIMIT}. */
+  limit: number;
 }
 export interface CI {
   mean: number;
@@ -126,14 +157,20 @@ export interface CI {
   hi: number;
 }
 export interface EvalSummary {
-  split: "dev" | "holdout";
+  /** `ood` (out-of-distribution) may be added later. */
+  split: "dev" | "holdout" | "ood";
+  /** Number of eval cases. */
   n: number;
   generatedAt: string;
   systems: {
     system: string;
     cellAccuracy: CI | null;
     fabricationRate: CI | null;
-    passHat4: number | null;
+    /** Share of cases whose output passes every contract check. */
+    contractPassRate: CI | null;
+    /** Estimated probability that all 4 runs of a case succeed. */
+    passHat4: CI | null;
+    p95LatencyMs: CI | null;
     costPer1kRowsUsd: CI | null;
   }[];
   pareto: {
@@ -141,6 +178,7 @@ export interface EvalSummary {
     kind: "baseline" | "router";
     points: {
       costPer1kRowsUsd: number;
+      /** Cell accuracy at this operating point. */
       quality: number;
       /** Router trade-off weight; `null` for baselines. */
       lambda: number | null;
@@ -157,7 +195,7 @@ export interface ApiClient {
     signal: AbortSignal,
   ): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
-  getPreview(runId: string, limit: number): Promise<DataPreview>;
+  getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
   getEvalSummary(): Promise<EvalSummary>;
   /**
    * Demo only, never part of the HTTP API: `true` when `runId` was created
