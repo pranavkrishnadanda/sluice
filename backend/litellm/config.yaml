@@ -30,6 +30,13 @@ model_list:
       # read 2026-10-28): 30 RPM, 1K RPD, 8K TPM, 200K TPD. Verify in console (/settings/limits).
       rpm: 30
       tpm: 8000
+    model_info:
+      allowed_fails_policy:  # hosted: tolerant, see "Cooldown" under router_settings
+        RateLimitErrorAllowedFails: 3
+        InternalServerErrorAllowedFails: 2
+        ServiceUnavailableErrorAllowedFails: 2
+        TimeoutErrorAllowedFails: 2
+      cooldown_time: 30
 
   - model_name: strong-fallback
     litellm_params:
@@ -40,6 +47,13 @@ model_list:
       # conservative placeholders. Verify in console (AI Studio > Rate limits) and adjust.
       rpm: 10
       tpm: 250000
+    model_info:
+      allowed_fails_policy:  # hosted: tolerant, see "Cooldown" under router_settings
+        RateLimitErrorAllowedFails: 3
+        InternalServerErrorAllowedFails: 2
+        ServiceUnavailableErrorAllowedFails: 2
+        TimeoutErrorAllowedFails: 2
+      cooldown_time: 30
 
   # small: workers ------------------------------------------------------------------------------
   - model_name: small
@@ -50,11 +64,8 @@ model_list:
       # Optional: when vLLM is not running, the connection error falls back to small-fallback.
       # No rpm/tpm here: the local server has no provider quota.
     model_info:
-      # A dead local server cools down on its FIRST failure (0 allowed fails), for 60 s.
-      # LiteLLM reports "connection refused" as InternalServerError. An explicit per-exception
-      # policy is needed: without one, the router skips cooldown for errors whose text mentions
-      # APIConnectionError (cooldown_handlers._is_cooldown_required) and exempts single-deployment
-      # groups. allowed_fails_policy is read from model_info only.
+      # local: cool down on the FIRST failure (0 allowed fails), for 60 s, see "Cooldown" below.
+      # LiteLLM reports "connection refused" as InternalServerError.
       allowed_fails_policy:
         InternalServerErrorAllowedFails: 0
         ServiceUnavailableErrorAllowedFails: 0
@@ -69,6 +80,13 @@ model_list:
       # Verify in console.
       rpm: 30
       tpm: 8000
+    model_info:
+      allowed_fails_policy:  # hosted: tolerant, see "Cooldown" under router_settings
+        RateLimitErrorAllowedFails: 3
+        InternalServerErrorAllowedFails: 2
+        ServiceUnavailableErrorAllowedFails: 2
+        TimeoutErrorAllowedFails: 2
+      cooldown_time: 30
 
 router_settings:
   routing_strategy: usage-based-routing-v2
@@ -77,22 +95,34 @@ router_settings:
   redis_port: 6379
   timeout: 60
   num_retries: 2
-  # Cooldown (LiteLLM v1.106.5 router_utils/cooldown_handlers.py): a deployment cools down once
-  # its failures in the cooldown window exceed allowed_fails. The counter lives in Redis and its
-  # TTL is cooldown_time. allowed_fails differs from LiteLLM's default of 3, so this router-wide
-  # count applies even to single-deployment groups. A cooled-down deployment is not retried:
-  # Router.should_retry_this_error raises when no deployment is healthy, and the request goes to
-  # the group's fallback. Result:
-  #   - hosted deployments: a 429/5xx/timeout is retried once. The second failure inside 60 s
-  #     cools the deployment and the call moves to the fallback.
-  #   - `small` (local vLLM, see its model_info and model_group_retry_policy): no retries, and
-  #     cooldown on the first failure. The call falls back immediately, and later calls skip it
-  #     for 60 s.
-  allowed_fails: 1
-  cooldown_time: 60
-  # Retry only on 429, 5xx and timeouts. Bad request, auth, not found and content-policy errors
-  # go straight to the fallback. num_retries retries the SAME group (here one deployment) until
-  # it is cooled down, as described above.
+  # Retries (retry_policy): 429, 500, 503 and timeouts are retried up to 2 times on the SAME
+  # group (here one deployment), so up to 3 attempts before the fallback. Bad request, auth,
+  # not found, content-policy and every other error get 0 retries and go straight to the
+  # fallback. The `small` group gets 0 retries for everything (model_group_retry_policy).
+  #
+  # Cooldown (LiteLLM v1.106.5 router_utils/cooldown_handlers.py, router.py). There is
+  # deliberately NO router-wide allowed_fails or cooldown_time, so LiteLLM's defaults stay
+  # (allowed_fails 3, cooldown_time 5 s). Each deployment's model_info.allowed_fails_policy
+  # counts failures per exception type in Redis. The counter's TTL equals that deployment's
+  # cooldown_time. A deployment cools down when a count EXCEEDS its allowance. Errors the policy
+  # does not list (e.g. 401/404) fall back to the default allowance of 3, still using the
+  # deployment's cooldown_time. Explicit per-exception entries also apply to single-deployment
+  # groups, and to errors mentioning APIConnectionError, which the router otherwise exempts.
+  # A cooled-down
+  # deployment is not retried: Router.should_retry_this_error raises when no deployment is
+  # healthy, and the request goes to the fallback group.
+  #   - small (local vLLM): 0 allowed fails, cooldown 60 s. The first refused connection cools
+  #     it down, the call falls back at once, and later calls skip it for 60 s.
+  #   - hosted (strong, strong-fallback, small-fallback): cooldown 30 s.
+  #     - 429: the 4th within the window. One call's 3 attempts of 429 do not eject the
+  #       deployment.
+  #     - 500/503/timeout: the 3rd within the window.
+  #     The proxy's own rpm/tpm pre-check (enforce_model_rate_limits) raises litellm.RateLimitError
+  #     and calls set_cooldown_deployments (router.async_routing_strategy_pre_call_checks), so
+  #     local-limit rejections feed the SAME RateLimitError counter. They cannot be told apart in
+  #     config. A cooldown triggered there lasts the router default of 5 s, because that path
+  #     passes router.cooldown_time and not the deployment's. This is acceptable: a deployment
+  #     rejected by its own per-minute limit has no capacity left this minute anyway.
   retry_policy:
     RateLimitErrorRetries: 2
     InternalServerErrorRetries: 2
