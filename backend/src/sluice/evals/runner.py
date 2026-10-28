@@ -512,7 +512,7 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
             f"- `{split}` cases: `LOCK.json` sha256 `{splits.get(split, {}).get('sha256', _NONE)}`"
             for split in sorted({s.split for s in summaries})
         ],
-        "- Environment (from `LOCK.json`): "
+        "- Case-build environment (from `LOCK.json`): "
         + (", ".join(f"{lib} {ver}" for lib, ver in sorted(env.items())) or _NONE),
         f"- Run date (UTC): {max(dates).astimezone(UTC).date().isoformat() if dates else _NONE}",
     ]

@@ -539,3 +539,8 @@ def test_render_results_keeps_bootstrap_for_non_boolean_metrics() -> None:
 def test_render_results_intro_names_the_exact_binomial_method() -> None:
     intro = render_results([_boundary_summary()], LOCK).split("## Overall")[0]
     assert "Clopper-Pearson" in intro
+
+
+def test_render_results_labels_the_case_build_environment() -> None:
+    md = render_results([_summary()], LOCK)
+    assert "- Case-build environment (from `LOCK.json`): duckdb 2.0.0, polars 2.1.0" in md

@@ -116,6 +116,7 @@ def test_bootstrap_rejects_non_finite(bad):
         bootstrap_ci([0.1, bad])
 
 
+@pytest.mark.slow  # wall-clock bound: flaky on loaded CI runners
 def test_bootstrap_300_values_10k_resamples_is_fast():
     values = [(i * 7919 % 300) / 300 for i in range(300)]
     bootstrap_ci(values)  # warm-up (imports, allocator)
