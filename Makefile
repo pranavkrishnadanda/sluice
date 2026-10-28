@@ -1,4 +1,4 @@
-.PHONY: test test-all lint fmt cases
+.PHONY: test test-all lint fmt cases eval-rules results
 
 test:
 	cd backend && uv run pytest -q -m "not slow"
@@ -20,3 +20,9 @@ cases:
 	$(SLUICE) cases --split dev --n 300
 	$(SLUICE) cases --split holdout --n 300
 	$(SLUICE) cases --verify
+
+eval-rules:
+	$(SLUICE) eval --system rules --split dev --trials 1
+
+results:
+	$(SLUICE) results
