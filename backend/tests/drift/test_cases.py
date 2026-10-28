@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import polars as pl
 import pytest
@@ -23,7 +24,9 @@ from sluice.drift.cases import (
     load_reference,
     plan_split,
     sample_recipe,
+    severe_options,
     split_hash,
+    unexpected_files,
 )
 from sluice.drift.ops import DriftError
 from sluice.drift.writers import write_input
@@ -185,6 +188,10 @@ def _assert_recipe_rules(recipe: Recipe) -> None:
     assert recipe.fmt in {"csv", "json", "json_nested", "parquet"}
     if recipe.encoding == "latin-1":
         assert recipe.fmt == "csv"
+        assert recipe.difficulty != "easy"
+        assert ("unicode_text", "o_comment" if recipe.table == "orders" else "l_comment") in [
+            (op, p.get("column")) for op, p in recipe.ops
+        ]
     assert recipe.n_rows == 500
     contract = load_contract(recipe.table)
     for op, p in recipe.ops:
@@ -362,8 +369,10 @@ def test_cli_cases_build_lock_verify(tmp_path: Path) -> None:
         assert result.exit_code == 0, result.output
     assert runner.invoke(app, [*base, "--lock"]).exit_code == 0
     lock = json.loads((tmp_path / "LOCK.json").read_text(encoding="utf-8"))
-    assert set(lock) == {"dev", "holdout"}
-    assert lock["dev"]["n_cases"] == 2
+    assert set(lock) == {"environment", "splits"}
+    assert lock["environment"] == {"duckdb": duckdb.__version__, "polars": pl.__version__}
+    assert set(lock["splits"]) == {"dev", "holdout"}
+    assert lock["splits"]["dev"]["n_cases"] == 2
     assert runner.invoke(app, [*base, "--verify"]).exit_code == 0
 
     manifest = tmp_path / "dev" / "dev-0000" / "manifest.json"
@@ -388,3 +397,150 @@ def test_split_hash_ignores_dotfiles(tmp_path: Path) -> None:
     before = split_hash(cases)
     (cases[0].dir / ".DS_Store").write_bytes(b"finder")
     assert split_hash(cases) == before
+
+
+# --- fix round 1: latin-1, severe stratification, version stamp, stray files ----------------
+
+
+def _has_high_byte(path: Path) -> bool:
+    return any(b > 127 for b in path.read_bytes())
+
+
+def test_latin1_cases_contain_non_ascii(tmp_path: Path, clean: dict[str, pl.DataFrame]) -> None:
+    rng = np.random.default_rng(99)
+    latin = []
+    for i in range(600):
+        recipe = sample_recipe(TABLES[i % 2], DIFFICULTIES[i % 3], rng)
+        if recipe.encoding == "latin-1":
+            latin.append(recipe)
+    assert len(latin) >= 10
+    for i, recipe in enumerate(latin):
+        case = build_case(f"dev-{i:04d}", "dev", recipe, clean, i, tmp_path)
+        assert _has_high_byte(case.input_path), recipe
+
+
+def test_easy_csv_is_never_latin1() -> None:
+    rng = np.random.default_rng(5)
+    recipes = [sample_recipe("orders", "easy", rng) for _ in range(400)]
+    assert all(r.encoding != "latin-1" for r in recipes)
+    assert any(r.fmt == "csv" for r in recipes)
+
+
+def test_hard_severe_op_is_stratified() -> None:
+    plan = plan_split("holdout", 300, 1)
+    hard = [p for p in plan if p.recipe.difficulty == "hard"]
+    by_table = {t: Counter(p.severe for p in hard if p.recipe.table == t) for t in TABLES}
+    assert by_table["orders"] == {"unit_paise": 18, "destroy": 18, "drop_column": 18}
+    assert by_table["lineitem"] == {
+        "unit_paise": 9,
+        "destroy": 9,
+        "drop_column": 9,
+        "fk_break": 9,
+    }
+    for p in hard:
+        params = [prm for op, prm in p.recipe.ops if op == p.severe]
+        assert params, p
+        if p.severe == "unit_paise":
+            assert params[0]["hinted"] is False
+    assert all(p.severe is None for p in plan if p.recipe.difficulty != "hard")
+
+
+def test_table_mix_is_stratified_within_difficulty() -> None:
+    plan = plan_split("dev", 300, 1)
+    cells = Counter((p.recipe.difficulty, p.recipe.table) for p in plan)
+    assert cells == {
+        ("easy", "orders"): 54,
+        ("easy", "lineitem"): 36,
+        ("medium", "orders"): 72,
+        ("medium", "lineitem"): 48,
+        ("hard", "orders"): 54,
+        ("hard", "lineitem"): 36,
+    }
+
+
+def test_severe_options_and_validation() -> None:
+    assert severe_options("orders") == ("unit_paise", "destroy", "drop_column")
+    assert severe_options("lineitem") == ("unit_paise", "destroy", "drop_column", "fk_break")
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="severe"):
+        sample_recipe("orders", "hard", rng, severe="fk_break")
+    with pytest.raises(ValueError, match="severe"):
+        sample_recipe("lineitem", "medium", rng, severe="destroy")
+
+
+def test_build_case_clears_existing_case_dir(
+    tmp_path: Path, clean: dict[str, pl.DataFrame]
+) -> None:
+    (tmp_path / "dev-0000").mkdir()
+    (tmp_path / "dev-0000" / "manifest 2.json").write_text("{}", encoding="utf-8")
+    case = build_case("dev-0000", "dev", _hard_lineitem_recipe(), clean, 1, tmp_path)
+    assert sorted(p.name for p in case.dir.iterdir()) == [
+        "expected.parquet",
+        "input.csv",
+        "manifest.json",
+    ]
+
+
+def test_build_split_removes_conflict_copies(tmp_path: Path) -> None:
+    build_split("dev", 2, 1, tmp_path)
+    (tmp_path / "dev-0000 2").mkdir()
+    (tmp_path / "dev-0001" / "expected 2.parquet").write_bytes(b"x")
+    build_split("dev", 2, 1, tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dev-0000", "dev-0001"]
+    assert unexpected_files(tmp_path) == []
+
+
+def test_unexpected_files_lists_strays(tmp_path: Path) -> None:
+    cases = build_split("dev", 2, 1, tmp_path)
+    assert unexpected_files(tmp_path) == []
+    (cases[0].dir / ".DS_Store").write_bytes(b"finder")
+    conflict = cases[0].dir / "manifest 2.json"
+    conflict.write_text("{}", encoding="utf-8")
+    other_input = cases[1].dir / (
+        "input.parquet" if cases[1].manifest["format"] != "parquet" else "input.csv"
+    )
+    other_input.write_bytes(b"x")
+    stray_dir = tmp_path / "dev-0000 2"
+    stray_dir.mkdir()
+    assert unexpected_files(tmp_path) == sorted([conflict, other_input, stray_dir])
+
+
+def _locked(tmp_path: Path) -> list[str]:
+    runner = CliRunner()
+    base = ["cases", "--cases-dir", str(tmp_path)]
+    assert runner.invoke(app, [*base, "--split", "dev", "--n", "2", "--lock"]).exit_code == 0
+    assert runner.invoke(app, [*base, "--verify"]).exit_code == 0
+    return base
+
+
+def test_cli_verify_fails_on_unexpected_files(tmp_path: Path) -> None:
+    base = _locked(tmp_path)
+    stray = tmp_path / "dev" / "dev-0001" / "input 2.csv"
+    stray.write_bytes(b"x")
+    result = CliRunner().invoke(app, [*base, "--verify"])
+    assert result.exit_code == 1
+    assert "unexpected" in result.output
+    assert str(stray) in result.output
+
+
+def test_cli_verify_reports_environment_change(tmp_path: Path) -> None:
+    base = _locked(tmp_path)
+    lock_path = tmp_path / "LOCK.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["environment"]["polars"] = "0.0.1"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    result = CliRunner().invoke(app, [*base, "--verify"])
+    assert result.exit_code == 1
+    assert f"environment changed (polars 0.0.1 -> {pl.__version__})" in result.output
+    assert "make cases" in result.output
+
+
+@pytest.mark.parametrize("table", TABLES)
+def test_forced_severe_recipes_never_raise(table: str, clean: dict[str, pl.DataFrame]) -> None:
+    rng = np.random.default_rng(77)
+    for severe in severe_options(table):
+        for i in range(50):
+            recipe = sample_recipe(table, "hard", rng, severe=severe)
+            _assert_recipe_rules(recipe)
+            assert severe in [op for op, _ in recipe.ops]
+            apply_recipe(recipe, clean, seed=i)
