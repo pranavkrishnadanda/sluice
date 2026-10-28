@@ -121,9 +121,9 @@ export function ResultsTable({ summary }: ResultsTableProps) {
         </table>
       </section>
       <p className="text-muted text-xs leading-5">
-        Brackets show 95% confidence intervals. pass^4 is the estimated chance
-        that all 4 runs of a case succeed (τ-bench pass^k estimator). — means
-        not measured.
+        Brackets show 95% confidence intervals. pass^4 is the estimated
+        probability that all 4 runs of a case succeed (τ-bench pass^k
+        estimator). — means not measured.
       </p>
     </div>
   );

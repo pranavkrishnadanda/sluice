@@ -1,12 +1,13 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ApiProvider } from "@/components/api/ApiProvider";
 import { AppShell } from "@/components/shell/AppShell";
 import { groupRunsByDay } from "@/components/shell/group-runs";
+import { RunStreamProvider } from "@/components/thread/run-stream";
 import { MockApiClient } from "@/lib/api/mock-client";
-import type { ApiClient, RunSummary } from "@/lib/api/types";
+import type { ApiClient, RunEvent, RunSummary } from "@/lib/api/types";
 import { setViewportWidth } from "../helpers/viewport";
 
 const nav = vi.hoisted(() => ({ pathname: "/runs" }));
@@ -87,6 +88,57 @@ describe("AppShell", () => {
     // Status is conveyed in text, not only by the dot's colour.
     expect(
       list.getByRole("link", { name: /lineitem_2026-10\.csv.*quarantined/i }),
+    ).toBeInTheDocument();
+  });
+
+  test("the open run's status dot refreshes when its run_finished arrives", async () => {
+    const client = new MockApiClient({ delayMs: 0 });
+    const run = await client.createRun(
+      new File(["a"], "fresh.csv", { type: "text/csv" }),
+      "orders",
+    );
+    nav.pathname = `/runs/${run.id}`;
+    const listRuns = vi.spyOn(client, "listRuns");
+    let emit: ((e: RunEvent) => void) | null = null;
+    let finish: (() => void) | null = null;
+    const events: RunEvent[] = [];
+    await client.streamEvents(
+      run.id,
+      (e) => events.push(e),
+      new AbortController().signal,
+    );
+    vi.spyOn(client, "streamEvents").mockImplementation(
+      (_id, onEvent) =>
+        new Promise<void>((resolve) => {
+          emit = onEvent;
+          finish = resolve;
+        }),
+    );
+    render(
+      <ApiProvider client={client}>
+        <RunStreamProvider runId={run.id}>
+          <AppShell>
+            <h1>Run</h1>
+          </AppShell>
+        </RunStreamProvider>
+      </ApiProvider>,
+    );
+    await within(sidebar()).findByRole("link", { name: /fresh\.csv/ });
+    const before = listRuns.mock.calls.length;
+    act(() => {
+      for (const e of events.slice(0, -1)) emit?.(e);
+    });
+    expect(listRuns.mock.calls.length).toBe(before);
+    act(() => {
+      const last = events.at(-1);
+      if (last) emit?.(last);
+      finish?.();
+    });
+    await waitFor(() => expect(listRuns.mock.calls.length).toBe(before + 1));
+    expect(
+      await within(sidebar()).findByRole("link", {
+        name: /fresh\.csv, succeeded/i,
+      }),
     ).toBeInTheDocument();
   });
 

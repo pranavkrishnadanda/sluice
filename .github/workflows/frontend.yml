@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - "frontend/**"
+      - "docs/api/contract.md"
       - ".github/workflows/frontend.yml"
   pull_request:
     paths:
       - "frontend/**"
+      - "docs/api/contract.md"
       - ".github/workflows/frontend.yml"
 
 permissions:

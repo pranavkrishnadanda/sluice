@@ -8,7 +8,7 @@ import { useRunStream } from "@/components/thread/run-stream";
 import { errorDetail } from "@/lib/api/errors";
 import type { Transform } from "@/lib/api/types";
 import type { RunViewState } from "@/lib/run-state";
-import { CodeTab } from "./CodeTab";
+import { CodeTab, type NoCodeReason } from "./CodeTab";
 import { DataTab, DataTabSkeleton } from "./DataTab";
 import { PlanTab } from "./PlanTab";
 import { type PreviewPages, usePreviewPages } from "./use-preview-pages";
@@ -48,6 +48,13 @@ const transformsKey = (state: RunViewState | null) =>
         .map((n) => `${n.id}:${n.attemptsReported}`)
         .join(",")
     : "static";
+
+function noCodeReason(state: RunViewState | null): NoCodeReason {
+  if (!state) return "none";
+  if (!state.finished) return "pending";
+  if (state.noLlmWork) return "rules";
+  return state.status === "failed" ? "failed" : "none";
+}
 
 function Unavailable({
   what,
@@ -278,7 +285,7 @@ export function SidePanel({
             <CodeTab
               transforms={visibleTransforms(data, state)}
               nodes={planNodes}
-              pending={state !== null && !state.finished}
+              emptyReason={noCodeReason(state)}
             />
           )}
         </Loaded>

@@ -37,10 +37,14 @@ async function* readSse(
   let buffer = "";
   let id: string | null = null;
   let data: string[] = [];
+  let finished = false;
   try {
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) return;
+      if (done) {
+        finished = true;
+        return;
+      }
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split(/\r\n|\r|\n/);
       // The last piece may be an incomplete line (or a lone "\r" of "\r\n").
@@ -62,7 +66,18 @@ async function* readSse(
       }
     }
   } finally {
+    // The consumer stopped early (e.g. after `run_finished`) or the read
+    // failed: cancel the body so the connection is closed, not leaked.
+    if (!finished) await reader.cancel().catch(() => {});
     reader.releaseLock();
+  }
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
   }
 }
 
@@ -159,7 +174,9 @@ export class HttpApiClient implements ApiClient {
         if (!res.body) throw new Error(`Empty event stream from ${url}`);
 
         for await (const message of readSse(res.body)) {
-          const parsed: unknown = JSON.parse(message.data);
+          const parsed = parseJson(message.data);
+          // Malformed or unrecognised messages are skipped (the contract
+          // says clients ignore what they do not understand).
           if (!isRunEvent(parsed) || parsed.seq <= lastSeq) continue;
           lastSeq = parsed.seq;
           progressed = true;

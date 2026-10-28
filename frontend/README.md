@@ -9,6 +9,57 @@ bun install
 bun run dev        # http://localhost:3000
 ```
 
+No dependency install scripts are needed, so none are trusted
+(`"trustedDependencies": []`): `sharp` ships prebuilt binaries through its
+optional `@img/*` packages, and `bun pm untrusted` reports nothing blocked.
+
+## Demo mode and the backend
+
+The UI talks to the backend through one `ApiClient` interface
+(`src/lib/api/`), chosen from `NEXT_PUBLIC_SLUICE_API_URL`:
+
+| Value                               | Client                                                                  |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| unset, empty or `mock`              | `MockApiClient`: built-in fixture runs and eval results, in the browser |
+| a URL, e.g. `http://localhost:8080` | `HttpApiClient` against the FastAPI backend                             |
+
+- **Demo mode** needs no backend. Every number-bearing view (header, run
+  summary, side panel, eval cards) shows a "Demo data" badge. A file you
+  upload is **not** uploaded or read: the mock replays a sample run and says
+  so in the thread.
+- The backend listens on **port 8080** (8000 is reserved on the owner's
+  machine); it must allow CORS from the UI's origin, including on the SSE
+  stream and for the `Last-Event-ID` header. See
+  [`docs/api/contract.md`](../docs/api/contract.md) for the full contract.
+- `NEXT_PUBLIC_SLUICE_API_URL` is **inlined at build time**: after changing
+  it, restart `bun run dev` or rebuild. A built app cannot be pointed at a
+  different backend at runtime.
+
+```bash
+NEXT_PUBLIC_SLUICE_API_URL=http://localhost:8080 bun run dev
+```
+
+## Stack choices
+
+- **Next.js App Router, React, TypeScript strict, Tailwind CSS.** Server
+  Components by default; client components only where there is interaction
+  or a live stream.
+- **TanStack Virtual, without TanStack Table.** The Data tab is a native
+  `<table>` with a fixed row height, virtualised by `@tanstack/react-virtual`.
+  It has no sorting, grouping or column state, so a table engine would add
+  weight without features.
+- **Radix Tabs, without shadcn/ui.** The side panel uses
+  `@radix-ui/react-tabs` directly for its keyboard and ARIA behaviour. The
+  rest of the UI is a small set of local components (glass surfaces, pills,
+  chips) styled with Tailwind tokens, so a component kit's generated sources
+  would mostly be unused.
+- **ECharts** (modular imports, SVG renderer, loaded on the evals page only)
+  for the cost-quality chart; **Shiki** (loaded on demand) for code
+  highlighting.
+- **Bun** for packages and scripts; **Biome** and **Oxlint** for lint and
+  format; **tsgo** for type checking; **Vitest** + Testing Library and
+  **Playwright** + axe for tests.
+
 ## Checks
 
 | Command             | What it does                         |

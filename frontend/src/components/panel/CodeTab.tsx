@@ -278,11 +278,26 @@ function NodeTransforms({ group }: { group: TransformGroup }) {
   );
 }
 
+/**
+ * Why a run may have no transforms, which picks the empty copy:
+ * still running, rules handled everything (`noLlmWork`), the run failed,
+ * or nothing more specific is known.
+ */
+export type NoCodeReason = "pending" | "rules" | "failed" | "none";
+
+const NO_CODE: Record<NoCodeReason, string> = {
+  pending: "No generated code yet — transforms appear as plan steps finish.",
+  rules: "No generated code — deterministic rules handled this run.",
+  failed:
+    "No generated code — the run failed before any transform was written.",
+  none: "No generated code for this run.",
+};
+
 export interface CodeTabProps {
   transforms: readonly Transform[];
   nodes: readonly { id: string; title: string }[];
-  /** The run is still producing transforms (changes the empty copy). */
-  pending: boolean;
+  /** Picks the copy shown when there are no transforms. */
+  emptyReason: NoCodeReason;
 }
 
 /**
@@ -290,7 +305,7 @@ export interface CodeTabProps {
  * picker and (for repaired nodes) a line diff against the previous attempt.
  * Highlighting loads Shiki on demand; the plain code renders first.
  */
-export function CodeTab({ transforms, nodes, pending }: CodeTabProps) {
+export function CodeTab({ transforms, nodes, emptyReason }: CodeTabProps) {
   const groups = useMemo(
     () => groupTransforms(transforms, nodes),
     [transforms, nodes],
@@ -298,9 +313,7 @@ export function CodeTab({ transforms, nodes, pending }: CodeTabProps) {
   if (groups.length === 0) {
     return (
       <p className="grid min-h-40 place-items-center rounded-xl bg-chip px-4 text-center text-muted text-sm">
-        {pending
-          ? "No generated code yet — transforms appear as plan steps finish."
-          : "No generated code — deterministic rules handled this run."}
+        {NO_CODE[emptyReason]}
       </p>
     );
   }

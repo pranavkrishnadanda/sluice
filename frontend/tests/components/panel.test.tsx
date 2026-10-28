@@ -446,7 +446,47 @@ describe("code tab", () => {
     const user = userEvent.setup();
     renderPanel("run-clean", stateOf(RUN_CLEAN_EVENTS));
     await user.click(screen.getByRole("tab", { name: "Code" }));
-    expect(await screen.findByText(/no generated code/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/deterministic rules handled this run/i),
+    ).toBeInTheDocument();
+  });
+
+  test("a failed run without transforms does not credit the rules", async () => {
+    const user = userEvent.setup();
+    const empty = withPreview(bigPreview(1));
+    const client: ApiClient = { ...empty, getTransforms: async () => [] };
+    const failed = stateOf([
+      ...RUN_REPAIRED_EVENTS.slice(0, 5),
+      {
+        seq: 6,
+        at: "2026-10-27T10:14:09.000Z",
+        type: "run_finished",
+        status: "failed",
+        summary: "Model provider unavailable",
+        costUsd: 0,
+        tokens: 0,
+      },
+    ]);
+    renderPanel("run-repaired", failed, client);
+    await user.click(screen.getByRole("tab", { name: "Code" }));
+    expect(
+      await screen.findByText(/run failed before any transform was written/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/deterministic rules/i)).toBeNull();
+  });
+
+  test("a finished run with plan nodes but no transforms is not 'rules only'", async () => {
+    const user = userEvent.setup();
+    const client: ApiClient = {
+      ...withPreview(bigPreview(1)),
+      getTransforms: async () => [],
+    };
+    renderPanel("run-repaired", stateOf(RUN_REPAIRED_EVENTS), client);
+    await user.click(screen.getByRole("tab", { name: "Code" }));
+    expect(
+      await screen.findByText(/no generated code for this run/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/deterministic rules/i)).toBeNull();
   });
 
   test("refetches transforms once per reported attempt, not per status change", async () => {

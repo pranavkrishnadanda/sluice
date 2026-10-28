@@ -145,7 +145,7 @@ describe("ResultsTable", () => {
     render(<ResultsTable summary={EVAL_SUMMARY} />);
     expect(
       screen.getByText(
-        /pass\^4 is the estimated chance that all 4 runs of a case succeed \(τ-bench pass\^k estimator\)/,
+        /pass\^4 is the estimated probability that all 4 runs of a case succeed \(τ-bench pass\^k estimator\)/,
       ),
     ).toBeInTheDocument();
   });

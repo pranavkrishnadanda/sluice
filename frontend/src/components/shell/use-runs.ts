@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useApi } from "@/components/api/ApiProvider";
+import { useRunStream } from "@/components/thread/run-stream";
 import type { ApiClient, RunSummary } from "@/lib/api/types";
 
 export type RunsState =
@@ -35,11 +36,15 @@ const failed =
 
 /**
  * The run list for the sidebar: stale-while-revalidate from the last list
- * this client returned, refetched on every mount. With nothing to show, a
- * failure becomes `error` and `retry` refetches.
+ * this client returned, refetched on every mount and again when the open
+ * run's `run_finished` arrives (so its status dot settles). With nothing to
+ * show, a failure becomes `error` and `retry` refetches.
  */
 export function useRuns(): { state: RunsState; retry: () => void } {
   const api = useApi();
+  const stream = useRunStream();
+  // Set once the open run's stream reports `run_finished`.
+  const finishedRun = stream?.state.finished ? stream.runId : null;
   const [state, setState] = useState<RunsState>(
     () => lastRuns.get(api) ?? { status: "loading" },
   );
@@ -58,6 +63,22 @@ export function useRuns(): { state: RunsState; retry: () => void } {
       live = false;
     };
   }, [api]);
+
+  // The open run just finished: refetch so its status dot settles. A failed
+  // refetch keeps the list on screen.
+  useEffect(() => {
+    if (finishedRun === null) return;
+    let live = true;
+    fetchRuns(api).then(
+      (ready) => {
+        if (live) setState(ready);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [api, finishedRun]);
 
   const retry = useCallback(() => {
     setState({ status: "loading" });
