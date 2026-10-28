@@ -1,10 +1,10 @@
 .PHONY: test test-all lint fmt cases eval-rules results
 
 test:
-	cd backend && uv run pytest -q -m "not slow"
+	cd backend && uv run python -m pytest -q -m "not slow"
 
 test-all:
-	cd backend && uv run pytest -q
+	cd backend && uv run python -m pytest -q
 
 lint:
 	cd backend && uv run ruff check . && uv run ruff format --check .
