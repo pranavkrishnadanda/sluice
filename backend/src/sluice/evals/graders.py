@@ -14,7 +14,9 @@ PK (``O`` is empty when ``out.file_quarantined``).
   if ``n_flag_cells == 0``).
 * ``fabricated_rows = |PK(O) - (PK(E) | case.quarantined())|``; ``extra_columns`` are output
   columns not in the contract.
-* ``contract_pass = validate(contract, out.df, reference, flags=out.flags).passed``.
+* ``contract_pass`` is ``False`` when ``out.file_quarantined`` (a quarantined file has no final
+  output) or when the output has no rows while ``E`` has rows; otherwise it is
+  ``validate(contract, out.df, reference, flags=out.flags).passed``.
 * ``success = cell_accuracy == 1.0 and contract_pass and fabricated_rows == 0``.
 
 Value comparison: each output column is cast to its contract dtype and compared exactly to
@@ -259,7 +261,8 @@ def grade(case: Case, out: SystemOutput, reference: dict[str, set[Any]]) -> Grad
 
     cell_accuracy = _ratio(n_correct, n_cells)
     fabricated_rows = len(o_pks - (e_pks | case.quarantined()))
-    contract_pass = validate(contract, out.df, reference, flags=out.flags).passed
+    has_output = not out.file_quarantined and (out.df.height > 0 or expected.height == 0)
+    contract_pass = has_output and validate(contract, out.df, reference, flags=out.flags).passed
     return Grade(
         case_id=case.case_id,
         difficulty=case.difficulty,

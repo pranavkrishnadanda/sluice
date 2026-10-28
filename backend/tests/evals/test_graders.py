@@ -479,3 +479,30 @@ def test_bad_string_cell_is_the_only_incorrect_cell(
     t = _truth(orders)
     g = grade(_case(tmp_path, t), _out(_with(t, column, values, pl.String())), {})
     assert g.cell_accuracy == pytest.approx(ONE_WRONG)
+
+
+# --- final-review fixes: quarantined/empty output and nested dtypes --------------------------
+
+
+def test_file_quarantined_output_fails_the_contract(tmp_path: Path, orders: Contract) -> None:
+    # A quarantined file has no final output, so it cannot pass the contract (spec 7.7).
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t), _out(t.clear(), file_quarantined=True), {})
+    assert g.contract_pass is False
+    assert g.success is False
+
+
+def test_empty_output_fails_the_contract_when_rows_are_expected(
+    tmp_path: Path, orders: Contract
+) -> None:
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t), _out(t.clear()), {})
+    assert g.contract_pass is False
+
+
+def test_empty_output_can_pass_the_contract_when_no_rows_are_expected(
+    tmp_path: Path, orders: Contract
+) -> None:
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t.clear()), _out(t.clear()), {})
+    assert g.contract_pass is True
