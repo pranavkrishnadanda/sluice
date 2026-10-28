@@ -44,7 +44,7 @@ import polars as pl
 
 from sluice.contracts.model import MONEY_PRECISION, MONEY_SCALE, ColumnSpec, Contract
 from sluice.evals.types import PK
-from sluice.rules.profile import Profile
+from sluice.rules.profile import Profile, match_columns
 
 SENTINEL_TOKENS: frozenset[str] = frozenset({"N/A", "", "-1", "###"})
 DAY_FIRST_LOCALES: frozenset[str] = frozenset({"en_IN"})
@@ -367,6 +367,31 @@ def _collect_flags(frame: pl.DataFrame, contract: Contract) -> set[tuple[PK, str
         for spec in contract.columns
         for key in frame.filter(pl.col(_flag_col(spec.name))).select(pk).rows()
     }
+
+
+def cell_texts(series: pl.Series) -> list[str | None] | None:
+    """Raw cells as the text the rules parse (see :func:`_as_text`); ``None`` if unsupported."""
+    return _as_text(series)
+
+
+def raw_keys(df: pl.DataFrame, contract: Contract) -> list[PK | None]:
+    """The clean primary key the rules derive for each raw row, in row order.
+
+    Uses the rules' own column matching and cell parsing, so a key here equals the key the row
+    carries in :attr:`RuleResult.flags` (when the row survives). ``None`` where any key part
+    fails to parse, or when a key column has no matching input column.
+
+    Complexity: O(rows x key columns).
+    """
+    by_target = {target: name for name, target in match_columns(list(df.columns), contract).items()}
+    parts: list[list[Any]] = []
+    for key in contract.primary_key:
+        if key not in by_target:
+            return [None] * df.height
+        parts.append(
+            _repair_column(contract.column(key), df[by_target[key]], contract.locale).values
+        )
+    return [None if any(v is None for v in row) else tuple(row) for row in zip(*parts, strict=True)]
 
 
 def apply_rules(
