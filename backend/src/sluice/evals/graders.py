@@ -1,0 +1,195 @@
+"""Ground-truth graders: score one system output against one case's truth.
+
+Definitions (spec section 7.7). ``E`` = expected rows keyed by PK; ``O`` = output rows keyed by
+PK (``O`` is empty when ``out.file_quarantined``).
+
+* ``row_recall = |PK(O) & PK(E)| / |PK(E)|``; ``row_precision = |PK(O) & PK(E)| / |PK(O)|``;
+  ``None`` when the denominator is 0.
+* For each ``pk`` in ``E`` and contract column ``c``: *truth* is ``FLAG`` if ``(pk, c)`` is in
+  ``case.flags()``, else the expected value. *Prediction* is ``MISSING`` if ``pk`` is not in
+  ``O``; ``FLAG`` if ``(pk, c)`` is in ``out.flags`` and the output cell is null; otherwise the
+  output value (null is a value). A cell is correct iff truth == prediction.
+* ``cell_accuracy = correct / n_cells`` (``None`` if ``n_cells == 0``).
+* ``fabrication_rate = |truth FLAG and prediction a non-null value| / n_flag_cells`` (``None``
+  if ``n_flag_cells == 0``).
+* ``fabricated_rows = |PK(O) - (PK(E) | case.quarantined())|``; ``extra_columns`` are output
+  columns not in the contract.
+* ``contract_pass = validate(contract, out.df, reference, flags=out.flags).passed``.
+* ``success = cell_accuracy == 1.0 and contract_pass and fabricated_rows == 0``.
+
+Value comparison: each output column is cast (non-strict) to its contract dtype and compared
+exactly to truth (``Decimal(15, 2)`` money exactly, dates exactly, strings exactly, timestamps
+truncated to the second on both sides). A non-null output cell whose cast fails (or whose column
+cannot be cast at all) is a non-null value equal to nothing: incorrect, and a fabrication where
+truth is ``FLAG``. A contract column missing from the output makes its cells ``MISSING``.
+
+Output rows are keyed by the PK columns cast to the contract dtypes; if any PK column is
+missing no output row is addressable and ``O`` is empty. Duplicate output PKs are scored on
+their first occurrence (``validate`` already fails ``unique_pk``).
+
+Cost: a handful of vectorised Polars joins over ``|E| + |O|`` rows; ``O(|E| + |O| + |flags|)``.
+"""
+
+from dataclasses import dataclass
+from typing import Any
+
+import polars as pl
+
+from sluice.contracts.model import Contract, load_contract
+from sluice.contracts.validate import validate
+from sluice.drift.cases import Case
+from sluice.evals.types import PK, SystemOutput
+
+_P = "__sluice_pred_"  # cast output value
+_N = "__sluice_nn_"  # output cell is non-null (before the cast)
+_TF = "__sluice_truth_flag_"
+_OF = "__sluice_out_flag_"
+_PRESENT = "__sluice_present"
+_FLAG_COL = "__sluice_column"
+_TIMESTAMP_PRECISION = "1s"
+
+
+@dataclass(frozen=True, slots=True)
+class Grade:
+    """The score of one system output on one case (see the module docstring)."""
+
+    case_id: str
+    difficulty: str
+    cell_accuracy: float | None
+    fabrication_rate: float | None
+    fabricated_rows: int
+    extra_columns: list[str]
+    row_recall: float | None
+    row_precision: float | None
+    contract_pass: bool
+    success: bool
+    n_cells: int
+    n_flag_cells: int
+
+
+def _ratio(num: int, den: int) -> float | None:
+    return num / den if den else None
+
+
+def _cast(series: pl.Series, dtype: pl.DataType) -> pl.Series:
+    """``series`` cast non-strictly to ``dtype``; all-null if the cast is unsupported."""
+    try:
+        return series.cast(dtype, strict=False)
+    except Exception:  # any unsupported cast means "no castable value"
+        return pl.Series(series.name, [None] * series.len(), dtype=dtype)
+
+
+def _output_frame(contract: Contract, out: SystemOutput) -> pl.DataFrame:
+    """Output rows keyed by cast PK, with ``_P``/``_N`` columns per present contract column."""
+    schema = contract.polars_schema()
+    pk = list(contract.primary_key)
+    df = out.df
+    if out.file_quarantined or any(k not in df.columns for k in pk):
+        return pl.DataFrame(schema={k: schema[k] for k in pk})
+    cols: list[pl.Series] = [_cast(df[k], schema[k]) for k in pk]
+    for name, dtype in schema.items():
+        if name in df.columns:
+            cols.append(_cast(df[name], dtype).alias(_P + name))
+            cols.append(df[name].is_not_null().alias(_N + name))
+    return pl.DataFrame(cols).unique(subset=pk, keep="first", maintain_order=True)
+
+
+def _flag_indicators(
+    contract: Contract, flags: set[tuple[PK, str]], prefix: str, columns: list[str]
+) -> pl.DataFrame:
+    """One row per flagged PK, a boolean ``prefix+column`` per contract column."""
+    schema = contract.polars_schema()
+    pk = list(contract.primary_key)
+    width = len(pk)
+    rows = [(*key, column) for key, column in flags if len(key) == width and column in schema]
+    frame_schema: dict[str, Any] = {k: schema[k] for k in pk} | {_FLAG_COL: pl.String}
+    long = pl.DataFrame(rows, schema=frame_schema, orient="row", strict=False)
+    return long.group_by(pk).agg(
+        [(pl.col(_FLAG_COL) == c).any().alias(prefix + c) for c in columns]
+    )
+
+
+def _comparable(expr: pl.Expr, dtype: pl.DataType) -> pl.Expr:
+    if isinstance(dtype, pl.Datetime):
+        return expr.dt.truncate(_TIMESTAMP_PRECISION)
+    return expr
+
+
+def grade(case: Case, out: SystemOutput, reference: dict[str, set[Any]]) -> Grade:
+    """Score ``out`` against ``case``'s truth; never raises on malformed output.
+
+    Args:
+        case: The benchmark case (truth, expected flags and quarantine).
+        out: What the system returned.
+        reference: Parent key sets for foreign-key checks (``{}`` when there are none).
+    """
+    contract = load_contract(case.table, case.manifest.get("contract_version", "v1"))
+    schema = contract.polars_schema()
+    pk = list(contract.primary_key)
+    columns = list(schema)
+
+    expected = case.expected()
+    output = _output_frame(contract, out)
+    e_pks: set[PK] = set(expected.select(pk).rows())
+    o_pks: set[PK] = set(output.select(pk).rows())
+    hit = len(e_pks & o_pks)
+
+    truth_flags = _flag_indicators(contract, case.flags(), _TF, columns)
+    out_flags = _flag_indicators(contract, out.flags, _OF, columns)
+    joined = (
+        expected.join(truth_flags, on=pk, how="left")
+        .join(output.with_columns(pl.lit(True).alias(_PRESENT)), on=pk, how="left")
+        .join(out_flags, on=pk, how="left")
+    )
+
+    present = pl.col(_PRESENT).fill_null(False)
+    correct_terms: list[pl.Expr] = []
+    fabricated_terms: list[pl.Expr] = []
+    flag_terms: list[pl.Expr] = []
+    for c in columns:
+        truth_flag = pl.col(_TF + c).fill_null(False)
+        flag_terms.append(truth_flag)
+        if _P + c not in output.columns:  # column missing from output -> MISSING
+            correct_terms.append(pl.lit(False))
+            fabricated_terms.append(pl.lit(False))
+            continue
+        nonnull = pl.col(_N + c).fill_null(False)
+        value = pl.col(_P + c)
+        uncastable = nonnull & value.is_null()
+        pred_flag = present & pl.col(_OF + c).fill_null(False) & ~nonnull
+        value_equal = _comparable(value, schema[c]).eq_missing(_comparable(pl.col(c), schema[c]))
+        correct_terms.append(
+            pl.when(truth_flag)
+            .then(pred_flag)
+            .otherwise(present & ~pred_flag & ~uncastable & value_equal)
+        )
+        fabricated_terms.append(truth_flag & present & nonnull)
+
+    def total(terms: list[pl.Expr]) -> pl.Expr:
+        return pl.sum_horizontal([t.cast(pl.UInt32) for t in terms]).sum()
+
+    sums = joined.select(
+        total(correct_terms).alias("correct"),
+        total(fabricated_terms).alias("fabricated"),
+        total(flag_terms).alias("flag_cells"),
+    ).row(0)
+    n_correct, n_fabricated, n_flag_cells = (int(v or 0) for v in sums)
+    n_cells = expected.height * len(columns)
+
+    cell_accuracy = _ratio(n_correct, n_cells)
+    fabricated_rows = len(o_pks - (e_pks | case.quarantined()))
+    contract_pass = validate(contract, out.df, reference, flags=out.flags).passed
+    return Grade(
+        case_id=case.case_id,
+        difficulty=case.difficulty,
+        cell_accuracy=cell_accuracy,
+        fabrication_rate=_ratio(n_fabricated, n_flag_cells),
+        fabricated_rows=fabricated_rows,
+        extra_columns=[c for c in out.df.columns if c not in schema],
+        row_recall=_ratio(hit, len(e_pks)),
+        row_precision=_ratio(hit, len(o_pks)),
+        contract_pass=contract_pass,
+        success=cell_accuracy == 1.0 and contract_pass and fabricated_rows == 0,
+        n_cells=n_cells,
+        n_flag_cells=n_flag_cells,
+    )
