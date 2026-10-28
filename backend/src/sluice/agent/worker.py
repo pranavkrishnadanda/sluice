@@ -52,6 +52,7 @@ MAX_GUARD_ROWS: Final = 5
 """Offending row indices named in a guard error."""
 
 ALLOWED_IMPORTS: Final[frozenset[str]] = frozenset({"polars", "re", "decimal", "datetime", "math"})
+"""Modules generated code may import. `from __future__ import annotations` is also accepted."""
 
 BANNED_NAMES: Final[frozenset[str]] = frozenset(
     {
@@ -160,7 +161,8 @@ def precheck_code(code: str) -> str | None:
 
     Parses with `ast` only; nothing is executed or compiled to bytecode. O(size of the tree).
     Checks: size, syntax, a top-level non-async ``def transform`` with one positional parameter,
-    imports only from `ALLOWED_IMPORTS` and only at top level, no `BANNED_NAMES`, no dunder
+    imports only from `ALLOWED_IMPORTS` (plus `from __future__ import annotations`) and only at
+    top level, no `BANNED_NAMES`, no dunder
     attribute access.
     """
     if len(code) > MAX_CODE_CHARS:
@@ -197,7 +199,10 @@ def _check_node(node: ast.AST, *, top_level: bool) -> str | None:
     elif isinstance(node, ast.ImportFrom):
         if not top_level:
             return "imports are only allowed at the top level of the module"
-        if node.level or node.module not in ALLOWED_IMPORTS:
+        if node.module == "__future__" and not node.level:
+            if [a.name for a in node.names] != ["annotations"]:
+                return "only `from __future__ import annotations` is allowed from __future__"
+        elif node.level or node.module not in ALLOWED_IMPORTS:
             return f"import from {node.module or '.'!r} is not allowed ({_allowed()})"
     elif isinstance(node, ast.Name) and node.id in BANNED_NAMES:
         return f"use of {node.id!r} is not allowed"

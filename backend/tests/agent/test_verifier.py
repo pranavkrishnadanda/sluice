@@ -18,6 +18,7 @@ from sluice.agent.verifier import (
     Verdict,
     verify_node,
 )
+from sluice.contracts.model import ColumnSpec
 from sluice.llm.client import LLM, CallRecord
 
 BASE_URL = "http://litellm.test"
@@ -32,6 +33,7 @@ class Node:
 
 
 NODE = Node(id="n1", column="o_totalprice", issue="amounts in paise")
+SPEC = ColumnSpec(name="o_totalprice", dtype="decimal", unit="INR", min=0, max=600000)
 PAIRS: list[tuple[str, str | None]] = [("12450050", "124500.50"), ("N/A", None)]
 STATS: dict[str, float | int | None] = {
     "before_parsed_max": None,
@@ -65,7 +67,7 @@ class Capture:
 
 
 def _verify(cap: Capture, **overrides: Any) -> tuple[Verdict, CallRecord]:
-    kwargs: dict[str, Any] = {"node": NODE, "pairs": PAIRS, "stats": STATS}
+    kwargs: dict[str, Any] = {"node": NODE, "spec": SPEC, "pairs": PAIRS, "stats": STATS}
     kwargs.update(overrides)
 
     async def go() -> tuple[Verdict, CallRecord]:
@@ -124,3 +126,24 @@ def test_verdict_rejects_empty_reason() -> None:
 def test_verifier_system_prompt_mentions_unit_scale_and_fabrication() -> None:
     assert "100" in VERIFIER_SYSTEM_PROMPT
     assert "fabricat" in VERIFIER_SYSTEM_PROMPT.lower()
+
+
+def test_verify_node_prompt_contains_spec_dtype_unit_and_range() -> None:
+    cap = Capture({"accept": True, "reason": "ok"})
+    _verify(cap)
+    text = cap.text()
+    assert '"dtype": "decimal"' in text
+    assert '"unit": "INR"' in text
+    assert '"min": 0' in text
+    assert '"max": 600000' in text
+
+
+def test_verify_node_prompt_contains_enum_and_omits_unset_fields() -> None:
+    cap = Capture({"accept": True, "reason": "ok"})
+    spec = ColumnSpec(name="o_orderstatus", dtype="string", enum=["F", "O", "P"])
+    _verify(cap, spec=spec)
+    text = cap.text()
+    assert '"enum": ["F", "O", "P"]' in text
+    assert '"unit"' not in text
+    assert '"min"' not in text
+    assert '"max"' not in text

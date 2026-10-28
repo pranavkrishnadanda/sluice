@@ -200,6 +200,7 @@ def test_precheck_code_accepts_minimal_transform() -> None:
         "import re\nimport math\nfrom decimal import Decimal\nimport datetime\n" + GOOD_CODE,
         "from datetime import date, datetime\n" + GOOD_CODE,
         "import polars as pl\nimport re\n_X = re.compile(r'\\d')\n" + GOOD_CODE,
+        "from __future__ import annotations\n" + GOOD_CODE,
     ],
 )
 def test_precheck_code_accepts_allowed_imports(code: str) -> None:
@@ -241,6 +242,8 @@ def test_precheck_code_transform_with_wrong_arity_is_rejected() -> None:
         "import socket, re",
         "from . import x",
         "import importlib",
+        "from __future__ import generator_stop",
+        "import __future__",
     ],
 )
 def test_precheck_code_disallowed_import_is_rejected(imp: str) -> None:
