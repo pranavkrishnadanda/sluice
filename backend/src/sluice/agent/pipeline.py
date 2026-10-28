@@ -14,10 +14,12 @@ States, in order (each one emits the contract event named after it, see ``docs/a
 5. **work**, nodes in dependency waves, the nodes of one wave concurrently (``asyncio.gather``).
    Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` (unchecked draft)
    -> ``precheck_code``
-   -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> an effect check (the rewrite
-   must recover a flagged cell and break no parsed one) -> ``verify_node``. Each attempt emits
-   ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's reason is fed to
-   the next attempt as ``prior_error`` (the precheck's, guard's or verifier's own reason).
+   -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> keep only the rewritten
+   cells pass 1 flagged (Ruling F2: parsed cells keep their raw text) -> an effect check (the
+   rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``. Each
+   attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
+   reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
+   own reason).
    A node whose dependency was not accepted never starts.
    **Failure path** (contract): when a node's final attempt fails, no new node starts (nodes in
    flight finish), there is no ``verified``, and the whole input is quarantined
@@ -525,7 +527,7 @@ async def _attempt(
         out = out.cast(pl.String)
     if (reason := guard_output(values, out)) is not None:
         return reason, None
-    out = out.alias(source_name)
+    out = only_flagged(values, out.alias(source_name), flagged_before)  # Ruling F2
 
     effect = _effect(run.case, frame, source_name, spec, values, out, flagged_before)
     if effect.error is not None:
@@ -547,6 +549,19 @@ async def _attempt(
 
 
 # --------------------------------------------------------------------------- effect check
+
+
+def only_flagged(raw: pl.Series, out: pl.Series, flagged: set[int]) -> pl.Series:
+    """``out`` in the ``flagged`` rows, ``raw`` everywhere else (Ruling F2), named as ``out``.
+
+    A rewrite may only change the cells rules pass 1 flagged for its column: a cell the rules
+    parsed keeps its raw text, so a transform cannot alter a value the rules already read
+    (whatever the verifier sees). Every whole-column repair the drift ops need (paise, IST)
+    flags every row, so nothing a valid rewrite needs is lost. O(rows).
+    """
+    mask = pl.Series([i in flagged for i in range(raw.len())], dtype=pl.Boolean)
+    merged = pl.select(pl.when(mask).then(out).otherwise(raw)).to_series()
+    return merged.alias(out.name)
 
 
 @dataclass(frozen=True, slots=True)

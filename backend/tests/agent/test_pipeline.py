@@ -545,7 +545,9 @@ def test_pipeline_all_null_output_is_cast_to_string_and_rejected(indian: Case) -
     script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [ALL_NULL, STRIP_COMMAS]})
     result = run(indian, script)  # Ruling W2: a pl.Null output must not crash the guard
     (failed,) = result.events("attempt_failed")
-    assert "unparseable that the rules parsed before" in failed.error  # type: ignore[attr-defined]
+    # Ruling F2: only flagged cells take the rewrite, so the nulls break no parsed cell; the
+    # attempt is rejected because it recovers none of the flagged ones.
+    assert "recovered none" in failed.error  # type: ignore[attr-defined]
     assert price_flags(result.out) == 0
 
 
@@ -986,3 +988,37 @@ def test_pipeline_worker_sees_the_original_hinted_source_name(
     (prompt,) = script.roles("worker")
     assert 'Source column name: "o_totalprice_paise"' in prompt
     assert result.out.meta["nodes"][0]["accepted"] is True
+
+
+TAMPER_DATES = _module("    return values  # canned: fixes flagged dates, rewrites parsed ones")
+
+
+def _tamper_dates(values: pl.Series) -> pl.Series:
+    parsed = values.str.to_date("%d %b %Y", strict=False).dt.strftime("%Y-%m-%d")
+    return pl.Series(values.name, parsed).fill_null(pl.lit("1995-06-15"))
+
+
+CANNED[TAMPER_DATES] = lambda v: SandboxResult(True, _tamper_dates(v), None, 3)
+
+
+def test_pipeline_rewrite_only_replaces_cells_the_rules_flagged(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    """I-2 (Ruling F2): a rewrite that also changes parsed cells has no effect on them."""
+    case = _build(cases_dir, orders_df, "dev-0102", [DATES])
+    plan = {"nodes": [node("n1", "o_orderdate")]}
+    script = Script(plan=plan, workers={"o_orderdate": [TAMPER_DATES]})
+    result = run(case, script)
+    base = rules_only(case)
+    flagged = {pk for pk, column in base.flags if column == "o_orderdate"}
+    assert flagged, "the case must have flagged dates"
+    assert result.out.meta["nodes"][0]["accepted"] is True
+    key = "o_orderkey"
+    agent = dict(
+        zip(result.out.df[key].to_list(), result.out.df["o_orderdate"].to_list(), strict=True)
+    )
+    rules = dict(zip(base.df[key].to_list(), base.df["o_orderdate"].to_list(), strict=True))
+    unflagged = [k for k in rules if (k,) not in flagged]
+    assert unflagged
+    assert all(agent[k] == rules[k] for k in unflagged)
+    assert all(agent[k] is not None for (k,) in flagged)
