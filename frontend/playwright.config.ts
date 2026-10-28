@@ -47,7 +47,8 @@ export default defineConfig({
       NEXT_DIST_DIR: DIST_DIR,
       NEXT_TELEMETRY_DISABLED: "1",
     },
-    stdout: "ignore",
+    // Surface build/start output so CI failures are diagnosable.
+    stdout: "pipe",
     stderr: "pipe",
   },
 });

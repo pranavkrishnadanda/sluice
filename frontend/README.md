@@ -26,3 +26,10 @@ covers the upload → live run → Code/Plan flow, axe (WCAG 2.2 AA, light and
 dark), keyboard order, phone-width layout and reduced motion/transparency.
 Locally it drives your installed Google Chrome; CI installs Playwright's
 Chromium. Failures and the run screenshots land in `test-results/`.
+
+`tsconfig.json` lists `.next-e2e/types/**/*.ts` and `.next-e2e/dev/types/**/*.ts`
+in `include` and `.next-e2e` in `exclude` on purpose. `next build` with a custom
+`distDir` checks for those include strings and, if they are missing, adds them
+and reformats the whole file. The exclude then keeps a possibly stale e2e build's
+global route types (`PageProps`, `LayoutProps`) out of `bun run typecheck`, so
+only `.next/types` is type-checked.

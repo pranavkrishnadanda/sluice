@@ -6,22 +6,43 @@ import {
   openFinishedRun,
 } from "./helpers";
 
-const WCAG_AA = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
+const TAGS = [
+  "wcag2a",
+  "wcag2aa",
+  "wcag21a",
+  "wcag21aa",
+  "wcag22aa",
+  "best-practice",
+];
+
+/**
+ * Rules that fail at any impact. Everything else fails only when serious or
+ * critical. `heading-order` (moderate, best-practice) guards the panel's
+ * heading levels under the run's h1.
+ */
+const ALWAYS_BLOCKING = new Set(["heading-order"]);
 
 interface Scan {
-  /** Serious or critical WCAG A/AA violations, summarised for a readable diff. */
+  /** Blocking violations, summarised for a readable diff. */
   blocking: { id: string; impact: string; help: string; targets: string[] }[];
   /** Text nodes whose contrast axe actually measured (and passed). */
   contrastChecked: number;
+  /** Text nodes axe could not measure, with axe's reason. */
+  contrastIncomplete: string[];
 }
 
 async function scan(page: Page): Promise<Scan> {
-  const { violations, passes } = await new AxeBuilder({ page })
-    .withTags(WCAG_AA)
+  const { violations, passes, incomplete } = await new AxeBuilder({ page })
+    .withTags(TAGS)
     .analyze();
   return {
     blocking: violations
-      .filter((v) => v.impact === "serious" || v.impact === "critical")
+      .filter(
+        (v) =>
+          v.impact === "serious" ||
+          v.impact === "critical" ||
+          ALWAYS_BLOCKING.has(v.id),
+      )
       .map((v) => ({
         id: v.id,
         impact: v.impact ?? "",
@@ -30,6 +51,13 @@ async function scan(page: Page): Promise<Scan> {
       })),
     contrastChecked:
       passes.find((p) => p.id === "color-contrast")?.nodes.length ?? 0,
+    contrastIncomplete:
+      incomplete
+        .find((p) => p.id === "color-contrast")
+        ?.nodes.map(
+          (n) =>
+            `${n.target.join(" ")}: ${n.any.map((c) => c.message).join("; ")}`,
+        ) ?? [],
   };
 }
 
@@ -59,15 +87,31 @@ async function afterLoad(page: Page, mode: Mode) {
   });
 }
 
+/**
+ * Most text axe still cannot measure with opaque glass, per view: the brand
+ * link on the bare backdrop gradient (every view), the diff's "−" marker
+ * glyph (Code), and the SVG plan-node text plus its overlapped caption
+ * (Plan; the sr-only "Plan steps" list is its text alternative). A regression
+ * that hides real text from the contrast check pushes a view over its limit.
+ */
+const INCOMPLETE_LIMIT: Record<string, number> = {
+  "Data tab": 1,
+  "Code tab, diff": 2,
+  "Plan tab": 8,
+  Evals: 1,
+};
+
 function expectClean(result: Scan, mode: Mode, label: string) {
   expect(result.blocking, label).toEqual([]);
+  if (mode !== "opaque") return;
   // Guard against a vacuous pass: the opaque rendering must really be measured.
-  if (mode === "opaque") {
-    expect(
-      result.contrastChecked,
-      `${label}: contrast checked`,
-    ).toBeGreaterThan(20);
-  }
+  expect(result.contrastChecked, `${label}: contrast checked`).toBeGreaterThan(
+    20,
+  );
+  expect(
+    result.contrastIncomplete.length,
+    `${label}: contrast not measurable\n${result.contrastIncomplete.join("\n")}`,
+  ).toBeLessThanOrEqual(INCOMPLETE_LIMIT[label] ?? 0);
 }
 
 for (const colorScheme of ["light", "dark"] as const) {
