@@ -1,0 +1,42 @@
+[project]
+name = "sluice"
+version = "0.1.0"
+description = "A self-planning agentic data pipeline."
+readme = "README.md"
+authors = [
+    { name = "Pranav Krishna Danda", email = "pranavkrishna317@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=2.0.0",
+    "numpy>=2.5.4",
+    "pandera[polars]>=0.35.0",
+    "polars>=2.1.0",
+    "pyarrow>=26.0.0",
+    "pyyaml>=6.0.3",
+    "scipy>=1.18.1",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+sluice = "sluice.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.10.2,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: long-running tests, excluded from `make test`"]
