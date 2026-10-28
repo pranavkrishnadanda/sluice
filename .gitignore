@@ -3,3 +3,9 @@
 !.env.example
 .superpowers/
 .DS_Store
+backend/cases/*/
+evals/runs/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,67 @@
+"""The contract between a system under evaluation and the benchmark harness.
+
+A system gets a :class:`CaseInput` (the drifted file, its contract and the parent-key sets for
+foreign-key checks) and returns a :class:`SystemOutput`. Every primary-key tuple in ``flags`` and
+``quarantined`` holds Python-native ``int``/``str`` values, exactly as the key appears in the
+system's output (for quarantined rows: as it appeared in the input, after cleaning).
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+import polars as pl
+
+from sluice.contracts.model import Contract
+
+PK = tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CaseInput:
+    """What a system is given for one case.
+
+    Attributes:
+        path: The drifted input file (CSV, JSON or Parquet).
+        contract: The table contract the output must satisfy.
+        reference: Parent key sets keyed ``"<table>.<column>"`` (``{}`` when there are no FKs).
+    """
+
+    path: Path
+    contract: Contract
+    reference: dict[str, set[Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class SystemOutput:
+    """What a system returns for one case.
+
+    Attributes:
+        df: Cleaned rows in the exact contract schema (column order and dtypes).
+        flags: ``(pk, contract_column)`` cells the system could not recover; each is null in
+            ``df``.
+        quarantined: PKs of rows withheld from ``df`` (e.g. foreign-key misses).
+        file_quarantined: True when the whole file was rejected; ``df`` is then empty.
+        cost_usd: Model spend for the case (0 for systems without an LLM).
+        latency_s: Wall-clock time spent in ``run``.
+        meta: Free-form, JSON-serialisable diagnostics (e.g. the actions taken).
+    """
+
+    df: pl.DataFrame
+    flags: set[tuple[PK, str]]
+    quarantined: set[PK]
+    file_quarantined: bool
+    cost_usd: float
+    latency_s: float
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class System(Protocol):
+    """A pipeline under evaluation."""
+
+    name: str
+
+    def run(self, case: CaseInput) -> SystemOutput:
+        """Ingest ``case.path`` and return contract-shaped output."""
+        ...
