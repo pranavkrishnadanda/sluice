@@ -23,10 +23,11 @@ The UI talks to the backend through one `ApiClient` interface
 | unset, empty or `mock`              | `MockApiClient`: built-in fixture runs and eval results, in the browser |
 | a URL, e.g. `http://localhost:8080` | `HttpApiClient` against the FastAPI backend                             |
 
-- **Demo mode** needs no backend. Every number-bearing view (header, run
-  summary, side panel, eval cards) shows a "Demo data" badge. A file you
-  upload is **not** uploaded or read: the mock replays a sample run and says
-  so in the thread.
+**Demo mode** needs no backend. Every number-bearing view (header, run
+summary, side panel, eval cards) shows a "Demo data" badge. A file you upload
+is **not** uploaded or read: the mock replays a sample run and says so in the
+thread.
+
 - The backend listens on **port 8080** (8000 is reserved on the owner's
   machine); it must allow CORS from the UI's origin, including on the SSE
   stream and for the `Last-Event-ID` header. See
