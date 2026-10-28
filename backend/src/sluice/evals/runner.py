@@ -105,6 +105,7 @@ class EvalSummary:
     by_difficulty: dict[str, dict[str, CI | None]]
     n_by_difficulty: dict[str, int] = field(default_factory=dict)
     n_defined: dict[str, int] = field(default_factory=dict)
+    n_defined_by_difficulty: dict[str, dict[str, int]] = field(default_factory=dict)
     created_at: datetime | None = None
 
     def to_json(self, cases_sha256: str | None = None) -> dict[str, Any]:
@@ -121,6 +122,9 @@ class EvalSummary:
             },
             "n_by_difficulty": dict(self.n_by_difficulty),
             "n_defined": dict(self.n_defined),
+            "n_defined_by_difficulty": {
+                d: dict(m) for d, m in self.n_defined_by_difficulty.items()
+            },
             "created_at": None if self.created_at is None else _iso(self.created_at),
             "cases_sha256": cases_sha256,
         }
@@ -141,6 +145,10 @@ class EvalSummary:
             },
             n_by_difficulty={d: int(n) for d, n in raw.get("n_by_difficulty", {}).items()},
             n_defined={m: int(n) for m, n in raw.get("n_defined", {}).items()},
+            n_defined_by_difficulty={
+                d: {m: int(n) for m, n in counts.items()}
+                for d, counts in raw.get("n_defined_by_difficulty", {}).items()
+            },
             created_at=None if created is None else datetime.fromisoformat(created),
         )
 
@@ -163,6 +171,10 @@ def _mean(values: Iterable[Any]) -> float | None:
 def _difficulty_order(found: Iterable[str]) -> list[str]:
     present = set(found)
     return [d for d in DIFFICULTIES if d in present] + sorted(present - set(DIFFICULTIES))
+
+
+def _defined(per_case: Sequence[Mapping[str, float | None]]) -> dict[str, int]:
+    return {m: sum(1 for c in per_case if c[m] is not None) for m in METRICS}
 
 
 def _cis(per_case: Sequence[Mapping[str, float | None]]) -> dict[str, CI | None]:
@@ -202,10 +214,12 @@ def summarize(
 
     by_difficulty: dict[str, dict[str, CI | None]] = {}
     n_by_difficulty: dict[str, int] = {}
+    n_defined_by_difficulty: dict[str, dict[str, int]] = {}
     for d in _difficulty_order(difficulty):
         group = [c for c, cd in zip(per_case, difficulty, strict=True) if cd == d]
         by_difficulty[d] = _cis(group)
         n_by_difficulty[d] = len(group)
+        n_defined_by_difficulty[d] = _defined(group)
 
     return EvalSummary(
         system=system,
@@ -216,7 +230,8 @@ def summarize(
         pass_hat_k=math.fsum(pass_hats) / len(pass_hats) if pass_hats else None,
         by_difficulty=by_difficulty,
         n_by_difficulty=n_by_difficulty,
-        n_defined={m: sum(1 for c in per_case if c[m] is not None) for m in METRICS},
+        n_defined=_defined(per_case),
+        n_defined_by_difficulty=n_defined_by_difficulty,
         created_at=created_at,
     )
 
@@ -310,6 +325,14 @@ def format_ci(ci: CI | None) -> str:
     return f"{mean * 100:.1f}% [{lo * 100:.1f}, {hi * 100:.1f}]"
 
 
+def _cell(ci: CI | None, n_defined: int | None, n_row: int | None) -> str:
+    """``format_ci`` plus ``(n=k)`` when the metric is defined on fewer cases than the row."""
+    text = format_ci(ci)
+    if ci is not None and n_defined is not None and n_defined != n_row:
+        text += f" (n={n_defined})"
+    return text
+
+
 def eval_command(summary: EvalSummary) -> str:
     """The shell command that reproduces ``summary``'s run, from the repo root."""
     return (
@@ -336,7 +359,7 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
     )
     tail = _CLI.removeprefix("cd backend && ")
     reproduce = " && ".join(
-        [eval_command(summaries[0])]
+        ["make cases", eval_command(summaries[0])]
         + [eval_command(s).removeprefix("cd backend && ") for s in summaries[1:]]
         + [f"{tail} results"]
     )
@@ -349,13 +372,15 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         "among those unrecoverable cells, the share where the system wrote a value instead of "
         "flagging it (lower is better). **Row recall** is the share of expected rows present in "
         "the output. **Contract pass** is the share of cases whose output passes the table "
-        "contract. **Success** is the share of cases that are perfect: every cell right, the "
+        "contract. Contract pass ignores cells the system flagged as unrecoverable, so a case "
+        "can pass the contract and still fail Success. **Success** is the share of cases that "
+        "are perfect: every cell right, the "
         "contract passing and no invented rows. Every value is the mean over cases with its "
         "95% percentile-bootstrap confidence interval in brackets (10,000 resamples, seed 0); "
         "each case's metric is first averaged over its trials, and a case where a metric is "
         "undefined (for example fabrication when nothing needed flagging) is left out of that "
         "metric. Latency and cost are not shown. Reproduce from the repository root with "
-        f"`make cases && {reproduce}`."
+        f"`{reproduce}`. A value followed by `(n=k)` is defined on only k of the row's cases."
     )
 
     headers = [h for h, _ in _TABLE_METRICS]
@@ -364,13 +389,17 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         _row(["---"] * (4 + len(headers))),
     ]
     for s in summaries:
-        cells = [format_ci(s.metrics.get(k)) for _, k in _TABLE_METRICS]
+        cells = [_cell(s.metrics.get(k), s.n_defined.get(k), s.n_cases) for _, k in _TABLE_METRICS]
         main.append(_row([s.system, s.split, s.n_cases, s.trials, *cells]))
-    defined = [
+    notes = [
         f"Fabrication is defined on {s.n_defined['fabrication_rate']} of {s.n_cases} `{s.split}` "
         f"cases for `{s.system}` (those with at least one unrecoverable cell)."
         for s in summaries
         if "fabrication_rate" in s.n_defined
+    ] + [
+        "Contract pass checks the output against the table contract with flagged cells exempt, "
+        "so a system that flags what it cannot recover can pass the contract and still fail "
+        "Success, which also requires every cell to be right."
     ]
 
     diff = [
@@ -379,8 +408,10 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
     ]
     for s in summaries:
         for d, m in s.by_difficulty.items():
-            cells = [format_ci(m.get(k)) for _, k in _TABLE_METRICS]
-            diff.append(_row([s.system, s.split, d, s.n_by_difficulty.get(d, _NONE), *cells]))
+            n_d = s.n_by_difficulty.get(d)
+            counts = s.n_defined_by_difficulty.get(d, {})
+            cells = [_cell(m.get(k), counts.get(k), n_d) for _, k in _TABLE_METRICS]
+            diff.append(_row([s.system, s.split, d, _NONE if n_d is None else n_d, *cells]))
 
     pass_hats = [
         f"- `{s.system}` on `{s.split}`: pass^{s.trials} = {s.pass_hat_k * 100:.1f}%"
@@ -416,7 +447,8 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         "",
         *main,
         "",
-        *([" ".join(defined), ""] if defined else []),
+        " ".join(notes),
+        "",
         "## By difficulty",
         "",
         *diff,

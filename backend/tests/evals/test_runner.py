@@ -34,6 +34,15 @@ def small_cases(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out
 
 
+@pytest.fixture(scope="module")
+def flagged_cases(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Ten dev cases (seed 1); at least one expects flagged (unrecoverable) cells."""
+    out = tmp_path_factory.mktemp("flagged") / "dev"
+    built = build_split("dev", 10, 1, out)
+    assert any(c.manifest["expected_flags"] for c in built), "fixture needs a flagged case"
+    return out
+
+
 def _lines(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
@@ -83,10 +92,10 @@ def test_run_eval_single_trial_has_no_pass_hat_k(small_cases: Path, tmp_path: Pa
     assert set(s.metrics) == set(METRICS)
 
 
-def test_run_eval_rules_never_fabricate(small_cases: Path, tmp_path: Path) -> None:
-    s = run_eval("rules", "dev", 1, small_cases, tmp_path)
-    fab = s.metrics["fabrication_rate"]
-    assert fab is None or fab == (0.0, 0.0, 0.0)
+def test_run_eval_rules_never_fabricate(flagged_cases: Path, tmp_path: Path) -> None:
+    s = run_eval("rules", "dev", 1, flagged_cases, tmp_path)
+    assert s.n_defined["fabrication_rate"] > 0
+    assert s.metrics["fabrication_rate"] == (0.0, 0.0, 0.0)
 
 
 def test_run_eval_is_deterministic_apart_from_latency(small_cases: Path, tmp_path: Path) -> None:
@@ -359,3 +368,51 @@ def test_render_results_footer_command_runs_as_one_line() -> None:
         "cd backend && PYTHONPATH=src uv run sluice eval --system rules --split dev --trials 1"
         " && PYTHONPATH=src uv run sluice results\n```"
     ) in md
+
+
+def test_render_results_intro_and_footer_commands_agree() -> None:
+    md = render_results([_summary()], LOCK)
+    cmd = (
+        "make cases && cd backend && PYTHONPATH=src uv run sluice eval --system rules"
+        " --split dev --trials 1 && PYTHONPATH=src uv run sluice results"
+    )
+    assert f"`{cmd}`" in md  # intro
+    assert f"```sh\n{cmd}\n```" in md  # footer
+
+
+def test_render_results_explains_contract_pass_vs_success() -> None:
+    md = render_results([_summary()], LOCK)
+    intro, rest = md.split("## Overall", 1)
+    overall = rest.split("## By difficulty", 1)[0]
+    assert "Contract pass ignores cells the system flagged as unrecoverable" in intro
+    assert "can pass the contract and still fail Success" in overall
+
+
+def test_render_results_shows_denominator_in_cell_when_partial() -> None:
+    s = _summary(
+        n_cases=300,
+        n_defined=dict.fromkeys(METRICS, 300) | {"fabrication_rate": 67},
+        n_by_difficulty={"easy": 90, "hard": 90},
+        n_defined_by_difficulty={
+            "easy": dict.fromkeys(METRICS, 90) | {"fabrication_rate": 0},
+            "hard": dict.fromkeys(METRICS, 90) | {"fabrication_rate": 67},
+        },
+    )
+    md = render_results([s], LOCK)
+    assert "| rules | dev | 300 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 0.0] (n=67) |" in md
+    assert "| rules | dev | easy | 90 | 50.0% [40.0, 60.0] | 0.0% [0.0, 0.0] (n=0) |" in md
+    rows = [line for line in md.splitlines() if line.startswith("| rules")]
+    assert sum(r.count("(n=") for r in rows) == 2  # overall + easy; full and "—" cells: none
+
+
+def test_summarize_counts_defined_per_difficulty() -> None:
+    rows = [_row("a", 0, "easy"), _row("b", 0, "hard", fabrication_rate=0.0, n_flag_cells=3)]
+    s = summarize(rows, "rules", "dev", 1)
+    assert s.n_defined_by_difficulty["easy"]["fabrication_rate"] == 0
+    assert s.n_defined_by_difficulty["hard"]["fabrication_rate"] == 1
+
+
+def test_summary_round_trips_defined_per_difficulty(tmp_path: Path) -> None:
+    s = _summary(n_defined_by_difficulty={"easy": {"fabrication_rate": 0}})
+    s.write(tmp_path / "summary.json")
+    assert load_summary(tmp_path / "summary.json") == s
