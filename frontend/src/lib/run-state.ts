@@ -177,6 +177,29 @@ function onAttemptFailed(
   };
 }
 
+/** Shown on a node the run stopped mid-attempt (no result for that attempt). */
+export const STOPPED_NODE_NOTE =
+  "Stopped: the run ended before this attempt finished.";
+
+/**
+ * `run_finished` of any status closes every node still open (contract,
+ * "Early end"): a running or retrying node becomes `failed`. A node stopped
+ * mid-attempt (its current attempt never reported) gets a stop note; one
+ * whose last `attempt_failed` had no follow-up keeps that error. Pending
+ * nodes never started, so they stay pending.
+ */
+function closeOpenNodes(nodes: NodeViewState[]): NodeViewState[] {
+  return nodes.map((n) => {
+    if (n.status !== "running" && n.status !== "retrying") return n;
+    const midAttempt = n.attempt > n.attemptsReported;
+    return {
+      ...n,
+      status: "failed",
+      lastError: midAttempt ? STOPPED_NODE_NOTE : n.lastError,
+    };
+  });
+}
+
 function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
   switch (e.type) {
     case "run_started":
@@ -229,15 +252,7 @@ function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
         finished: true,
         finishedAt: e.at,
         totals: { ...state.totals, costUsd: e.costUsd, tokens: e.tokens },
-        // A failed run leaves no node mid-flight.
-        nodes:
-          e.status === "failed"
-            ? state.nodes.map((n) =>
-                n.status === "running" || n.status === "retrying"
-                  ? { ...n, status: "failed" }
-                  : n,
-              )
-            : state.nodes,
+        nodes: closeOpenNodes(state.nodes),
       };
   }
 }
