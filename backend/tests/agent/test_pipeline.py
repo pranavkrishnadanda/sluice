@@ -137,6 +137,7 @@ class Script:
     workers: dict[str, list[str]] = field(default_factory=dict)
     verdicts: list[bool] = field(default_factory=list)
     down: frozenset[str] = frozenset()
+    down_columns: frozenset[str] = frozenset()  # worker outage for these columns only
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -152,6 +153,8 @@ class Script:
         elif role == "worker":
             match = re.search(r'column "([^"]+)"', user)
             assert match is not None
+            if match.group(1) in self.down_columns:
+                raise ModelHTTPError(503, "script")
             queue = self.workers[match.group(1)]
             out = {"code": queue.pop(0) if len(queue) > 1 else queue[0], "explanation": "fix"}
         else:
@@ -203,6 +206,7 @@ def run(
     clock: Callable[[], float] = time.monotonic,
     contract: Contract | None = None,
     reference: dict[str, set[Any]] | None = None,
+    path: Path | None = None,
 ) -> Result:
     async def go() -> Result:
         model = FunctionModel(script.respond, model_name="script-model")
@@ -210,7 +214,7 @@ def run(
             log = EventLog()
             deps = PipelineDeps(llm=llm, sandbox=sandbox or FakeSandbox(), clock=clock)
             case_input = CaseInput(
-                case.input_path, contract or load_contract(case.table), reference or {}
+                path or case.input_path, contract or load_contract(case.table), reference or {}
             )
             out = await run_pipeline(case_input, deps, log)
             return Result(out, log, llm)
@@ -669,10 +673,50 @@ def test_pipeline_worker_unavailable_stops_node_and_records_error(indian: Case) 
     (pn,) = result.out.meta["plan_nodes"]
     assert (pn["attempts"], pn["accepted"]) == (1, False)
     assert result.out.meta["transforms"] == []  # no code was produced
-    assert not result.out.file_quarantined  # an outage is a fallback, not a node failure
+    assert not result.out.file_quarantined
+    # Ruling C4 (refined): the run could not complete -> failed, no verified, and the node's
+    # last attempt_failed is followed directly by run_finished.
+    types = [e.type for e in result.log.events]  # type: ignore[attr-defined]
+    assert types[-2:] == ["attempt_failed", "run_finished"]
+    (finished,) = result.events("run_finished")
+    assert finished.status == "failed"  # type: ignore[attr-defined]
+    assert "worker" in finished.summary and "LLMUnavailable" in finished.summary  # type: ignore[attr-defined]
+
+
+def test_pipeline_verifier_outage_fails_the_run_with_rules_output(indian: Case) -> None:
+    script = Script(
+        plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]}, down=frozenset({"verifier"})
+    )
+    result = run(indian, script)
+    assert_same_output(result.out, rules_only(indian))
+    assert "verifier" in result.out.meta["llm_error"]
+    assert not result.events("verified")
+    (finished,) = result.events("run_finished")
+    assert finished.status == "failed"  # type: ignore[attr-defined]
+
+
+def test_pipeline_worker_outage_discards_other_accepted_work(two_columns: Case) -> None:
+    plan = {"nodes": [node("n1", "o_totalprice"), node("n2", "o_orderdate", "n1")]}
+    script = Script(
+        plan=plan,
+        workers={"o_totalprice": [STRIP_COMMAS], "o_orderdate": [ISO_DATES]},
+        down_columns=frozenset({"o_orderdate"}),
+    )
+    result = run(two_columns, script)
+    n1, n2 = result.out.meta["plan_nodes"]
+    assert (n1["accepted"], n2["accepted"]) == (True, False)
+    assert_same_output(result.out, rules_only(two_columns))  # output = rules pass 1
+    (finished,) = result.events("run_finished")
+    assert finished.status == "failed"  # type: ignore[attr-defined]
+
+
+def test_pipeline_planning_outage_after_mapping_falls_back_and_succeeds(medium: Case) -> None:
+    # Mapping works, then every route is down: planning falls back (a fallback, not a failure).
+    script = Script(mapping=AMT_MAPPING, down=frozenset({"orchestrator"}))
+    result = run(medium, script)
     (finished,) = result.events("run_finished")
     assert finished.status == "succeeded"  # type: ignore[attr-defined]
-    assert "worker" in finished.summary  # type: ignore[attr-defined]
+    assert price_flags(result.out) > 0
 
 
 def test_pipeline_no_candidates_makes_no_plan_call(clean: Case) -> None:
@@ -797,3 +841,109 @@ def test_agent_system_runs_pipeline_in_its_own_event_loop(indian: Case) -> None:
     assert len(created) == 2 and created[0] is not created[1]  # one LLM per asyncio.run
     assert price_flags(first) == 0
     assert_same_output(first, second)
+
+
+# --------------------------------------------------------------------------- crashes (review 1)
+
+
+@dataclass
+class HostileSandbox:
+    """n1's code raises a host-side error once n2's sandbox call is in flight (and blocked)."""
+
+    entered: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    finished: list[str] = field(default_factory=list)
+
+    def __call__(self, code: str, values: pl.Series) -> SandboxResult:
+        if code == CRASH:
+            assert self.entered.wait(10)
+            raise RuntimeError("docker API exploded: secret-host-detail")
+        self.entered.set()
+        self.release.wait(2)  # bounded: asyncio.run waits for executor threads on shutdown
+        self.finished.append(code)
+        return CANNED[code](values)
+
+
+def test_pipeline_unexpected_error_finishes_the_run_exactly_once(two_columns: Case) -> None:
+    plan = {"nodes": [node("n1", "o_totalprice"), node("n2", "o_orderdate")]}
+    script = Script(plan=plan, workers={"o_totalprice": [CRASH], "o_orderdate": [ISO_DATES]})
+    sandbox = HostileSandbox()
+    result = run(two_columns, script, sandbox=sandbox)  # type: ignore[arg-type]
+    (finished,) = result.events("run_finished")
+    assert finished.status == "failed"  # type: ignore[attr-defined]
+    assert "RuntimeError" in finished.summary  # type: ignore[attr-defined]
+    assert "secret-host-detail" not in finished.summary  # type: ignore[attr-defined]
+    assert result.out.file_quarantined and result.out.df.is_empty()
+    assert result.out.meta["crash"] == "RuntimeError"
+    assert "secret-host-detail" not in json.dumps(result.out.meta)
+    # The sibling n2 was cancelled: it started but never finished or failed an attempt.
+    n2_events = [e.type for e in result.log.events if getattr(e, "node_id", None) == "n2"]
+    assert n2_events == ["node_started"]
+
+
+def test_pipeline_read_failure_still_emits_one_run_finished(tmp_path: Path) -> None:
+    missing = tmp_path / "gone.csv"
+    case = Case("dev-0099", "dev", "orders", tmp_path, {"format": "csv"})
+    result = run(case, Script(), contract=load_contract("orders"), path=missing)
+    types = [e.type for e in result.log.events]  # type: ignore[attr-defined]
+    assert types == ["run_started", "run_finished"]
+    (started,) = result.events("run_started")
+    assert started.rows is None  # type: ignore[attr-defined]
+    (finished,) = result.events("run_finished")
+    assert finished.status == "failed" and "FileNotFoundError" in finished.summary  # type: ignore[attr-defined]
+
+
+class Abort(BaseException):
+    """Stands in for cancellation / interrupts: a BaseException the pipeline must not catch."""
+
+
+def test_pipeline_base_exceptions_are_not_swallowed(indian: Case) -> None:
+    calls = 0
+
+    def clock() -> float:  # raises in the event-loop thread, on the first check after the start
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise Abort
+        return 0.0
+
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    with pytest.raises(BaseException) as excinfo:
+        run(indian, script, clock=clock)
+    assert not isinstance(excinfo.value, Exception)
+    leaves = excinfo.value.exceptions if isinstance(excinfo.value, BaseExceptionGroup) else ()
+    assert isinstance(excinfo.value, Abort) or all(isinstance(e, Abort) for e in leaves)
+
+
+# --------------------------------------------------------------------------- cap overshoot
+
+
+def test_pipeline_concurrent_nodes_overshoot_token_cap_by_at_most_one_attempt_each(
+    two_columns: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = TOKENS_PER_CALL + 1  # just above the planning call: both nodes may start
+    monkeypatch.setattr(pipeline, "MAX_TOKENS_PER_FILE", cap)
+    plan = {"nodes": [node("n1", "o_totalprice"), node("n2", "o_orderdate")]}
+    script = Script(plan=plan, workers={"o_totalprice": [CRASH], "o_orderdate": [CRASH]})
+    result = run(two_columns, script)
+    one_attempt = 2 * TOKENS_PER_CALL  # worker + verifier
+    assert result.out.meta["cap"] == "tokens"
+    assert result.out.meta["tokens"] <= cap + len(plan["nodes"]) * one_attempt
+    assert len(result.events("node_started")) <= len(plan["nodes"])
+
+
+# --------------------------------------------------------------------------- transform ids
+
+
+def test_pipeline_transform_id_is_derived_from_run_node_and_attempt(indian: Case) -> None:
+    long_id = "n" * 64
+    plan = {"nodes": [node(long_id, "o_totalprice")]}
+    script = Script(plan=plan, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+    result = run(indian, script)
+    (done,) = result.events("node_finished")
+    expected = pipeline.transform_id(result.out.meta["run_id"], long_id, 2)
+    assert done.transform_id == expected  # type: ignore[attr-defined]
+    assert len(expected) <= 64
+    assert pipeline.transform_id("other-run", long_id, 2) != expected  # globally unique
+    (meta_node,) = result.out.meta["nodes"]
+    assert meta_node["transform_id"] == expected

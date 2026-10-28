@@ -31,16 +31,30 @@ Fallbacks: model and provider problems never raise. ``LLMUnavailable`` (every ro
 ``LLMOutputError`` from mapping or planning skip that step: the frame stays as it was, so the
 output is what the rules make of it, and ``meta["llm_error"]`` says what happened. After an
 ``LLMUnavailable`` no further model call is made in the run. In a node, ``LLMOutputError`` (bad
-code, a failed precheck, or a bad verdict) is an ordinary failed attempt, while
-``LLMUnavailable`` stops that node and its column is left to the rules. A fallback does not make
-the run ``failed``: the status follows the data (``succeeded`` / ``quarantined``) and the summary
-names the step that fell back. ``failed`` means the run could not complete its plan: a cap
-stopped a planned node, or the sandbox itself was unavailable.
+code, a failed precheck, or a bad verdict) is an ordinary failed attempt. A mapping or planning
+fallback does not make the run ``failed``: the status follows the data (``succeeded`` /
+``quarantined``) and the summary names the step that fell back. ``LLMUnavailable`` in a worker
+or verifier call keeps a planned node from being accepted, so the run could not complete: no new
+attempt or node starts, the node's last ``attempt_failed`` is followed directly by
+``run_finished`` (``failed``, no ``verified``), and the output is rules pass 1 with
+``meta["llm_error"]``. ``failed`` otherwise means a cap stopped a planned node, the sandbox itself
+was unavailable, or the run crashed.
+
+Crashes: any other ``Exception`` (read error, Docker API error, Polars error, internal bug) ends
+the run with exactly one ``run_finished`` (``failed``, the summary naming only the exception
+type) and a whole-file quarantine output. Nodes of one wave run in an ``asyncio.TaskGroup``, so
+when one raises, its siblings are cancelled and awaited first. A sandbox call already running in
+its worker thread cannot be killed: the task stops waiting for it, and the thread ends when the
+container does, bounded by the runner's own ``SANDBOX_TIMEOUT_S`` (``asyncio.run`` waits for it
+on shutdown). ``BaseException`` (cancellation, interrupts) is never caught.
 
 Caps (``sluice.agent.caps``): ``MAX_TOKENS_PER_FILE`` and ``MAX_WALL_S_PER_FILE`` are checked
 before every new attempt (spend and time measured from the start of the run, with ``deps.clock``)
 and stop new attempts only; accepted work is kept in the output, ``meta["cap"]`` names the cap,
-and the run is ``failed`` (its plan was not completed) with no ``verified``.
+and the run is ``failed`` (its plan was not completed) with no ``verified``. The token cap is
+checked per attempt, so nodes running concurrently can each overshoot it by at most one attempt
+in flight (a worker call plus a verifier call): spend <= ``MAX_TOKENS_PER_FILE`` + nodes in the
+wave x one attempt's tokens. The wall-clock cap has the same per-attempt granularity.
 
 Cost: O(rows x columns) per rules pass; each attempt costs one rules pass on the rewritten frame
 plus a model call or two; the number of attempts is bounded by ``MAX_ATTEMPTS`` x plan size.
@@ -50,6 +64,7 @@ Memory: a few copies of the input frame (raw, mapped, rewritten), plus O(events)
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -108,6 +123,22 @@ MAX_ISSUE_DETAIL_CHARS: Final = 200
 Sandbox = Callable[[str, pl.Series], SandboxResult]
 
 
+class PipelineError(RuntimeError):
+    """An internal invariant broke; the run finishes as ``failed`` (see :func:`run_pipeline`)."""
+
+
+def transform_id(run_id: str, node_id: str, attempt: int) -> str:
+    """The contract ``transformId`` of an attempt: derived, opaque and globally unique.
+
+    ``t`` + the first 32 hex digits of SHA-256 over (run id, node id, attempt): the same attempt
+    always gets the same id, ids of different runs differ (the run id is a random UUID), and the
+    result fits ``[A-Za-z0-9_-]{1,64}`` whatever the node id's length. ``f"{node_id}-{attempt}"``
+    was not used: it is neither unique across runs nor bounded to 64 characters.
+    """
+    digest = hashlib.sha256(f"{run_id}\0{node_id}\0{attempt}".encode()).hexdigest()
+    return f"t{digest[:32]}"
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineDeps:
     """What the pipeline needs from outside: models, the sandbox and a monotonic clock.
@@ -136,6 +167,9 @@ class _NodeOutcome:
     values: pl.Series | None = None
     transforms: list[dict[str, Any]] = field(default_factory=list)
     stop: str | None = None
+    outage: bool = False
+    """A provider outage (no model route) kept this planned node from being accepted."""
+    transform_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -151,6 +185,7 @@ class _Run:
     emitted: list[EventModel] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     sandbox_error: str | None = None
+    finished: bool = False
     halted: str | None = None
     """Set when a node's final attempt failed: no new node starts and the file is quarantined."""
     unavailable: bool = False
@@ -199,10 +234,21 @@ def _spend(records: list[CallRecord]) -> tuple[int, float]:
 async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> SystemOutput:
     """Run the agent pipeline over ``case.path`` (see the module docstring for the states).
 
-    Never raises for model or provider problems; read errors and sandbox-infrastructure bugs
-    other than :class:`~sluice.sandbox.runner.SandboxError` propagate.
+    Never raises for an ``Exception``: model and provider problems fall back as described in
+    the module docstring, and anything unexpected (a read error, a sandbox or Docker API error,
+    a Polars error, an internal bug) ends the run with exactly one ``run_finished`` (status
+    ``failed``, the summary naming only the exception type) and a whole-file quarantine output.
+    ``BaseException`` (``asyncio.CancelledError``, ``KeyboardInterrupt``) is never caught.
     """
     run = _Run(case, deps, log, start=deps.clock(), records_from=len(deps.llm.records))
+    try:
+        return await _pipeline(run)
+    except Exception as exc:  # not BaseException: cancellation and interrupts propagate
+        return _crashed(run, exc)
+
+
+async def _pipeline(run: _Run) -> SystemOutput:
+    case, deps = run.case, run.deps
     contract = case.contract
     raw = read_input(case.path)
     run.emit(
@@ -268,6 +314,11 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
         actions = [*map_actions, *pass1.actions, f"file quarantined: {run.halted}"]
         return _quarantine_file(run, actions, plan, outcomes, mapping, run.halted)
 
+    if any(o.outage for o in outcomes):
+        # A provider outage kept a planned node from being accepted: the run could not complete.
+        # The output is rules pass 1 (accepted work of other nodes is not applied).
+        return _finish(run, pass1, map_actions + pass1.actions, plan, outcomes, mapping)
+
     final = pass1
     accepted = {o.node.column: o.values for o in outcomes if o.accepted and o.values is not None}
     if accepted:
@@ -316,19 +367,20 @@ async def _run_nodes(
                 runnable.append(n)
             else:
                 outcomes[n.id].stop = "dependency not accepted"
-        await asyncio.gather(
-            *(
-                _run_node(
-                    run,
-                    outcomes[n.id],
-                    frame,
-                    source[n.column],
-                    candidates[n.column],
-                    flagged.get(n.column, set()),
+        # A TaskGroup, not a bare gather: if one node raises, its siblings are cancelled and
+        # awaited before the error leaves (see the module docstring on sandbox threads).
+        async with asyncio.TaskGroup() as group:
+            for n in runnable:
+                group.create_task(
+                    _run_node(
+                        run,
+                        outcomes[n.id],
+                        frame,
+                        source[n.column],
+                        candidates[n.column],
+                        flagged.get(n.column, set()),
+                    )
                 )
-                for n in runnable
-            )
-        )
         done.update(n.id for n in wave)
     return [outcomes[n.id] for n in plan.nodes]
 
@@ -346,12 +398,13 @@ async def _run_node(
     contract = run.case.contract
     spec = contract.column(node.column)
     texts = cell_texts(frame[source_name])
-    assert texts is not None  # candidate_columns only offers columns it could read as text
+    if texts is None:  # candidate_columns only offers columns it could read as text
+        raise PipelineError(f"node {node.id}: column {node.column!r} cannot be read as text")
     values = pl.Series(source_name, texts, dtype=pl.String)
     prior_error: str | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if run.unavailable:
-            outcome.stop = "no model route is available"
+            outcome.stop, outcome.outage = "no model route is available", True
             return
         if run.cap_reached():
             outcome.stop = f"{run.cap} cap reached"
@@ -367,8 +420,10 @@ async def _run_node(
         )  # fmt: skip
         tokens, cost = _spend(records)
         if error is None:
-            assert rewritten is not None
+            if rewritten is None:
+                raise PipelineError(f"node {node.id}: accepted attempt without output")
             outcome.accepted, outcome.values = True, rewritten
+            outcome.transform_id = transform_id(run.run_id, node.id, attempt)
             run.emit(
                 NodeFinished(
                     node_id=node.id,
@@ -377,7 +432,7 @@ async def _run_node(
                     tokens=tokens,
                     cost_usd=cost,
                     latency_ms=max(0, round((run.deps.clock() - started) * 1000)),  # Ruling E1
-                    transform_id=uuid.uuid4().hex,
+                    transform_id=outcome.transform_id,
                 )
             )
             return
@@ -428,7 +483,7 @@ async def _attempt(
         return f"the worker's output did not match the transform schema: {exc}", None
     except LLMUnavailable as exc:
         run.llm_failed(f"worker {node.id}", exc)
-        outcome.stop = "no model route is available"
+        outcome.stop, outcome.outage = "no model route is available", True
         return f"LLMUnavailable: {exc}", None
     records.append(record)
     transform = {
@@ -468,7 +523,7 @@ async def _attempt(
         return f"the verifier's answer failed validation: {exc}", None
     except LLMUnavailable as exc:
         run.llm_failed(f"verifier {node.id}", exc)
-        outcome.stop = "no model route is available"
+        outcome.stop, outcome.outage = "no model route is available", True
         return f"LLMUnavailable: {exc}", None
     records.append(vrecord)
     if not verdict.accept:
@@ -661,8 +716,9 @@ def _status_and_summary(
     """``run_finished`` status and summary (contract "Statuses", Rulings C1 and C4).
 
     * ``quarantined`` when the whole input is held back (``quarantine``) or rows were;
-    * ``failed`` only when the run could not complete its plan: a cap stopped a planned node,
-      or the sandbox itself was unavailable;
+    * ``failed`` only when the run could not complete: a cap stopped a planned node, the
+      sandbox itself was unavailable, or a provider outage kept a planned node from being
+      accepted (a crash is reported by :func:`_crashed`);
     * otherwise ``succeeded``. A model/provider fallback (a step handed over to the rules) does
       not change the status; the summary names the step and the error type.
     """
@@ -682,7 +738,7 @@ def _status_and_summary(
         parts.append(f"the sandbox is unavailable ({run.sandbox_error})")
     if quarantine is not None:
         status = "quarantined"
-    elif run.cap is not None or run.sandbox_error is not None:
+    elif run.cap is not None or run.sandbox_error is not None or any(o.outage for o in outcomes):
         status = "failed"
     elif result is not None and result.quarantined:
         status = "quarantined"
@@ -744,7 +800,48 @@ def _quarantine_file(
     )
 
 
+def _exception_name(exc: BaseException) -> str:
+    """The type name of ``exc``, or of the first leaf of an exception group (no message)."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return type(exc).__name__
+
+
+def _crashed(run: _Run, exc: Exception) -> SystemOutput:
+    """Finish a run that raised: one ``run_finished`` (``failed``), whole-file quarantine.
+
+    The output is the empty contract frame with ``file_quarantined=True``: nothing from a run
+    that crashed half-way is trusted (the rules-only system has no crash path of its own; an
+    error there propagates). Only the exception's type name is reported: messages can carry
+    host paths or provider text.
+    """
+    name = _exception_name(exc)
+    if not run.emitted:  # the input could not even be read: start the run first
+        run.emit(
+            RunStarted(
+                run_id=run.run_id,
+                file_name=run.case.path.name,
+                table=run.case.contract.name,  # type: ignore[arg-type]
+                rows=None,
+            )
+        )
+    if not run.finished:
+        _run_finished(run, "failed", f"the run failed: {name}")
+    meta = _meta(run, [f"run failed: {name}"], None, [], None, {})
+    meta["crash"] = name
+    return SystemOutput(
+        df=pl.DataFrame(schema=run.case.contract.polars_schema()),
+        flags=set(),
+        quarantined=set(),
+        file_quarantined=True,
+        cost_usd=run.cost(),
+        latency_s=run.elapsed(),
+        meta=meta,
+    )
+
+
 def _run_finished(run: _Run, status: str, summary: str) -> None:
+    run.finished = True
     run.emit(
         RunFinished(
             status=status,  # type: ignore[arg-type]  # one of the FinalStatus literals
@@ -778,6 +875,8 @@ def _meta(
                 "accepted": o.accepted,
                 "tier": o.tier,
                 "stop": o.stop,
+                "outage": o.outage,
+                "transform_id": o.transform_id,
             }
             for o in outcomes
         ],

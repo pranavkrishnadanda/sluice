@@ -210,17 +210,20 @@ A run emits, in order: `run_started`, `profiled`, `rules_applied`,
 `plan_created`, then for each plan node `node_started` followed by either
 `node_finished` or `attempt_failed`. An `attempt_failed` with
 `attempt < maxAttempts` is followed by a `node_started` for the next attempt
-of the same node. Then `verified`, `loaded`, and finally `run_finished`.
-An empty `plan_created.nodes` means deterministic rules handled everything
+of the same node, unless the run ends there: an `attempt_failed` may be
+followed directly by `run_finished` when the run ends (a provider outage, a
+spend/time cap or a crash). Then `verified`, `loaded`, and finally
+`run_finished`. An empty `plan_created.nodes` means deterministic rules handled everything
 and no model was called.
 
 `node_started.maxAttempts` (equal to `attempt_failed.maxAttempts` for that
 node) lets the UI show "attempt 1/3" from the first attempt.
 
 **Failure path.** If a node's final attempt fails (`attempt_failed` with
-`attempt == maxAttempts`), no further nodes start and the run does **not**
-emit `verified` or `loaded`: the next event is `run_finished` with status
-`quarantined` (the input is held back; nothing was written).
+`attempt == maxAttempts`), no further nodes start (nodes already running
+finish, and their events are still emitted) and the run does **not** emit
+`verified` or `loaded`: it ends with `run_finished` with status `quarantined`
+(the input is held back; nothing was written).
 
 **Exactly one terminal event.** Every run ends with exactly one
 `run_finished`, whatever happens: a worker crash, a model-provider outage
@@ -233,8 +236,11 @@ or a spend/time cap still produces a `run_finished` (status `failed` or
 - `quarantined`: the pipeline worked as designed but held data back: some
   rows (`loaded.rowsQuarantined > 0`) or the whole input (no `loaded`) are
   in quarantine for review. Nothing invalid reached the warehouse.
-- `failed`: the system could not complete the run (crash, outage, cap,
-  internal error). It says nothing about the data's quality.
+- `failed`: the system could not complete the run (crash, cap, or a
+  provider outage it could not route around). It says nothing about the
+  data's quality. An outage during schema mapping or planning is not a
+  failure: that step falls back to the deterministic rules, the run can
+  still succeed, and `run_finished.summary` names the step that fell back.
 
 `node_finished.tier` is the tier that produced the accepted transform, which
 may be higher than the planned `PlanNode.tier` after escalation.
