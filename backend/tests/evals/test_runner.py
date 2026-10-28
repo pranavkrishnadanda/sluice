@@ -247,7 +247,7 @@ LOCK = {
 def test_render_results_tables_and_footer() -> None:
     md = render_results([_summary()], LOCK)
     assert "| System | Split | n | Trials | Cell accuracy | Fabrication | Row recall |" in md
-    assert "| rules | dev | 2 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 0.0] |" in md
+    assert "| rules | dev | 2 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 84.2] |"  # exact 0/2 in md
     assert "| rules | dev | hard | 1 | — | — | — | — | — |" in md
     assert "abc123" in md
     assert "duckdb 2.0.0" in md and "polars 2.1.0" in md
@@ -399,7 +399,7 @@ def test_render_results_shows_denominator_in_cell_when_partial() -> None:
         },
     )
     md = render_results([s], LOCK)
-    assert "| rules | dev | 300 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 0.0] (n=67) |" in md
+    assert "| rules | dev | 300 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 5.4] (n=67) |" in md
     assert "| rules | dev | easy | 90 | 50.0% [40.0, 60.0] | 0.0% [0.0, 0.0] (n=0) |" in md
     rows = [line for line in md.splitlines() if line.startswith("| rules")]
     assert sum(r.count("(n=") for r in rows) == 2  # overall + easy; full and "—" cells: none
@@ -487,3 +487,55 @@ def test_render_results_explains_quarantined_files_behind_fabrication() -> None:
     assert "16 of 300 `dev` files were quarantined whole" in md
     assert "9 of the 67 cases where fabrication is defined" in md
     assert "contribute no fabrications" in md
+
+
+# --- boundary intervals (final review) -------------------------------------------------------
+
+
+def _boundary_summary() -> EvalSummary:
+    metrics = dict.fromkeys(METRICS, (0.5, 0.4, 0.6))
+    metrics |= {
+        "fabrication_rate": (0.0, 0.0, 0.0),
+        "contract_pass": (1.0, 1.0, 1.0),
+        "success": (0.0, 0.0, 0.0),
+        "cell_accuracy": (1.0, 1.0, 1.0),
+    }
+    easy = dict(metrics) | {"success": (1.0, 1.0, 1.0)}
+    return _summary(
+        n_cases=300,
+        metrics=metrics,
+        n_defined=dict.fromkeys(METRICS, 300) | {"fabrication_rate": 67},
+        by_difficulty={"easy": easy},
+        n_by_difficulty={"easy": 90},
+        n_defined_by_difficulty={"easy": dict.fromkeys(METRICS, 90)},
+    )
+
+
+def test_render_results_uses_exact_interval_for_zero_fabrication() -> None:
+    md = render_results([_boundary_summary()], LOCK)
+    assert "0.0% [0.0, 5.4] (n=67)" in md
+    assert "0.0% [0.0, 0.0]" not in md.split("## By difficulty")[0].split("## Overall")[1]
+
+
+def test_render_results_uses_exact_interval_for_all_successes() -> None:
+    md = render_results([_boundary_summary()], LOCK)
+    easy = next(r for r in md.splitlines() if r.startswith("| rules | dev | easy |"))
+    assert "100.0% [96.0, 100.0]" in easy  # success 90/90 and contract pass 90/90
+
+
+def test_render_results_boundary_contract_pass_and_success_overall() -> None:
+    md = render_results([_boundary_summary()], LOCK)
+    overall = next(r for r in md.splitlines() if r.startswith("| rules | dev | 300 |"))
+    assert "100.0% [98.8, 100.0]" in overall  # contract pass 300/300
+    assert "0.0% [0.0, 1.2]" in overall  # success 0/300
+
+
+def test_render_results_keeps_bootstrap_for_non_boolean_metrics() -> None:
+    md = render_results([_boundary_summary()], LOCK)
+    overall = next(r for r in md.splitlines() if r.startswith("| rules | dev | 300 |"))
+    assert "| 100.0% [100.0, 100.0] |" in overall  # cell accuracy is not a per-case boolean
+
+
+def test_render_results_intro_names_the_exact_binomial_method() -> None:
+    intro = render_results([_boundary_summary()], LOCK).split("## Overall")[0]
+    assert "Clopper-Pearson" in intro

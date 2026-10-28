@@ -3,8 +3,9 @@
 import time
 
 import pytest
+from scipy.stats import binomtest
 
-from sluice.evals.stats import bootstrap_ci, mcnemar_p, pass_at_k, pass_hat_k
+from sluice.evals.stats import bootstrap_ci, clopper_pearson, mcnemar_p, pass_at_k, pass_hat_k
 
 # --- brief tests (verbatim) ---------------------------------------------------------------
 
@@ -189,3 +190,37 @@ def test_mcnemar_returns_python_float():
 def test_mcnemar_rejects_length_mismatch():
     with pytest.raises(ValueError, match="length"):
         mcnemar_p([True], [True, False])
+
+
+# --- clopper_pearson (boundary intervals in RESULTS.md) ------------------------------------
+
+
+def test_clopper_pearson_zero_successes():
+    lo, hi = clopper_pearson(0, 67)
+    assert lo == 0.0
+    assert hi == pytest.approx(1 - 0.025 ** (1 / 67))  # closed form at k = 0
+    assert round(hi * 100, 1) == 5.4
+
+
+def test_clopper_pearson_all_successes():
+    lo, hi = clopper_pearson(90, 90)
+    assert hi == 1.0
+    assert lo == pytest.approx(0.025 ** (1 / 90))  # closed form at k = n
+    assert round(lo * 100, 1) == 96.0
+
+
+def test_clopper_pearson_interior_brackets_the_rate():
+    lo, hi = clopper_pearson(30, 100)
+    assert lo < 0.3 < hi
+    ref = binomtest(30, 100).proportion_ci(confidence_level=0.95, method="exact")
+    assert (lo, hi) == pytest.approx((ref.low, ref.high))
+
+
+def test_clopper_pearson_returns_python_floats():
+    assert all(type(v) is float for v in clopper_pearson(3, 10))
+
+
+@pytest.mark.parametrize(("k", "n"), [(0, 0), (-1, 5), (6, 5)])
+def test_clopper_pearson_rejects_invalid(k, n):
+    with pytest.raises(ValueError):
+        clopper_pearson(k, n)

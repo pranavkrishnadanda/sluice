@@ -37,7 +37,7 @@ from typing import Any
 from sluice.contracts.model import Contract, load_contract
 from sluice.drift.cases import load_reference, load_split, split_hash
 from sluice.evals.graders import grade
-from sluice.evals.stats import bootstrap_ci, pass_hat_k
+from sluice.evals.stats import bootstrap_ci, clopper_pearson, pass_hat_k
 from sluice.evals.types import CaseInput, System
 from sluice.systems.rules_only import RulesOnlySystem
 
@@ -74,6 +74,8 @@ _TABLE_METRICS: tuple[tuple[str, str], ...] = (
     ("Success", "success"),
 )
 _QUARANTINE_HEADER = "Files quarantined"
+# Metrics that are 0/1 per case (fabrication only at its bounds): exact interval at 0% / 100%.
+_EXACT_AT_BOUNDARY: frozenset[str] = frozenset({"contract_pass", "success", "fabrication_rate"})
 _NONE = "—"
 _CLI = "cd backend && PYTHONPATH=src uv run sluice"
 
@@ -355,9 +357,26 @@ def format_ci(ci: CI | None) -> str:
     return f"{mean * 100:.1f}% [{lo * 100:.1f}, {hi * 100:.1f}]"
 
 
-def _cell(ci: CI | None, n_defined: int | None, n_row: int | None) -> str:
+def _presented(metric: str, ci: CI | None, n: int | None) -> CI | None:
+    """``ci``, or the exact binomial interval when a per-case boolean sits at 0 or 1.
+
+    The percentile bootstrap of an all-0 or all-1 sample has zero width, which overstates
+    certainty. For the per-case boolean metrics (and fabrication, which at exactly 0 or 1 is
+    0 or 1 on every case) the count is then ``0`` or ``n`` of ``n`` cases, and the interval
+    shown is :func:`~sluice.evals.stats.clopper_pearson` on it. Presentation only: the summary
+    keeps the bootstrap numbers.
+    """
+    if ci is None or metric not in _EXACT_AT_BOUNDARY or not n or ci[0] not in (0.0, 1.0):
+        return ci
+    mean = ci[0]
+    lo, hi = clopper_pearson(round(mean * n), n)
+    return (mean, lo, hi)
+
+
+def _cell(metric: str, ci: CI | None, n_defined: int | None, n_row: int | None) -> str:
     """``format_ci`` plus ``(n=k)`` when the metric is defined on fewer cases than the row."""
-    text = format_ci(ci)
+    n = n_defined if n_defined is not None else n_row
+    text = format_ci(_presented(metric, ci, n))
     if ci is not None and n_defined is not None and n_defined != n_row:
         text += f" (n={n_defined})"
     return text
@@ -432,7 +451,10 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         "contract and still fail Success. **Success** is the share of cases that are perfect: "
         "every cell right, the contract passing and no invented rows. Every value is the mean "
         "over cases with its 95% percentile-bootstrap confidence interval in brackets (10,000 "
-        "resamples, seed 0); each case's metric is first averaged over its trials, and a case "
+        "resamples, seed 0), except that a Fabrication, Contract pass or Success value of "
+        "exactly 0% or 100% (0 or n of n cases) shows the exact binomial (Clopper-Pearson) 95% "
+        "interval instead, since the bootstrap of a constant has zero width; each case's "
+        "metric is first averaged over its trials, and a case "
         "where a metric is undefined (for example fabrication when nothing needed flagging) is "
         "left out of that metric. Latency and cost are not shown. Reproduce from the repository "
         f"root with `{reproduce}`. A value followed by `(n=k)` is defined on only k of the "
@@ -446,7 +468,9 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         _row(["---"] * (4 + len(headers))),
     ]
     for s in summaries:
-        cells = [_cell(s.metrics.get(k), s.n_defined.get(k), s.n_cases) for _, k in _TABLE_METRICS]
+        cells = [
+            _cell(k, s.metrics.get(k), s.n_defined.get(k), s.n_cases) for _, k in _TABLE_METRICS
+        ]
         cells.append(f"{s.n_file_quarantined}/{s.n_cases}")
         main.append(_row([s.system, s.split, s.n_cases, s.trials, *cells]))
     notes = [note for s in summaries for note in _notes(s)] + [
@@ -463,7 +487,7 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         for d, m in s.by_difficulty.items():
             n_d = s.n_by_difficulty.get(d)
             counts = s.n_defined_by_difficulty.get(d, {})
-            cells = [_cell(m.get(k), counts.get(k), n_d) for _, k in _TABLE_METRICS]
+            cells = [_cell(k, m.get(k), counts.get(k), n_d) for _, k in _TABLE_METRICS]
             q_d = s.n_file_quarantined_by_difficulty.get(d)
             cells.append(_NONE if q_d is None or n_d is None else f"{q_d}/{n_d}")
             diff.append(_row([s.system, s.split, d, _NONE if n_d is None else n_d, *cells]))

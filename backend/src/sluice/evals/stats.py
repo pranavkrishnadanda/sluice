@@ -10,6 +10,9 @@
   (Yao et al. 2024). It is the probability that ``k`` trials drawn without replacement from the
   ``n`` observed are all successes, an unbiased estimator of ``p ** k``. ``pass_hat_k(n, c, n)``
   is 1.0 iff every trial succeeded. Both use exact integer combinatorics.
+* ``clopper_pearson`` -- the exact (Clopper-Pearson) binomial interval for ``k`` successes in
+  ``n`` trials, from beta quantiles. ``RESULTS.md`` uses it where the bootstrap collapses to
+  zero width (a per-case boolean that is 0 or 1 on every case).
 * ``mcnemar_p`` -- exact two-sided McNemar test on paired booleans: a binomial test with
   ``p = 0.5`` on the discordant pairs (``a`` right / ``b`` wrong vs. ``a`` wrong / ``b``
   right). 1.0 when there are no discordant pairs.
@@ -22,7 +25,7 @@ from collections.abc import Sequence
 from fractions import Fraction
 
 import numpy as np
-from scipy.stats import binomtest
+from scipy.stats import beta, binomtest
 
 # Cap on elements of one resample index matrix (int64), bounding peak memory at ~32 MiB.
 _MAX_CHUNK_ELEMENTS = 1 << 22
@@ -72,6 +75,24 @@ def bootstrap_ci(
     lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
     # A resampled mean cannot leave the data range; clamp away last-ulp summation error.
     return (mean, float(min(max(lo, lo_v), hi_v)), float(min(max(hi, lo_v), hi_v)))
+
+
+def clopper_pearson(k: int, n: int, alpha: float = 0.05) -> tuple[float, float]:
+    """The exact ``1 - alpha`` Clopper-Pearson interval ``(lo, hi)`` for ``k`` of ``n``.
+
+    ``lo = Beta(alpha / 2; k, n - k + 1)`` (0 when ``k == 0``) and
+    ``hi = Beta(1 - alpha / 2; k + 1, n - k)`` (1 when ``k == n``). O(1).
+
+    Raises:
+        ValueError: if ``n < 1``, ``k`` is not in ``[0, n]`` or ``alpha`` is not in ``(0, 1)``.
+    """
+    if n < 1 or not 0 <= k <= n:
+        raise ValueError(f"need 0 <= k <= n and n >= 1, got k={k}, n={n}")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    lo = 0.0 if k == 0 else float(beta.ppf(alpha / 2, k, n - k + 1))
+    hi = 1.0 if k == n else float(beta.ppf(1 - alpha / 2, k + 1, n - k))
+    return lo, hi
 
 
 def _check_nck(n: int, c: int, k: int) -> None:
