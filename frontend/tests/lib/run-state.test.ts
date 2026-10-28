@@ -361,4 +361,276 @@ describe("reduceRunEvents", () => {
       ruleActions: [],
     });
   });
+  describe("early end: run_finished closes every open node", () => {
+    const twoNodePlan: RunEvent = {
+      seq: 2,
+      at: AT,
+      type: "plan_created",
+      nodes: [
+        {
+          id: "n1",
+          title: "Normalise amounts",
+          columns: ["o_totalprice"],
+          tier: "small",
+          dependsOn: [],
+        },
+        {
+          id: "n2",
+          title: "Parse dates",
+          columns: ["o_orderdate"],
+          tier: "small",
+          dependsOn: [],
+        },
+        {
+          id: "n3",
+          title: "Join customers",
+          columns: ["o_custkey"],
+          tier: "strong",
+          dependsOn: ["n1", "n2"],
+        },
+      ],
+    };
+
+    const finished = (
+      seq: number,
+      status: "succeeded" | "quarantined" | "failed",
+      costUsd: number,
+      tokens: number,
+    ): RunEvent => ({
+      seq,
+      at: "2026-10-28T09:05:00.000Z",
+      type: "run_finished",
+      status,
+      summary: "ended",
+      costUsd,
+      tokens,
+    });
+
+    test("quarantined early end closes a node stopped mid-attempt", () => {
+      const s = reduceAll([
+        started,
+        twoNodePlan,
+        {
+          seq: 3,
+          at: AT,
+          type: "node_started",
+          nodeId: "n1",
+          attempt: 1,
+          maxAttempts: 3,
+        },
+        {
+          seq: 4,
+          at: AT,
+          type: "node_started",
+          nodeId: "n2",
+          attempt: 3,
+          maxAttempts: 3,
+        },
+        {
+          seq: 5,
+          at: AT,
+          type: "attempt_failed",
+          nodeId: "n2",
+          attempt: 3,
+          maxAttempts: 3,
+          error: "contract check failed",
+          tokens: 10,
+          costUsd: 0.01,
+        },
+        finished(6, "quarantined", 0.05, 50),
+      ]);
+      expect(s?.status).toBe("quarantined");
+      const [n1, n2, n3] = s?.nodes ?? [];
+      expect(n1).toMatchObject({ status: "failed", attempt: 1 });
+      expect(n1?.lastError).toMatch(/run ended/i);
+      expect(n2).toMatchObject({
+        status: "failed",
+        lastError: "contract check failed",
+      });
+      // A node that never started is not open; it stays pending.
+      expect(n3?.status).toBe("pending");
+      expect(
+        s?.nodes.some((n) => n.status === "running" || n.status === "retrying"),
+      ).toBe(false);
+    });
+
+    test("a retrying node whose last attempt_failed had no follow-up keeps its error", () => {
+      const s = reduceAll([
+        started,
+        twoNodePlan,
+        {
+          seq: 3,
+          at: AT,
+          type: "node_started",
+          nodeId: "n1",
+          attempt: 1,
+          maxAttempts: 3,
+        },
+        {
+          seq: 4,
+          at: AT,
+          type: "attempt_failed",
+          nodeId: "n1",
+          attempt: 1,
+          maxAttempts: 3,
+          error: "provider timeout",
+          tokens: 0,
+          costUsd: 0,
+        },
+        finished(5, "failed", 0, 0),
+      ]);
+      expect(s?.nodes[0]).toMatchObject({
+        status: "failed",
+        attempt: 1,
+        lastError: "provider timeout",
+      });
+    });
+
+    test("a succeeded run_finished arriving while a node is open still closes it", () => {
+      const s = reduceAll([
+        started,
+        twoNodePlan,
+        {
+          seq: 3,
+          at: AT,
+          type: "node_started",
+          nodeId: "n1",
+          attempt: 2,
+          maxAttempts: 3,
+        },
+        finished(4, "succeeded", 0, 0),
+      ]);
+      expect(s?.status).toBe("succeeded");
+      expect(s?.finished).toBe(true);
+      expect(s?.nodes[0]?.status).toBe("failed");
+      expect(s?.nodes[1]?.status).toBe("pending");
+    });
+
+    test("interleaved events of concurrent nodes are tracked per node", () => {
+      const s = reduceAll([
+        started,
+        twoNodePlan,
+        {
+          seq: 3,
+          at: AT,
+          type: "node_started",
+          nodeId: "n1",
+          attempt: 1,
+          maxAttempts: 3,
+        },
+        {
+          seq: 4,
+          at: AT,
+          type: "node_started",
+          nodeId: "n2",
+          attempt: 1,
+          maxAttempts: 2,
+        },
+        {
+          seq: 5,
+          at: AT,
+          type: "attempt_failed",
+          nodeId: "n1",
+          attempt: 1,
+          maxAttempts: 3,
+          error: "bad cast",
+          tokens: 5,
+          costUsd: 0.001,
+        },
+        {
+          seq: 6,
+          at: AT,
+          type: "node_finished",
+          nodeId: "n2",
+          attempt: 1,
+          tier: "small",
+          tokens: 7,
+          costUsd: 0.002,
+          latencyMs: 300,
+          transformId: "t-n2-1",
+        },
+        {
+          seq: 7,
+          at: AT,
+          type: "node_started",
+          nodeId: "n1",
+          attempt: 2,
+          maxAttempts: 3,
+        },
+      ]);
+      const [n1, n2] = s?.nodes ?? [];
+      expect(n1).toMatchObject({
+        status: "retrying",
+        attempt: 2,
+        attemptsReported: 1,
+        maxAttempts: 3,
+        lastError: "bad cast",
+        tokens: 5,
+      });
+      expect(n2).toMatchObject({
+        status: "done",
+        attempt: 1,
+        maxAttempts: 2,
+        lastError: null,
+        tokens: 7,
+        transformId: "t-n2-1",
+      });
+      expect(s?.totals).toEqual({ costUsd: 0.003, tokens: 12, latencyMs: 300 });
+
+      const end = reduceRunEvents(s, finished(8, "failed", 0.004, 20));
+      expect(end.nodes[0]).toMatchObject({ status: "failed", attempt: 2 });
+      expect(end.nodes[0]?.lastError).toMatch(/run ended/i);
+      expect(end.nodes[1]?.status).toBe("done");
+    });
+
+    test("totals jump to run_finished's figures even when above the node sum", () => {
+      const before = reduceAll([
+        started,
+        twoNodePlan,
+        {
+          seq: 3,
+          at: AT,
+          type: "node_started",
+          nodeId: "n1",
+          attempt: 1,
+          maxAttempts: 3,
+        },
+        {
+          seq: 4,
+          at: AT,
+          type: "node_finished",
+          nodeId: "n1",
+          attempt: 1,
+          tier: "small",
+          tokens: 100,
+          costUsd: 0.01,
+          latencyMs: 250,
+          transformId: "t-n1-1",
+        },
+        {
+          seq: 5,
+          at: AT,
+          type: "node_started",
+          nodeId: "n2",
+          attempt: 1,
+          maxAttempts: 3,
+        },
+      ]);
+      expect(before?.totals).toEqual({
+        costUsd: 0.01,
+        tokens: 100,
+        latencyMs: 250,
+      });
+      const end = reduceRunEvents(
+        before,
+        finished(6, "quarantined", 0.42, 4200),
+      );
+      expect(end.totals).toEqual({
+        costUsd: 0.42,
+        tokens: 4200,
+        latencyMs: 250,
+      });
+      expect(end.finishedAt).toBe("2026-10-28T09:05:00.000Z");
+    });
+  });
 });
