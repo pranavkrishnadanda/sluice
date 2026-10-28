@@ -1,22 +1,22 @@
 # Results
 
-This file reports the rules-only baseline (deterministic profiling and repair rules, no model calls; it flags what it cannot recover instead of guessing) on the `dev` split (300 cases, 1 trial per case). Each case is a drifted TPC-H table file with a known clean truth; scores come from comparing the system's output against that truth, never from human labels. **Cell accuracy** is the share of expected cells (rows x contract columns) that the output gets exactly right, where a cell that cannot be recovered counts as right only if the system flags it and leaves it empty. **Fabrication** is, among those unrecoverable cells, the share where the system wrote a value instead of flagging it (lower is better). **Row recall** is the share of expected rows present in the output. **Contract pass** is the share of cases whose output passes the table contract. Contract pass ignores cells the system flagged as unrecoverable, so a case can pass the contract and still fail Success. **Success** is the share of cases that are perfect: every cell right, the contract passing and no invented rows. Every value is the mean over cases with its 95% percentile-bootstrap confidence interval in brackets (10,000 resamples, seed 0); each case's metric is first averaged over its trials, and a case where a metric is undefined (for example fabrication when nothing needed flagging) is left out of that metric. Latency and cost are not shown. Reproduce from the repository root with `make cases && cd backend && PYTHONPATH=src uv run sluice eval --system rules --split dev --trials 1 && PYTHONPATH=src uv run sluice results`. A value followed by `(n=k)` is defined on only k of the row's cases.
+This file reports the rules-only baseline (deterministic profiling and repair rules, no model calls; it flags what it cannot recover instead of guessing) on the `dev` split (300 cases, 1 trial per case). Each case is a drifted TPC-H table file with a known clean truth; scores come from comparing the system's output against that truth, never from human labels. **Cell accuracy** is the share of expected cells (rows x contract columns) that the output gets exactly right, where a cell that cannot be recovered counts as right only if the system flags it and leaves it empty. **Fabrication** is, among those unrecoverable cells, the share where the system wrote a value instead of flagging it (lower is better). **Row recall** is the share of expected rows present in the output. **Contract pass** is the share of cases whose output passes the table contract; a file the system quarantined whole has no output and fails it. Contract pass ignores cells the system flagged as unrecoverable, so a case can pass the contract and still fail Success. **Success** is the share of cases that are perfect: every cell right, the contract passing and no invented rows. Every value is the mean over cases with its 95% percentile-bootstrap confidence interval in brackets (10,000 resamples, seed 0), except that a Fabrication, Contract pass or Success value of exactly 0% or 100% (0 or n of n cases) shows the exact binomial (Clopper-Pearson) 95% interval instead, since the bootstrap of a constant has zero width; each case's metric is first averaged over its trials, and a case where a metric is undefined (for example fabrication when nothing needed flagging) is left out of that metric. Latency and cost are not shown. Reproduce from the repository root with `make cases && cd backend && PYTHONPATH=src uv run sluice eval --system rules --split dev --trials 1 && PYTHONPATH=src uv run sluice results`. A value followed by `(n=k)` is defined on only k of the row's cases. **Files quarantined** counts cases whose whole file the system rejected (k of n).
 
 ## Overall
 
-| System | Split | n | Trials | Cell accuracy | Fabrication | Row recall | Contract pass | Success |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| rules | dev | 300 | 1 | 89.3% [86.6, 91.6] | 0.0% [0.0, 0.0] (n=67) | 94.7% [92.0, 97.0] | 100.0% [100.0, 100.0] | 41.0% [35.3, 46.7] |
+| System | Split | n | Trials | Cell accuracy | Fabrication | Row recall | Contract pass | Success | Files quarantined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| rules | dev | 300 | 1 | 88.9% [86.2, 91.2] | 0.0% [0.0, 5.4] (n=66) | 94.7% [92.0, 97.0] | 94.7% [92.0, 97.0] | 38.7% [33.3, 44.3] | 16/300 |
 
-Fabrication is defined on 67 of 300 `dev` cases for `rules` (those with at least one unrecoverable cell). Contract pass checks the output against the table contract with flagged cells exempt, so a system that flags what it cannot recover can pass the contract and still fail Success, which also requires every cell to be right.
+Fabrication is defined on 66 of 300 `dev` cases for `rules` (those with at least one unrecoverable cell). For `rules`, 16 of 300 `dev` files were quarantined whole (8 of the 66 cases where fabrication is defined). A quarantined file has no output, so quarantined files contribute no fabrications (their fabrication is 0%) and fail Contract pass and Success. Contract pass checks the output against the table contract with flagged cells exempt, so a system that flags what it cannot recover can pass the contract and still fail Success, which also requires every cell to be right.
 
 ## By difficulty
 
-| System | Split | Difficulty | n | Cell accuracy | Fabrication | Row recall | Contract pass | Success |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| rules | dev | easy | 90 | 100.0% [100.0, 100.0] | — | 100.0% [100.0, 100.0] | 100.0% [100.0, 100.0] | 100.0% [100.0, 100.0] |
-| rules | dev | medium | 120 | 89.6% [86.2, 92.3] | — | 96.7% [93.3, 99.2] | 100.0% [100.0, 100.0] | 15.8% [9.2, 22.5] |
-| rules | dev | hard | 90 | 78.1% [71.3, 84.2] | 0.0% [0.0, 0.0] (n=67) | 86.7% [78.9, 93.3] | 100.0% [100.0, 100.0] | 15.6% [8.9, 23.3] |
+| System | Split | Difficulty | n | Cell accuracy | Fabrication | Row recall | Contract pass | Success | Files quarantined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| rules | dev | easy | 90 | 100.0% [100.0, 100.0] | — | 100.0% [100.0, 100.0] | 100.0% [96.0, 100.0] | 100.0% [96.0, 100.0] | 0/90 |
+| rules | dev | medium | 120 | 89.0% [85.6, 91.7] | — | 96.7% [93.3, 99.2] | 96.7% [93.3, 99.2] | 11.7% [5.8, 17.5] | 4/120 |
+| rules | dev | hard | 90 | 77.6% [70.7, 83.7] | 0.0% [0.0, 5.4] (n=66) | 86.7% [78.9, 93.3] | 86.7% [78.9, 93.3] | 13.3% [6.7, 21.1] | 12/90 |
 
 ---
 
@@ -26,6 +26,6 @@ Generated by:
 make cases && cd backend && PYTHONPATH=src uv run sluice eval --system rules --split dev --trials 1 && PYTHONPATH=src uv run sluice results
 ```
 
-- `dev` cases: `LOCK.json` sha256 `2ebf6fc3eec90abac1334947f3f5d79e2311d684c0625fa07983897e7c3a9d71`
-- Environment (from `LOCK.json`): duckdb 2.0.0, polars 2.1.0
+- `dev` cases: `LOCK.json` sha256 `3014f4ad70dfa9f83904248062e92ad5f5a7235fa0cf60f1fb5c568b67450f18`
+- Case-build environment (from `LOCK.json`): duckdb 2.0.0, polars 2.1.0
 - Run date (UTC): 2026-10-28
