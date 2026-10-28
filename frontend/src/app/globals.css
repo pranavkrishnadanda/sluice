@@ -72,6 +72,15 @@
   --diff-del: #9a1a23; /* 6.3:1 on its tint */
   --diff-add-bg: rgb(18 140 70 / 0.14);
   --diff-del-bg: rgb(200 40 50 / 0.11);
+  /*
+   * Evals chart series (non-text, >= 3:1 on every glass/solid surface; see
+   * tests/design/contrast.test.ts). Baselines share one hue and are labelled
+   * directly; each router line takes the next router slot.
+   */
+  --chart-baseline: #007658;
+  --chart-router-1: #2a63d6;
+  --chart-router-2: #ad4514;
+  --chart-grid: rgb(29 29 31 / 0.1);
 }
 
 [data-theme="dark"] {
@@ -109,6 +118,10 @@
   --diff-del: #ffb0b0; /* 7.8:1 on its tint */
   --diff-add-bg: rgb(76 214 138 / 0.14);
   --diff-del-bg: rgb(255 120 120 / 0.13);
+  --chart-baseline: #22b38f;
+  --chart-router-1: #73a0f5;
+  --chart-router-2: #ee8645;
+  --chart-grid: rgb(242 242 247 / 0.12);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -147,6 +160,10 @@
     --diff-del: #ffb0b0;
     --diff-add-bg: rgb(76 214 138 / 0.14);
     --diff-del-bg: rgb(255 120 120 / 0.13);
+    --chart-baseline: #22b38f;
+    --chart-router-1: #73a0f5;
+    --chart-router-2: #ee8645;
+    --chart-grid: rgb(242 242 247 / 0.12);
   }
 }
 

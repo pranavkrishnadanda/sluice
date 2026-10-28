@@ -279,3 +279,64 @@ describe("plan node fills (WCAG AA, 4.5:1)", () => {
     }
   }
 });
+
+/** OKLab (×100) of an sRGB colour, for perceptual distance between marks. */
+function oklab(c: Rgb): Rgb {
+  const [r, g, b] = c.map(toLinear) as unknown as Rgb;
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    100 * (0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s),
+    100 * (1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s),
+    100 * (0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s),
+  ];
+}
+
+const deltaE = (a: Rgb, b: Rgb) =>
+  Math.hypot(...oklab(a).map((v, i) => v - (oklab(b)[i] ?? 0)));
+
+/** Keep in step with CHART_TOKENS in src/components/evals/chart-colours.ts. */
+const CHART_SERIES_TOKENS = [
+  "--chart-baseline",
+  "--chart-router-1",
+  "--chart-router-2",
+] as const;
+
+/*
+ * Evals chart marks (points, lines) sit on a glass card: each series colour
+ * must reach 3:1 against every glass/solid surface (WCAG 1.4.11), and every
+ * pair of series must stay apart (OKLab ΔE >= 15) so no two read as one.
+ */
+describe("chart series colours (WCAG 1.4.11 non-text, 3:1)", () => {
+  for (const [theme, t] of Object.entries(THEMES)) {
+    for (const token of CHART_SERIES_TOKENS) {
+      it(`${theme} ${token} >= 3 on every glass and solid surface`, () => {
+        const fg = parseColor(t.get(token) ?? "").rgb;
+        const worst = surfaces(t)
+          .map((s) => ({ ...s, ratio: contrast(fg, s.rgb) }))
+          .sort((a, b) => a.ratio - b.ratio)[0];
+        const verdict =
+          worst && worst.ratio >= 3
+            ? "3:1"
+            : `${worst?.ratio.toFixed(2)}:1 on ${worst?.name}`;
+        expect(verdict).toBe("3:1");
+      });
+    }
+
+    it(`${theme} chart series are pairwise distinguishable`, () => {
+      const colours = CHART_SERIES_TOKENS.map(
+        (k) => [k, parseColor(t.get(k) ?? "").rgb] as const,
+      );
+      for (const [i, [a, ca]] of colours.entries()) {
+        for (const [b, cb] of colours.slice(i + 1)) {
+          expect([a, b, Number(deltaE(ca, cb).toFixed(1)) >= 15]).toEqual([
+            a,
+            b,
+            true,
+          ]);
+        }
+      }
+    });
+  }
+});
