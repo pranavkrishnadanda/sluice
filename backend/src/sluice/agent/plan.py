@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from typing import Final, Literal
+from typing import Final, Literal, TypeGuard
 
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
@@ -26,8 +26,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sluice.agent.events import OpaqueId
 from sluice.contracts.model import Contract
 from sluice.llm.client import LLM, CallRecord, LLMOutputError, Tier
-from sluice.rules.fixers import SENTINEL_TOKENS, RuleResult, cell_texts, raw_keys
-from sluice.rules.profile import match_columns
+from sluice.rules.fixers import SENTINEL_TOKENS, RuleResult, cell_texts, kept_raw_rows
+from sluice.rules.profile import profile
 
 MAX_SAMPLES: Final = 12
 """Raw samples kept per candidate column (sorted, distinct, first N)."""
@@ -36,7 +36,10 @@ PROMPT_SAMPLE_CHARS: Final = 200
 """Each sample is cut to this many characters in the prompt (bounds tokens and injection room)."""
 
 PLAN_VALIDATION_RETRIES: Final = 1
-"""Re-asks after a plan fails semantic validation, before ``LLMOutputError``."""
+"""Re-asks after a failed plan (client schema repair failed, or semantic validation failed)."""
+
+MAX_ERROR_CHARS: Final = 300
+"""Error text fed back to the model is cut to this many characters (no raw model output)."""
 
 ROLE: Final = "orchestrator"
 PLAN_TIER: Final[Tier] = "strong"
@@ -84,8 +87,9 @@ class PlanError(ValueError):
 # ---------------------------------------------------------------- candidates
 
 
-def _destroyed(text: str | None) -> bool:
-    return text is None or text.strip() in SENTINEL_TOKENS
+def _informative(text: str | None) -> TypeGuard[str]:
+    """Raw text that still carries information: not null and not a destroyed token."""
+    return text is not None and text.strip() not in SENTINEL_TOKENS
 
 
 def candidate_columns(
@@ -94,32 +98,38 @@ def candidate_columns(
     """Contract columns worth repairing, each with up to :data:`MAX_SAMPLES` raw samples.
 
     A column qualifies when at least one of its flagged cells has raw text that is not null and
-    not a destroyed token (compared after stripping, as the rules do). Raw rows are aligned to
-    the rules' clean primary keys with :func:`sluice.rules.fixers.raw_keys`; rows whose key cannot
-    be parsed were dropped by the rules and are ignored. Samples are the raw text verbatim,
-    distinct, sorted, first :data:`MAX_SAMPLES`. Keys follow contract column order.
+    not a destroyed token (compared after stripping, as the rules do). Each flagged cell is read
+    from the raw row the rules actually kept for its key
+    (:func:`sluice.rules.fixers.kept_raw_rows`), so text from a dropped duplicate or an unkeyed
+    row never becomes a sample. Samples are the raw text verbatim, distinct, sorted, first
+    :data:`MAX_SAMPLES`. Keys follow contract column order.
 
-    Complexity: O(rows x flagged columns) plus O(d log d) to sort d distinct samples per column.
+    Complexity: O(rows x contract columns) (one rules pass to find kept rows, plus one scan of
+    each flagged column) and O(d log d) to sort d distinct samples per column.
     """
-    flagged_columns = {column for _, column in rules.flags}
-    if not flagged_columns:
+    if not rules.flags:
         return {}
-    source = {target: name for name, target in match_columns(list(raw.columns), contract).items()}
-    keys = raw_keys(raw, contract)
+    prof = profile(raw, contract)
+    source = {
+        col.matched_contract_column: name
+        for name, col in prof.columns.items()
+        if col.matched_contract_column is not None
+    }
+    rows = kept_raw_rows(raw, contract, prof)
+    flagged_rows: dict[str, list[int]] = {}
+    for key, column in rules.flags:
+        if column in source and key in rows:
+            flagged_rows.setdefault(column, []).append(rows[key])
     out: dict[str, list[str]] = {}
     for spec in contract.columns:
-        if spec.name not in flagged_columns or spec.name not in source:
+        if spec.name not in flagged_rows:
             continue
         texts = cell_texts(raw[source[spec.name]])
         if texts is None:
             continue
-        seen = {
-            text
-            for key, text in zip(keys, texts, strict=True)
-            if key is not None and not _destroyed(text) and (key, spec.name) in rules.flags
-        }
+        seen = {text for i in flagged_rows[spec.name] if _informative(text := texts[i])}
         if seen:
-            out[spec.name] = sorted(seen)[:MAX_SAMPLES]  # type: ignore[type-var]
+            out[spec.name] = sorted(seen)[:MAX_SAMPLES]
     return out
 
 
@@ -199,16 +209,16 @@ async def propose_plan(
 ) -> tuple[Plan, list[CallRecord]]:
     """Ask the orchestrator for a validated repair plan over ``candidates``.
 
-    Empty ``candidates`` returns ``Plan(nodes=[])`` without calling a model. A plan that fails
-    :func:`validate_plan` is re-requested once with the error appended to the prompt.
+    Empty ``candidates`` returns ``Plan(nodes=[])`` without calling a model. A failed attempt
+    (the client's schema repair failed, or :func:`validate_plan` rejected the plan) is
+    re-requested once with a short error text (at most :data:`MAX_ERROR_CHARS`) appended.
 
     Returns:
         The plan and the accounting record of every call made.
 
     Raises:
-        LLMOutputError: the plan was still invalid after the retry (``record`` is the last
-            call's), or the client's own schema repair failed.
-        LLMUnavailable: the proxy failed (propagated from :meth:`LLM.run`).
+        LLMOutputError: the second attempt failed too (``record`` is the last call's).
+        LLMUnavailable: the proxy failed (propagated at once from :meth:`LLM.run`, no retry).
     """
     if not candidates:
         return Plan(nodes=[]), []
@@ -217,13 +227,21 @@ async def propose_plan(
     records: list[CallRecord] = []
     error = ""
     for _ in range(1 + PLAN_VALIDATION_RETRIES):
-        plan, record = await llm.run(ROLE, PLAN_TIER, SYSTEM_PROMPT, prompt, Plan)
-        records.append(record)
+        plan: Plan | None = None
         try:
-            return validate_plan(plan, candidates), records
-        except PlanError as exc:
-            error = str(exc)
+            plan, record = await llm.run(ROLE, PLAN_TIER, SYSTEM_PROMPT, prompt, Plan)
+        except LLMOutputError as exc:
+            # The client's message names role/tier/exception class only: no model output.
+            record, error = exc.record, "the output did not match the plan schema"
+        records.append(record)
+        if plan is not None:
+            try:
+                return validate_plan(plan, candidates), records
+            except PlanError as exc:
+                error = str(exc)
+        error = error[:MAX_ERROR_CHARS]
         prompt = f"{base}\n\nYour previous plan was rejected: {error}\nReturn a corrected plan."
+    # Raised here, outside every ``except`` block, so no exception context is chained.
     raise LLMOutputError(
         f"{ROLE}/{PLAN_TIER}: plan invalid after {PLAN_VALIDATION_RETRIES} retry: {error}",
         record=records[-1],

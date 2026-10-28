@@ -10,6 +10,7 @@ from typing import Any
 import polars as pl
 import pytest
 from pydantic import ValidationError
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -21,6 +22,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from sluice.agent.plan import (
+    MAX_ERROR_CHARS,
     MAX_SAMPLES,
     Plan,
     PlanError,
@@ -31,7 +33,7 @@ from sluice.agent.plan import (
     validate_plan,
 )
 from sluice.contracts.model import Contract, load_contract
-from sluice.llm.client import LLM, LLMOutputError
+from sluice.llm.client import LLM, LLMOutputError, LLMUnavailable
 from sluice.rules.fixers import RuleResult, apply_rules
 from sluice.rules.profile import profile
 
@@ -115,6 +117,34 @@ def test_candidates_ignore_rows_whose_key_cannot_be_parsed(orders: Contract) -> 
     got = candidate_columns(raw, rules(raw, orders), orders)
 
     assert got == {}
+
+
+def test_candidates_sample_only_the_duplicate_row_the_rules_kept(orders: Contract) -> None:
+    # Same PK twice, one flag each: the rules keep the earliest row, whose price is destroyed.
+    raw = pl.DataFrame({"o_orderkey": ["1", "1"], "o_totalprice": ["N/A", "1,00.00"]})
+
+    got = candidate_columns(raw, rules(raw, orders), orders)
+
+    assert "o_totalprice" not in got
+
+
+def test_candidates_ignore_garbage_in_a_dropped_duplicate(orders: Contract) -> None:
+    # Both rows' prices are flagged (an exact duplicate after repair): only row 0 survives.
+    raw = pl.DataFrame({"o_orderkey": ["1", "1"], "o_totalprice": ["1,00.00", "zzz"]})
+
+    got = candidate_columns(raw, rules(raw, orders), orders)
+
+    assert got == {"o_totalprice": ["1,00.00"]}
+
+
+def test_candidates_keep_the_more_flagged_duplicate(orders: Contract) -> None:
+    raw = pl.DataFrame(
+        {"o_orderkey": ["1", "1"], "o_custkey": ["7", "N/A"], "o_totalprice": ["1.00", "9,9.00"]}
+    )
+
+    got = candidate_columns(raw, rules(raw, orders), orders)
+
+    assert got == {"o_totalprice": ["9,9.00"]}
 
 
 # ---------------------------------------------------------------- plan models / validation
@@ -255,6 +285,57 @@ def test_propose_plan_may_return_empty_plan(orders: Contract) -> None:
 
     assert plan.nodes == []
     assert len(records) == 1
+
+
+def test_propose_plan_retries_after_client_output_error(orders: Contract) -> None:
+    bad = {"nodes": [node("bad id", "o_totalprice")]}  # fails the client's schema check twice
+    script = Scripted(bad, bad, {"nodes": [node("a", "o_totalprice")]})
+
+    plan, records = run(propose_plan(CANDS, orders, script.llm()))
+
+    assert [n.column for n in plan.nodes] == ["o_totalprice"]
+    assert len(records) == 2
+    assert "rejected" in script.prompts[-1]
+    assert "bad id" not in script.prompts[-1]
+
+
+def test_propose_plan_client_output_error_twice_raises(orders: Contract) -> None:
+    bad = {"nodes": [node("bad id", "o_totalprice")]}
+    script = Scripted(bad, bad, bad, bad)
+
+    with pytest.raises(LLMOutputError) as info:
+        run(propose_plan(CANDS, orders, script.llm()))
+
+    assert info.value.record.tier == "strong"
+    assert info.value.__context__ is None
+    assert script.queue == []
+
+
+def test_propose_plan_unavailable_propagates_without_retry(orders: Contract) -> None:
+    calls = 0
+
+    def down(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise ModelHTTPError(503, "strong")
+
+    llm = LLM("http://litellm.test", "k", model_override=FunctionModel(down))
+
+    with pytest.raises(LLMUnavailable):
+        run(propose_plan(CANDS, orders, llm))
+
+    assert calls == 1
+
+
+def test_propose_plan_feedback_is_bounded(orders: Contract) -> None:
+    long = "z" * 128
+    script = Scripted({"nodes": [node("a", long)]}, {"nodes": []})
+
+    run(propose_plan(CANDS, orders, script.llm()))
+
+    feedback = script.prompts[-1].split("rejected:", 1)[1]
+    assert len(feedback) <= MAX_ERROR_CHARS + len("\nReturn a corrected plan.")
+    assert long not in feedback
 
 
 # ---------------------------------------------------------------- route_tier

@@ -44,7 +44,7 @@ import polars as pl
 
 from sluice.contracts.model import MONEY_PRECISION, MONEY_SCALE, ColumnSpec, Contract
 from sluice.evals.types import PK
-from sluice.rules.profile import Profile, match_columns
+from sluice.rules.profile import Profile
 
 SENTINEL_TOKENS: frozenset[str] = frozenset({"N/A", "", "-1", "###"})
 DAY_FIRST_LOCALES: frozenset[str] = frozenset({"en_IN"})
@@ -67,6 +67,7 @@ _DMY_FORMAT = "%d/%m/%Y"
 _FLAG_PREFIX = "__flag__"
 _ROW_INDEX = "__row__"
 _FLAG_COUNT = "__n_flags__"
+_RAW_ROW = "__raw_row__"
 
 # Why a cell became null + flagged.
 SENTINEL = "sentinel"
@@ -314,10 +315,14 @@ def _drop_unkeyed(
     return out, dropped
 
 
-def _dedupe(frame: pl.DataFrame, contract: Contract, actions: list[str]) -> pl.DataFrame:
+def _dedupe(
+    frame: pl.DataFrame, contract: Contract, actions: list[str], carry: tuple[str, ...] = ()
+) -> pl.DataFrame:
     """Rule 10: exact duplicates (data and flags) first, then one row per PK, preferring the
-    row that carries the most flags."""
-    exact = frame.unique(keep="first", maintain_order=True)  # data and flag columns
+    row that carries the most flags. ``carry`` columns ride along but never count toward
+    "exact duplicate" (used by :func:`kept_raw_rows` to carry the raw row index)."""
+    subset = [c for c in frame.columns if c not in carry] if carry else None
+    exact = frame.unique(subset=subset, keep="first", maintain_order=True)  # data and flags
     if n := frame.height - exact.height:
         actions.append(f"dropped {n} exact duplicate row(s)")
     # Among rows sharing a PK keep the one with the most flags (earliest on ties), so a
@@ -374,24 +379,32 @@ def cell_texts(series: pl.Series) -> list[str | None] | None:
     return _as_text(series)
 
 
-def raw_keys(df: pl.DataFrame, contract: Contract) -> list[PK | None]:
-    """The clean primary key the rules derive for each raw row, in row order.
+def kept_raw_rows(df: pl.DataFrame, contract: Contract, prof: Profile) -> dict[PK, int]:
+    """Clean primary key -> index of the raw ``df`` row :func:`apply_rules` keeps for it.
 
-    Uses the rules' own column matching and cell parsing, so a key here equals the key the row
-    carries in :attr:`RuleResult.flags` (when the row survives). ``None`` where any key part
-    fails to parse, or when a key column has no matching input column.
+    Runs the same rules 1-10 (matching, cell parsing, unkeyed-row drop, dedupe) with the raw
+    row index carried through, so the choice among duplicate keys is exactly the rules' own.
+    Rows dropped as unkeyed or as duplicates are absent. FK quarantine (rule 11) is not applied:
+    quarantined rows carry no flags.
 
-    Complexity: O(rows x key columns).
+    Complexity: O(rows x columns), the cost of one rules pass.
+
+    Raises:
+        UnkeyableInputError: A primary-key column has no matching input column.
     """
-    by_target = {target: name for name, target in match_columns(list(df.columns), contract).items()}
-    parts: list[list[Any]] = []
-    for key in contract.primary_key:
-        if key not in by_target:
-            return [None] * df.height
-        parts.append(
-            _repair_column(contract.column(key), df[by_target[key]], contract.locale).values
-        )
-    return [None if any(v is None for v in row) else tuple(row) for row in zip(*parts, strict=True)]
+    _require_keys(contract, prof)
+    frame = _repair_frame(_select_matched(df, prof, []), contract, [])
+    frame = frame.with_row_index(_RAW_ROW)
+    frame, _ = _drop_unkeyed(frame, contract, [])
+    frame = _dedupe(frame, contract, [], carry=(_RAW_ROW,))
+    return {
+        tuple(row[:-1]): row[-1] for row in frame.select([*contract.primary_key, _RAW_ROW]).rows()
+    }
+
+
+def _require_keys(contract: Contract, prof: Profile) -> None:
+    if missing_pk := [k for k in contract.primary_key if k in prof.missing]:
+        raise UnkeyableInputError(f"primary-key column(s) not found in input: {missing_pk}")
 
 
 def apply_rules(
@@ -412,8 +425,7 @@ def apply_rules(
     Raises:
         UnkeyableInputError: A primary-key column has no matching input column.
     """
-    if missing_pk := [k for k in contract.primary_key if k in prof.missing]:
-        raise UnkeyableInputError(f"primary-key column(s) not found in input: {missing_pk}")
+    _require_keys(contract, prof)
     actions: list[str] = []
     selected = _select_matched(df, prof, actions)
     frame = _repair_frame(selected, contract, actions)
