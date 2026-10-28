@@ -13,8 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # setup-uv no longer publishes moving major tags; v10.3.2 is the latest v10 release.
-      - uses: astral-sh/setup-uv@v10.3.2
+      # setup-uv no longer publishes moving major tags; v10.3.3 is the latest v10 release.
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
@@ -28,3 +28,10 @@ jobs:
 
       - name: Test
         run: make test
+
+      # Rebuild both splits from scratch, check them against LOCK.json, re-run the rules eval and
+      # fail if the published RESULTS.md would change (the run-date footer line is ignored).
+      - name: Reproduce published results
+        run: |
+          make cases eval-rules results
+          git diff --exit-code -I '^- Run date \(UTC\): ' -- evals/RESULTS.md
