@@ -12,27 +12,35 @@ States, in order (each one emits the contract event named after it, see ``docs/a
 4. **plan** (``candidate_columns`` -> ``propose_plan``); ``plan_created``. No candidates means no
    model call and an empty plan.
 5. **work**, nodes in dependency waves, the nodes of one wave concurrently (``asyncio.gather``).
-   Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` -> ``precheck_code``
+   Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` (unchecked draft)
+   -> ``precheck_code``
    -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> an effect check (the rewrite
    must recover a flagged cell and break no parsed one) -> ``verify_node``. Each attempt emits
    ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's reason is fed to
-   the next attempt as ``prior_error``. A node whose dependency was not accepted never starts.
+   the next attempt as ``prior_error`` (the precheck's, guard's or verifier's own reason).
+   A node whose dependency was not accepted never starts.
+   **Failure path** (contract): when a node's final attempt fails, no new node starts (nodes in
+   flight finish), there is no ``verified``, and the whole input is quarantined
+   (``file_quarantined``, empty output) with ``run_finished`` status ``quarantined``.
 6. **rules pass 2** on the raw frame with every accepted column replaced; ``verified`` (contract
-   checks on the final output) only when every planned node was accepted, as the contract's
-   failure path requires.
-7. ``run_finished``, exactly once (``loaded`` belongs to the loader / ``sluice run``).
+   checks on the final output) unless the run failed.
+7. ``run_finished``, exactly once (``loaded`` belongs to the loader / ``sluice run``). Its
+   ``tokens``/``costUsd`` are the full run totals (mapping, planning and verifier calls too).
 
 Fallbacks: model and provider problems never raise. ``LLMUnavailable`` (every route failed) or
 ``LLMOutputError`` from mapping or planning skip that step: the frame stays as it was, so the
 output is what the rules make of it, and ``meta["llm_error"]`` says what happened. After an
 ``LLMUnavailable`` no further model call is made in the run. In a node, ``LLMOutputError`` (bad
-code, incl. a failed precheck, or a bad verdict) is an ordinary failed attempt, while
-``LLMUnavailable`` stops that node. A node that is not accepted leaves its column to the rules,
-which flag what they cannot parse, so a failure costs accuracy but never fabricates.
+code, a failed precheck, or a bad verdict) is an ordinary failed attempt, while
+``LLMUnavailable`` stops that node and its column is left to the rules. A fallback does not make
+the run ``failed``: the status follows the data (``succeeded`` / ``quarantined``) and the summary
+names the step that fell back. ``failed`` means the run could not complete its plan: a cap
+stopped a planned node, or the sandbox itself was unavailable.
 
 Caps (``sluice.agent.caps``): ``MAX_TOKENS_PER_FILE`` and ``MAX_WALL_S_PER_FILE`` are checked
 before every new attempt (spend and time measured from the start of the run, with ``deps.clock``)
-and stop new attempts only; accepted work is kept and ``meta["cap"]`` names the cap.
+and stop new attempts only; accepted work is kept in the output, ``meta["cap"]`` names the cap,
+and the run is ``failed`` (its plan was not completed) with no ``verified``.
 
 Cost: O(rows x columns) per rules pass; each attempt costs one rules pass on the rewritten frame
 plus a model call or two; the number of attempts is bounded by ``MAX_ATTEMPTS`` x plan size.
@@ -51,7 +59,12 @@ from typing import Any, Final
 import polars as pl
 
 from sluice.agent import plan as planning
-from sluice.agent.caps import MAX_ATTEMPTS, MAX_TOKENS_PER_FILE, MAX_WALL_S_PER_FILE
+from sluice.agent.caps import (
+    MAX_ATTEMPTS,
+    MAX_ERROR_CHARS,
+    MAX_TOKENS_PER_FILE,
+    MAX_WALL_S_PER_FILE,
+)
 from sluice.agent.events import (
     AttemptFailed,
     EventLog,
@@ -69,7 +82,7 @@ from sluice.agent.events import (
 from sluice.agent.events import PlanNode as EventPlanNode
 from sluice.agent.mapping import ColumnMapping, apply_mapping, propose_mapping
 from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
-from sluice.agent.worker import guard_output, precheck_code, write_transform
+from sluice.agent.worker import clip, guard_output, precheck_code, write_transform
 from sluice.contracts.model import ColumnSpec, Contract
 from sluice.contracts.validate import validate
 from sluice.evals.types import PK, CaseInput, SystemOutput
@@ -138,6 +151,8 @@ class _Run:
     emitted: list[EventModel] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     sandbox_error: str | None = None
+    halted: str | None = None
+    """Set when a node's final attempt failed: no new node starts and the file is quarantined."""
     unavailable: bool = False
     cap: str | None = None
 
@@ -212,7 +227,12 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
     try:
         pass1 = apply_rules(frame, contract, prof1, case.reference)
     except UnkeyableInputError as exc:
-        return _file_quarantined(run, prof1, map_actions, mapping, exc)
+        reason = str(exc)
+        actions = [*map_actions, f"file quarantined: {reason}"]
+        empty = RuleResult(pl.DataFrame(), set(), set(), [])
+        run.emit(Profiled(issues=_issues(prof1, empty, {}, mapping)))
+        run.emit(RulesApplied(actions=actions))
+        return _quarantine_file(run, actions, None, [], mapping, reason)
 
     candidates = planning.candidate_columns(frame, pass1, contract)
     run.emit(Profiled(issues=_issues(prof1, pass1, candidates, mapping)))
@@ -227,7 +247,7 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
-        return _finish(run, pass1, map_actions + pass1.actions, None, [], mapping, verified=False)
+        return _finish(run, pass1, map_actions + pass1.actions, None, [], mapping)
 
     run.emit(
         PlanCreated(
@@ -244,6 +264,9 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
         )
     )
     outcomes = await _run_nodes(run, plan, frame, prof1, pass1, candidates)
+    if run.halted is not None:
+        actions = [*map_actions, *pass1.actions, f"file quarantined: {run.halted}"]
+        return _quarantine_file(run, actions, plan, outcomes, mapping, run.halted)
 
     final = pass1
     accepted = {o.node.column: o.values for o in outcomes if o.accepted and o.values is not None}
@@ -254,8 +277,7 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
         )
         final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
     actions = map_actions + final.actions
-    all_accepted = all(o.accepted for o in outcomes)
-    return _finish(run, final, actions, plan, outcomes, mapping, verified=all_accepted)
+    return _finish(run, final, actions, plan, outcomes, mapping)
 
 
 # --------------------------------------------------------------------------- nodes
@@ -272,7 +294,9 @@ async def _run_nodes(
     """Run the plan in dependency waves; returns one outcome per node, in plan order.
 
     A wave is every not-yet-run node whose dependencies have all finished; its nodes run
-    concurrently. A node whose dependency was not accepted is skipped (0 attempts).
+    concurrently. A node whose dependency was not accepted is skipped (0 attempts). Once a
+    node's final attempt fails (``run.halted``) no later wave starts; nodes already in flight
+    run to completion and their events are still emitted.
     """
     outcomes = {n.id: _NodeOutcome(n, tier=planning.route_tier(n, 1)) for n in plan.nodes}
     pending = list(plan.nodes)
@@ -280,6 +304,10 @@ async def _run_nodes(
     source = _sources(prof)
     flagged = _flagged_rows(frame, run.case.contract, prof, pass1)
     while pending:
+        if run.halted is not None:  # a final failure: no new node starts
+            for n in pending:
+                outcomes[n.id].stop = "not started: the run is halted by a failed node"
+            break
         wave = [n for n in pending if set(n.depends_on) <= done]
         pending = [n for n in pending if n not in wave]
         runnable = []
@@ -365,8 +393,10 @@ async def _run_node(
         )
         if outcome.stop is not None:  # an outage or a broken sandbox: retrying cannot help
             return
-        prior_error = error
+        prior_error = clip(error, MAX_ERROR_CHARS)
     outcome.stop = f"no accepted transform after {MAX_ATTEMPTS} attempts"
+    if run.halted is None:  # the contract's failure path: hold the whole input back
+        run.halted = f"node {node.id} ({node.column}): {outcome.stop}"
 
 
 async def _attempt(
@@ -391,11 +421,11 @@ async def _attempt(
     node, llm = outcome.node, run.deps.llm
     try:
         code, record = await write_transform(
-            node, spec, source_name, samples, prior_error, tier, llm
+            node, spec, source_name, samples, prior_error, tier, llm, checked=False
         )
     except LLMOutputError as exc:
         records.append(exc.record)
-        return f"the worker's code failed validation (e.g. the static precheck): {exc}", None
+        return f"the worker's output did not match the transform schema: {exc}", None
     except LLMUnavailable as exc:
         run.llm_failed(f"worker {node.id}", exc)
         outcome.stop = "no model route is available"
@@ -410,6 +440,7 @@ async def _attempt(
     }
     outcome.transforms.append(transform)
 
+    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
     if (reason := precheck_code(code.code)) is not None:
         return f"precheck: {reason}", None
     try:
@@ -625,26 +656,35 @@ def _verified(run: _Run, result: RuleResult) -> None:
 
 
 def _status_and_summary(
-    run: _Run, result: RuleResult | None, outcomes: list[_NodeOutcome], file_quarantined: bool
+    run: _Run, result: RuleResult | None, outcomes: list[_NodeOutcome], quarantine: str | None
 ) -> tuple[str, str]:
+    """``run_finished`` status and summary (contract "Statuses", Rulings C1 and C4).
+
+    * ``quarantined`` when the whole input is held back (``quarantine``) or rows were;
+    * ``failed`` only when the run could not complete its plan: a cap stopped a planned node,
+      or the sandbox itself was unavailable;
+    * otherwise ``succeeded``. A model/provider fallback (a step handed over to the rules) does
+      not change the status; the summary names the step and the error type.
+    """
     accepted = sum(o.accepted for o in outcomes)
     parts = [f"repaired {accepted} of {len(outcomes)} planned column(s)"]
-    if result is not None:
+    if quarantine is not None:
+        parts.append(f"file quarantined: {quarantine}")
+    elif result is not None:
         parts.append(
             f"{len(result.flags)} cell(s) flagged, {len(result.quarantined)} row(s) quarantined"
         )
-    if file_quarantined:
-        status, parts = "quarantined", ["file quarantined: its primary key could not be located"]
-    elif run.errors:
-        status = "failed"
-        parts.append("fell back to the rules for: " + "; ".join(run.errors))
-    elif run.cap is not None:
-        status = "failed"
+    if run.errors:
+        parts.append("fell back to the rules for " + "; ".join(run.errors))
+    if run.cap is not None:
         parts.append(f"stopped by the {run.cap} cap")
-    elif run.sandbox_error is not None:
-        status = "failed"
+    if run.sandbox_error is not None:
         parts.append(f"the sandbox is unavailable ({run.sandbox_error})")
-    elif accepted < len(outcomes) or (result is not None and result.quarantined):
+    if quarantine is not None:
+        status = "quarantined"
+    elif run.cap is not None or run.sandbox_error is not None:
+        status = "failed"
+    elif result is not None and result.quarantined:
         status = "quarantined"
     else:
         status = "succeeded"
@@ -658,13 +698,13 @@ def _finish(
     plan: planning.Plan | None,
     outcomes: list[_NodeOutcome],
     mapping: ColumnMapping | None,
-    *,
-    verified: bool,
 ) -> SystemOutput:
-    if verified and run.cap is None and not run.errors and run.sandbox_error is None:
+    """The output of a run that was not quarantined whole: ``verified`` unless it failed."""
+    status, summary = _status_and_summary(run, result, outcomes, quarantine=None)
+    if status != "failed":
         _verified(run, result)
-    status, summary = _status_and_summary(run, result, outcomes, file_quarantined=False)
     _run_finished(run, status, summary)
+    reasons = _quarantine_reasons(result, run.case.contract)
     return SystemOutput(
         df=result.df,
         flags=result.flags,
@@ -672,27 +712,27 @@ def _finish(
         file_quarantined=False,
         cost_usd=run.cost(),
         latency_s=run.elapsed(),
-        meta=_meta(
-            run, actions, plan, outcomes, mapping, _quarantine_reasons(result, run.case.contract)
-        ),
+        meta=_meta(run, actions, plan, outcomes, mapping, reasons),
     )
 
 
-def _file_quarantined(
+def _quarantine_file(
     run: _Run,
-    prof: Profile,
-    map_actions: list[str],
+    actions: list[str],
+    plan: planning.Plan | None,
+    outcomes: list[_NodeOutcome],
     mapping: ColumnMapping | None,
-    exc: UnkeyableInputError,
+    reason: str,
 ) -> SystemOutput:
-    """The whole file is rejected, as in the rules-only system: empty output, no flags."""
-    actions = [*map_actions, f"file quarantined: {exc}"]
-    run.emit(
-        Profiled(issues=_issues(prof, RuleResult(pl.DataFrame(), set(), set(), []), {}, mapping))
-    )
-    run.emit(RulesApplied(actions=actions))
-    status, summary = _status_and_summary(run, None, [], file_quarantined=True)
+    """Hold the whole input back, as the rules-only system does: empty output, no flags.
+
+    Used when the primary key cannot be found, and on the contract's failure path (a node's
+    final attempt failed). No ``verified``; ``run_finished`` has status ``quarantined``.
+    """
+    status, summary = _status_and_summary(run, None, outcomes, quarantine=reason)
     _run_finished(run, status, summary)
+    meta = _meta(run, actions, plan, outcomes, mapping, {})
+    meta["file_quarantine_reason"] = reason
     return SystemOutput(
         df=pl.DataFrame(schema=run.case.contract.polars_schema()),
         flags=set(),
@@ -700,7 +740,7 @@ def _file_quarantined(
         file_quarantined=True,
         cost_usd=run.cost(),
         latency_s=run.elapsed(),
-        meta=_meta(run, actions, None, [], mapping, {}),
+        meta=meta,
     )
 
 

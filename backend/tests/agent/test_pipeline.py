@@ -39,7 +39,7 @@ from sluice.agent.mapping import SYSTEM_PROMPT as MAPPER_PROMPT
 from sluice.agent.pipeline import PipelineDeps, run_pipeline
 from sluice.agent.plan import SYSTEM_PROMPT as PLANNER_PROMPT
 from sluice.agent.verifier import VERIFIER_SYSTEM_PROMPT
-from sluice.agent.worker import WORKER_SYSTEM_PROMPT
+from sluice.agent.worker import WORKER_SYSTEM_PROMPT, precheck_code
 from sluice.contracts.model import Contract, load_contract
 from sluice.drift.cases import Case, Recipe, build_case
 from sluice.evals.graders import grade
@@ -356,6 +356,10 @@ def test_pipeline_happy_path_emits_full_event_sequence(medium: Case) -> None:
     (finished,) = result.events("run_finished")
     assert finished.status == "succeeded"  # type: ignore[attr-defined]
     assert finished.tokens == 4 * TOKENS_PER_CALL  # type: ignore[attr-defined]  # map, plan, work, verify
+    node_tokens = sum(
+        e.tokens for e in result.log.events if e.type in ("node_finished", "attempt_failed")
+    )  # type: ignore[attr-defined]
+    assert finished.tokens > node_tokens  # type: ignore[attr-defined]  # Ruling C2: full run totals
     (plan_created,) = result.events("plan_created")
     (pnode,) = plan_created.nodes  # type: ignore[attr-defined]
     assert (pnode.id, pnode.columns, pnode.tier) == ("n1", ["o_totalprice"], "small")
@@ -403,12 +407,11 @@ def test_pipeline_failed_attempt_retried_with_escalation_small_to_strong(indian:
     }
 
 
-def test_pipeline_stops_at_max_attempts_and_keeps_rules_output(indian: Case) -> None:
+def test_pipeline_stops_at_max_attempts_and_quarantines_the_whole_file(indian: Case) -> None:
     sandbox = FakeSandbox()
     result = run(
         indian, Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH]}), sandbox=sandbox
     )
-    baseline = run(indian, Script(plan={"nodes": []}))
 
     assert len(sandbox.calls) == MAX_ATTEMPTS
     failed = result.events("attempt_failed")
@@ -418,11 +421,46 @@ def test_pipeline_stops_at_max_attempts_and_keeps_rules_output(indian: Case) -> 
     assert not result.events("verified")  # contract failure path
     (finished,) = result.events("run_finished")
     assert finished.status == "quarantined"  # type: ignore[attr-defined]
-    assert_same_output(result.out, baseline.out)
-    assert price_flags(result.out) > 0
+    assert "n1" in finished.summary  # type: ignore[attr-defined]
+    assert result.out.file_quarantined  # Ruling C1: the input is held back
+    assert (
+        result.out.df.is_empty() and result.out.df.schema == load_contract("orders").polars_schema()
+    )
+    assert result.out.flags == set() and result.out.quarantined == set()
+    assert "n1" in result.out.meta["file_quarantine_reason"]
     (pn,) = result.out.meta["plan_nodes"]
     assert (pn["attempts"], pn["accepted"]) == (MAX_ATTEMPTS, False)
+    assert [t["passed"] for t in result.out.meta["transforms"]] == [False] * MAX_ATTEMPTS
     assert grade(indian, result.out, {}).fabrication_rate in (None, 0.0)
+
+
+def test_pipeline_final_failure_starts_no_new_nodes_but_lets_in_flight_ones_finish(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    custkey = ("indian_number_string", {"column": "o_custkey"})
+    case = _build(cases_dir, orders_df, "dev-0007", [INDIAN, DATES, custkey])
+    plan = {
+        "nodes": [
+            node("n1", "o_totalprice"),
+            node("n2", "o_orderdate"),
+            node("n3", "o_custkey", "n2"),  # a later wave: must not start after n1 fails
+        ]
+    }
+    workers = {
+        "o_totalprice": [CRASH],
+        "o_orderdate": [ISO_DATES],
+        "o_custkey": [STRIP_COMMAS],
+    }
+    result = run(case, Script(plan=plan, workers=workers))
+    started = {e.node_id for e in result.events("node_started")}  # type: ignore[attr-defined]
+    assert started == {"n1", "n2"}
+    assert [e.node_id for e in result.events("node_finished")] == ["n2"]  # type: ignore[attr-defined]
+    n3 = result.out.meta["plan_nodes"][2]
+    assert (n3["attempts"], n3["accepted"]) == (0, False)
+    assert result.out.file_quarantined
+    assert not result.events("verified")
+    (finished,) = result.events("run_finished")
+    assert finished.status == "quarantined"  # type: ignore[attr-defined]
 
 
 def test_pipeline_fabricating_transform_is_rejected_before_rules(medium: Case) -> None:
@@ -432,6 +470,7 @@ def test_pipeline_fabricating_transform_is_rejected_before_rules(medium: Case) -
     result = run(medium, script)
     (failed,) = result.events("attempt_failed")
     assert "fabrication" in failed.error  # type: ignore[attr-defined]
+    assert "fabrication" in script.roles("worker")[1]  # the guard's reason is the prior_error
     assert len(script.roles("verifier")) == 1  # the guard stopped attempt 1 before the verifier
     assert grade(medium, result.out, {}).fabrication_rate in (None, 0.0)
 
@@ -441,15 +480,35 @@ def test_pipeline_verifier_rejection_is_a_failed_attempt(indian: Case) -> None:
     result = run(indian, script)
     (failed,) = result.events("attempt_failed")
     assert "verifier" in failed.error and "100x" in failed.error  # type: ignore[attr-defined]
+    assert "100x" in script.roles("worker")[1]
     assert failed.tokens == 2 * TOKENS_PER_CALL  # type: ignore[attr-defined]
     (done,) = result.events("node_finished")
     assert done.attempt == 2  # type: ignore[attr-defined]
 
 
-def test_pipeline_precheck_failure_is_failed_attempt_without_sandbox(indian: Case) -> None:
+def test_pipeline_precheck_failure_feeds_its_reason_to_the_next_attempt(indian: Case) -> None:
     sandbox = FakeSandbox()
-    # Attempt 1: the code fails the precheck twice (client repair retry) -> LLMOutputError.
-    workers = {"o_totalprice": [NO_TRANSFORM, NO_TRANSFORM, STRIP_COMMAS]}
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [NO_TRANSFORM, STRIP_COMMAS]})
+    result = run(indian, script, sandbox=sandbox)
+    assert sandbox.calls == [STRIP_COMMAS]  # no sandbox run for the code that failed precheck
+    reason = precheck_code(NO_TRANSFORM)
+    assert reason is not None
+    (failed,) = result.events("attempt_failed")
+    assert failed.attempt == 1 and reason in failed.error  # type: ignore[attr-defined]
+    assert failed.tokens == TOKENS_PER_CALL  # type: ignore[attr-defined]  # one call, no repair
+    worker_prompts = script.roles("worker")
+    assert len(worker_prompts) == 2
+    assert json.dumps(reason)[1:-1] in worker_prompts[1]  # Ruling C3: attempt 2 sees the reason
+    assert result.out.meta["transforms"][0]["code"] == NO_TRANSFORM
+    assert "llm_error" not in result.out.meta  # a bad transform is a repair signal, not an outage
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]
+
+
+def test_pipeline_schema_invalid_worker_output_is_a_failed_attempt(indian: Case) -> None:
+    sandbox = FakeSandbox()
+    # Attempt 1: empty code fails the schema twice (client repair retry) -> LLMOutputError.
+    workers = {"o_totalprice": ["", "", STRIP_COMMAS]}
     result = run(indian, Script(plan=PRICE_PLAN, workers=workers), sandbox=sandbox)
     assert sandbox.calls == [STRIP_COMMAS]
     (failed,) = result.events("attempt_failed")
@@ -512,6 +571,7 @@ def test_pipeline_dependent_node_is_skipped_when_its_dependency_fails(two_column
     assert {e.node_id for e in result.events("node_started")} == {"n1"}  # type: ignore[attr-defined]
     n2 = result.out.meta["plan_nodes"][1]
     assert (n2["node_id"], n2["attempts"], n2["accepted"]) == ("n2", 0, False)
+    assert result.out.file_quarantined
 
 
 def test_pipeline_dependent_node_runs_after_its_dependency(two_columns: Case) -> None:
@@ -569,8 +629,10 @@ def test_pipeline_planner_unavailable_equals_rules_only(indian: Case) -> None:
     assert "LLMUnavailable" in result.out.meta["llm_error"]
     assert "planning" in result.out.meta["llm_error"]
     assert not result.events("plan_created")
+    assert result.events("verified")
     (finished,) = result.events("run_finished")
-    assert finished.status == "failed"  # type: ignore[attr-defined]
+    assert finished.status == "succeeded"  # type: ignore[attr-defined]  # Ruling C4
+    assert "planning" in finished.summary and "LLMUnavailable" in finished.summary  # type: ignore[attr-defined]
 
 
 def test_pipeline_planner_invalid_output_falls_back_to_rules(indian: Case) -> None:
@@ -578,6 +640,9 @@ def test_pipeline_planner_invalid_output_falls_back_to_rules(indian: Case) -> No
     result = run(indian, Script(plan=bad))
     assert_same_output(result.out, rules_only(indian))
     assert "LLMOutputError" in result.out.meta["llm_error"]
+    (finished,) = result.events("run_finished")
+    assert finished.status == "succeeded"  # type: ignore[attr-defined]
+    assert "LLMOutputError" in finished.summary  # type: ignore[attr-defined]
 
 
 def test_pipeline_provider_down_everywhere_equals_rules_only(medium: Case) -> None:
@@ -588,6 +653,9 @@ def test_pipeline_provider_down_everywhere_equals_rules_only(medium: Case) -> No
     assert "mapping" in result.out.meta["llm_error"]
     assert [r for r, _ in script.calls] == ["mapper"]  # no more calls once every route failed
     assert result.out.cost_usd == 0.0
+    (finished,) = result.events("run_finished")
+    assert finished.status == "succeeded"  # type: ignore[attr-defined]
+    assert "mapping" in finished.summary  # type: ignore[attr-defined]
 
 
 def test_pipeline_worker_unavailable_stops_node_and_records_error(indian: Case) -> None:
@@ -601,6 +669,10 @@ def test_pipeline_worker_unavailable_stops_node_and_records_error(indian: Case) 
     (pn,) = result.out.meta["plan_nodes"]
     assert (pn["attempts"], pn["accepted"]) == (1, False)
     assert result.out.meta["transforms"] == []  # no code was produced
+    assert not result.out.file_quarantined  # an outage is a fallback, not a node failure
+    (finished,) = result.events("run_finished")
+    assert finished.status == "succeeded"  # type: ignore[attr-defined]
+    assert "worker" in finished.summary  # type: ignore[attr-defined]
 
 
 def test_pipeline_no_candidates_makes_no_plan_call(clean: Case) -> None:

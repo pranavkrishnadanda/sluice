@@ -240,8 +240,10 @@ or a spend/time cap still produces a `run_finished` (status `failed` or
 may be higher than the planned `PlanNode.tier` after escalation.
 `attempt_failed.tokens` / `costUsd` are the spend of that failed attempt.
 `attempt_failed.error` is at most **2,000 characters** (truncated by the
-server). `run_finished.costUsd` / `tokens` are the run totals, including
-failed attempts: they equal the sum of every `node_finished` and
+server). `run_finished.costUsd` / `tokens` are the full run totals: every
+model call in the run, including failed attempts and the calls that belong to
+no node event (schema mapping, planning and verification). They are therefore
+greater than or equal to the sum of every `node_finished` and
 `attempt_failed` `tokens` / `costUsd` in the run.
 
 ## Transforms
