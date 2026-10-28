@@ -1022,3 +1022,39 @@ def test_pipeline_rewrite_only_replaces_cells_the_rules_flagged(
     assert unflagged
     assert all(agent[k] == rules[k] for k in unflagged)
     assert all(agent[k] is not None for (k,) in flagged)
+
+
+class _FakeSettings:
+    litellm_url = "http://litellm.test"
+
+    class litellm_master_key:  # noqa: N801 - mimics a SecretStr attribute
+        @staticmethod
+        def get_secret_value() -> str:
+            return "k"
+
+
+async def _built_llm(system: AgentSystem) -> LLM:
+    llm = system._llm_factory()
+    await llm.aclose()
+    return llm
+
+
+def test_agent_system_for_evals_bypasses_the_response_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-3 (Ruling F3): the eval factory (no arguments) builds a client with cache=False."""
+    import sluice.systems.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "get_settings", lambda: _FakeSettings())
+    llm = asyncio.run(_built_llm(SYSTEMS["agent"]()))  # type: ignore[arg-type]
+    assert llm.cache is False
+
+
+def test_cli_agent_system_keeps_the_response_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sluice.systems.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "get_settings", lambda: _FakeSettings())
+    fn = cli.resolve_run_fn(note=lambda _m: None)
+    system = fn.__self__  # type: ignore[attr-defined]
+    assert isinstance(system, AgentSystem)
+    assert asyncio.run(_built_llm(system)).cache is True

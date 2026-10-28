@@ -364,3 +364,30 @@ def test_concurrent_calls_attribute_headers_to_their_own_record() -> None:
     (_, first), (_, second) = run(both())
 
     assert (first.cost_usd, second.cost_usd) == (0.5, 0.25)
+
+
+# ---------------------------------------------------------------- final review I-3: cache bypass
+
+
+def _sent_body(cache: bool | None) -> dict[str, Any]:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=completion(OK, prompt_tokens=1, completion_tokens=1))
+    )
+    client = httpx2.AsyncClient(transport=RespxBridge(router))
+    kwargs = {} if cache is None else {"cache": cache}
+    run(
+        LLM(BASE_URL, API_KEY, http_client=client, **kwargs).run(
+            "worker", "small", "s", "p", Answer
+        )
+    )
+    return json.loads(route.calls.last.request.content)
+
+
+def test_proxy_request_with_cache_disabled_carries_litellm_no_cache() -> None:
+    assert _sent_body(cache=False)["cache"] == {"no-cache": True}
+
+
+def test_proxy_request_uses_the_cache_by_default() -> None:
+    assert "cache" not in _sent_body(cache=None)
+    assert "cache" not in _sent_body(cache=True)

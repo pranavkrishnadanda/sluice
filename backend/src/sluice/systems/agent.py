@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from collections.abc import Callable
 
@@ -14,10 +15,10 @@ from sluice.sandbox.runner import run_transform
 from sluice.settings import get_settings
 
 
-def _default_llm() -> LLM:
+def _default_llm(*, cache: bool) -> LLM:
     """The LiteLLM-proxy client from :class:`~sluice.settings.Settings` (read at call time)."""
     settings = get_settings()
-    return LLM(settings.litellm_url, settings.litellm_master_key.get_secret_value())
+    return LLM(settings.litellm_url, settings.litellm_master_key.get_secret_value(), cache=cache)
 
 
 class AgentSystem:
@@ -28,20 +29,26 @@ class AgentSystem:
     client creation, not at construction, so registering the system needs no environment.
 
     Args:
-        llm_factory: Builds the model client, called inside the run's event loop.
+        llm_factory: Builds the model client, called inside the run's event loop (default: the
+            LiteLLM proxy from the settings, with ``cache``).
         sandbox: Runs one transform (default: the Docker sandbox, ``run_transform``).
         clock: Monotonic seconds, for latency and the wall-clock cap.
+        cache: Whether the default client may answer from LiteLLM's response cache. ``False``
+            by default, which is what evals construct (``SYSTEMS["agent"]()``), so each trial
+            measures the model rather than the cache (Ruling F3); ``sluice run`` passes ``True``.
     """
 
     name = "agent"
 
     def __init__(
         self,
-        llm_factory: Callable[[], LLM] = _default_llm,
+        llm_factory: Callable[[], LLM] | None = None,
         sandbox: Sandbox = run_transform,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        cache: bool = False,
     ) -> None:
-        self._llm_factory = llm_factory
+        self._llm_factory = llm_factory or functools.partial(_default_llm, cache=cache)
         self._sandbox = sandbox
         self._clock = clock
 

@@ -58,6 +58,12 @@ DEPLOYMENT_HEADER: Final = "x-litellm-model-name"
 _MODEL_SETTINGS: Final = ModelSettings(temperature=0.0, max_retries=0)
 """Deterministic sampling (stable cache keys) and no SDK-level retries (LiteLLM retries)."""
 
+NO_CACHE_BODY: Final = {"cache": {"no-cache": True}}
+"""LiteLLM's per-request cache control: do not answer from the response cache (the fresh answer
+is still stored). Checked in LiteLLM 1.106.5 ``caching/caching_handler.py``: a cache read is
+skipped when the request's ``cache`` dict has ``"no-cache": True``; the proxy forwards top-level
+body keys to the router, so the client sends it through ``extra_body``."""
+
 _response_headers: ContextVar[list[httpx2.Headers] | None] = ContextVar(
     "sluice_llm_response_headers", default=None
 )
@@ -114,6 +120,8 @@ class LLM:
             `TestModel` in tests).
         http_client: The `httpx2` client to send proxy requests with (tests inject a transport).
             A client passed in stays the caller's to close; one created here is closed by `aclose`.
+        cache: Whether the proxy may answer from its response cache. Evals pass ``False`` so
+            every trial measures the model, not the cache (Ruling F3); ``sluice run`` keeps it.
 
     Event-loop lifetime: the HTTP client pools connections bound to the event loop that first
     uses them. Create, use and close (`aclose` / `async with`) an instance inside ONE event loop,
@@ -128,8 +136,10 @@ class LLM:
         *,
         model_override: Model | None = None,
         http_client: httpx2.AsyncClient | None = None,
+        cache: bool = True,
     ) -> None:
         self.records: list[CallRecord] = []
+        self.cache = cache
         self._override = model_override
         self._owns_client = http_client is None
         self._http = http_client or httpx2.AsyncClient(
@@ -141,13 +151,19 @@ class LLM:
         provider = LiteLLMProvider(
             api_base=f"{base_url.rstrip('/')}/v1", api_key=api_key, http_client=self._http
         )
+        settings = (
+            _MODEL_SETTINGS if cache else ModelSettings(**_MODEL_SETTINGS, extra_body=NO_CACHE_BODY)
+        )
         self._models: dict[Tier, Model] = {
-            tier: OpenAIChatModel(tier, provider=provider, settings=_MODEL_SETTINGS)
+            tier: OpenAIChatModel(tier, provider=provider, settings=settings)
             for tier in ("small", "strong")
         }
 
     def __repr__(self) -> str:
-        return f"LLM(records={len(self.records)}, override={self._override is not None})"
+        return (
+            f"LLM(records={len(self.records)}, override={self._override is not None}, "
+            f"cache={self.cache})"
+        )
 
     async def aclose(self) -> None:
         """Close the HTTP client if this instance created it."""

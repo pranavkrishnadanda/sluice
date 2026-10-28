@@ -146,6 +146,9 @@ def test_resolve_run_fn_prefers_agent_when_registered(monkeypatch: pytest.Monkey
     class _Agent:
         name = "agent"
 
+        def __init__(self, *, cache: bool = False) -> None:
+            self.cache = cache
+
         def run(self, case: CaseInput) -> SystemOutput:
             raise NotImplementedError
 

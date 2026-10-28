@@ -243,12 +243,16 @@ def file_sha256(path: Path) -> str:
 
 
 def resolve_run_fn(note: Callable[[str], Any]) -> RunFn:
-    """The agent system's ``run``, looked up at call time; the rules system until it exists."""
+    """The agent system's ``run``, looked up at call time; the rules system until it exists.
+
+    The agent keeps LiteLLM's response cache (``cache=True``): a repeat ``sluice run`` should
+    cost nothing, unlike an eval trial (Ruling F3).
+    """
     factory = SYSTEMS.get("agent")
     if factory is None:
         note("note: the agent system is not registered yet; running the rules-only system")
-        factory = SYSTEMS["rules"]
-    return factory().run
+        return SYSTEMS["rules"]().run
+    return factory(cache=True).run  # type: ignore[call-arg]
 
 
 class RunFailedError(Exception):
