@@ -1,18 +1,36 @@
 """Command-line entry point for Sluice."""
 
+import hashlib
 import json
+import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import duckdb
 import polars as pl
+import psycopg
 import pydantic_ai
 import typer
+from sqlalchemy.exc import SQLAlchemyError
 
-from sluice.drift.cases import build_split, load_split, split_hash, unexpected_files
+from sluice.agent.events import (
+    PIPELINE_EVENT_ADAPTER,
+    EventLog,
+    EventModel,
+    Loaded,
+    RulesApplied,
+    RunFinished,
+    RunStarted,
+)
+from sluice.contracts.model import Contract, load_contract
+from sluice.drift.cases import build_split, load_reference, load_split, split_hash, unexpected_files
 from sluice.evals.runner import SYSTEMS, format_ci, latest_summaries, render_results, run_eval
+from sluice.evals.types import CaseInput, SystemOutput
+from sluice.load.iceberg import LoadError, LoadResult, find_load, load_output
+from sluice.settings import Settings, get_settings
 
 # The CLI owns its terminal output (eval tables, JSON): no Pydantic AI first-run banner.
 pydantic_ai.BANNER_ENABLED = False
@@ -26,6 +44,13 @@ RESULTS_MD = EVALS_DIR / "RESULTS.md"
 LOCK_FILE = "LOCK.json"
 DEFAULT_SEED = 2026
 DEFAULT_N = 300
+HASH_CHUNK_BYTES = 1 << 20
+# Events the `run` command emits itself; the same types in a pipeline's meta are not replayed.
+_CLI_EVENTS = frozenset({"run_started", "loaded", "run_finished"})
+
+RunFn = Callable[[CaseInput], SystemOutput]
+LoadFn = Callable[..., LoadResult]
+LoadedFn = Callable[..., LoadResult | None]
 
 
 class SplitName(StrEnum):
@@ -195,3 +220,151 @@ def results(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_results([s for s, _ in found], lock_data), encoding="utf-8")
     typer.echo(f"wrote {out} ({len(found)} run(s))")
+
+
+class TableName(StrEnum):
+    """A table `sluice run` can load."""
+
+    orders = "orders"
+    lineitem = "lineitem"
+
+
+def file_sha256(path: Path) -> str:
+    """SHA-256 of ``path``'s bytes, read in 1 MiB chunks (memory O(1) in the file size)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_run_fn(note: Callable[[str], Any]) -> RunFn:
+    """The agent system's ``run``, looked up at call time; the rules system until it exists."""
+    factory = SYSTEMS.get("agent")
+    if factory is None:
+        note("note: the agent system is not registered yet; running the rules-only system")
+        factory = SYSTEMS["rules"]
+    return factory().run
+
+
+def _replayed(out: SystemOutput) -> list[EventModel]:
+    raw = out.meta.get("events")
+    if not raw:
+        return [RulesApplied(actions=[str(a) for a in out.meta.get("actions", [])])]
+    events: list[EventModel] = []
+    for item in raw:
+        if isinstance(item, EventModel):
+            event = item
+        else:
+            event = PIPELINE_EVENT_ADAPTER.validate_python(item)
+        if event.type not in _CLI_EVENTS:  # type: ignore[attr-defined]
+            events.append(event)
+    return events
+
+
+def _skip_summary(result: LoadResult) -> str:
+    return f"file already loaded (snapshot {result.snapshot_id}); nothing written"
+
+
+def run_file(
+    path: Path,
+    table: str,
+    *,
+    contract_version: str = "v1",
+    run_fn: RunFn | None = None,
+    load_fn: LoadFn = load_output,
+    loaded_fn: LoadedFn = find_load,
+    settings_fn: Callable[[], Settings] = get_settings,
+    reference_fn: Callable[[str], dict[str, set[Any]]] = load_reference,
+    echo: Callable[[str], Any] = typer.echo,
+) -> LoadResult:
+    """Run the pipeline over ``path``, print its events as JSON lines, and load the output.
+
+    ``run_fn`` defaults to :func:`resolve_run_fn` (agent, else rules). Before the pipeline runs,
+    ``loaded_fn`` looks up the idempotency key; a file already loaded into this table is
+    reported as skipped without running (or paying for) the pipeline. ``load_fn`` re-checks the
+    key under its locks, so a concurrent duplicate is still caught. On an exception a
+    ``run_finished`` event with status ``failed`` is printed and the exception re-raised.
+    """
+    contract: Contract = load_contract(table, contract_version)
+    run_id = uuid.uuid4().hex
+    log = EventLog()
+
+    def emit(event: EventModel) -> None:
+        echo(log.emit(event).to_json())
+
+    emit(RunStarted(run_id=run_id, file_name=path.name, table=table, rows=None))  # type: ignore[arg-type]
+    cost = 0.0
+    try:
+        sha = file_sha256(path)
+        settings = settings_fn()
+        prior = loaded_fn(contract, sha, settings=settings)
+        if prior is not None:
+            emit(
+                RunFinished(
+                    status="succeeded",
+                    summary=_skip_summary(prior),
+                    cost_usd=0.0,
+                    tokens=0,
+                )
+            )
+            return prior
+        fn = run_fn or resolve_run_fn(note=lambda m: typer.echo(m, err=True))
+        out = fn(CaseInput(path, contract, reference_fn(table)))
+        cost = out.cost_usd
+        for event in _replayed(out):
+            emit(event)
+        result = load_fn(out, contract, run_id=run_id, file_sha256=sha, settings=settings)
+    except Exception as exc:
+        emit(
+            RunFinished(
+                status="failed", summary=f"{type(exc).__name__}", cost_usd=max(cost, 0.0), tokens=0
+            )
+        )
+        raise
+    if not result.skipped and result.snapshot_id is not None:
+        emit(
+            Loaded(
+                rows_loaded=result.rows_loaded,
+                rows_quarantined=result.rows_quarantined,
+                snapshot_id=result.snapshot_id,
+            )
+        )
+    if result.skipped:
+        summary = _skip_summary(result)
+    else:
+        summary = f"loaded {result.rows_loaded} row(s), quarantined {result.rows_quarantined}" + (
+            " (recovered an earlier commit)" if result.recovered else ""
+        )
+    emit(
+        RunFinished(
+            status="quarantined" if out.file_quarantined else "succeeded",
+            summary=summary,
+            cost_usd=out.cost_usd,
+            tokens=int(out.meta.get("tokens", 0)),
+        )
+    )
+    return result
+
+
+@app.command("run")
+def run_cmd(
+    file: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, readable=True, help="Input file.")
+    ],
+    table: Annotated[TableName, typer.Option(help="Target table.")],
+    contract_version: Annotated[str, typer.Option(help="Contract version.")] = "v1",
+) -> None:
+    """Run the pipeline over FILE, print its events as JSON lines, and load it into Iceberg.
+
+    Loading is idempotent per (file SHA-256, contract version): a repeat writes nothing.
+    """
+    try:
+        run_file(file, table.value, contract_version=contract_version)
+    except (psycopg.Error, SQLAlchemyError) as exc:
+        # Driver messages can echo connection details; print the error type only.
+        typer.echo(f"run failed: {type(exc).__name__}", err=True)
+        raise typer.Exit(1) from exc
+    except (LoadError, ValueError, OSError) as exc:
+        typer.echo(f"run failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(1) from exc
