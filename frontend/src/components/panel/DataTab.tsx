@@ -1,14 +1,10 @@
 "use client";
-/* oxlint-disable jsx-a11y/no-redundant-roles, jsx-a11y/no-interactive-element-to-noninteractive-role */
-// ^ The virtualised <table> is laid out with block/grid display, which can
-// strip implicit table semantics in some browsers (notably Safari), so its
-// table/rowgroup/row/cell roles are restated on purpose.
 
 import {
   useVirtualizer,
   type VirtualizerOptions,
 } from "@tanstack/react-virtual";
-import { useId, useMemo, useRef, useState } from "react";
+import { type Key, useId, useMemo, useRef, useState } from "react";
 import type { DataPreview, PreviewCell } from "@/lib/api/types";
 import { formatCount } from "@/lib/format";
 
@@ -22,8 +18,9 @@ interface CellRow {
 
 const ROW_HEIGHT = 36;
 const OVERSCAN = 8;
-const GRID =
-  "grid grid-cols-[2.75rem_6.25rem_minmax(5rem,1fr)_minmax(5rem,1fr)]";
+/** Column widths; `table-fixed` keeps them stable as rows scroll in and out. */
+const COLUMNS = ["3.5rem", "5.75rem", "auto", "auto"] as const;
+const CELL = "truncate border-black/5 border-b px-1.5 dark:border-white/5";
 
 const isChanged = (c: PreviewCell) => c.flagged || c.before !== c.after;
 
@@ -40,7 +37,7 @@ function flatten(preview: DataPreview): CellRow[] {
 }
 
 type ObserveRect = VirtualizerOptions<
-  HTMLTableElement,
+  HTMLDivElement,
   Element
 >["observeElementRect"];
 
@@ -98,7 +95,7 @@ export interface DataTabProps {
  */
 export function DataTab({ preview, viewportHeight }: DataTabProps) {
   const [changedOnly, setChangedOnly] = useState(true);
-  const scrollRef = useRef<HTMLTableElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const captionId = useId();
 
   const all = useMemo(() => flatten(preview), [preview]);
@@ -180,87 +177,122 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
             : "No rows in this preview."}
         </p>
       ) : (
-        // A real <table> laid out as a grid so rows can be absolutely
-        // positioned. `display` overrides can strip implicit table semantics
-        // in some browsers, so the roles are restated explicitly.
-        // biome-ignore-start lint/a11y/noRedundantRoles: explicit roles survive the grid/block display overrides.
-        <table
+        // Native table, virtualised with spacer rows above and below the
+        // visible window: no display overrides, so the implicit table
+        // semantics hold in every browser and no explicit roles are needed.
+        <div
           ref={scrollRef}
-          role="table"
-          aria-label="Before and after values"
-          aria-describedby={captionId}
-          aria-rowcount={rows.length + 1}
           /* oxlint-disable jsx-a11y/no-noninteractive-tabindex */
           // biome-ignore lint/a11y/noNoninteractiveTabindex: a scrollable region must be keyboard-focusable (WCAG 2.1.1).
           tabIndex={0}
           /* oxlint-enable jsx-a11y/no-noninteractive-tabindex */
-          className="relative block min-h-72 flex-1 overflow-auto overscroll-contain rounded-xl font-mono text-[0.6875rem] ring-1 ring-black/10 ring-inset dark:ring-white/10"
+          className="min-h-72 flex-1 overflow-auto overscroll-contain rounded-xl ring-1 ring-black/10 ring-inset dark:ring-white/10"
         >
-          <thead role="rowgroup" className="sticky top-0 z-10 grid">
-            <tr
-              role="row"
-              aria-rowindex={1}
-              className={`${GRID} min-w-78 border-black/10 border-b bg-glass-solid font-sans font-medium text-muted dark:border-white/10`}
-            >
-              {["pk", "column", "before", "after"].map((h) => (
-                <th
-                  key={h}
-                  role="columnheader"
-                  scope="col"
-                  className="px-2 py-2 text-left font-medium"
-                >
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody
-            role="rowgroup"
-            className="relative grid min-w-78"
-            style={{ height: virtualizer.getTotalSize() }}
-          >
-            {virtualizer.getVirtualItems().map((item) => {
-              const row = rows[item.index];
-              if (!row) return null;
-              return (
-                <tr
-                  key={item.key}
-                  role="row"
-                  aria-rowindex={item.index + 2}
-                  className={`${GRID} absolute inset-x-0 top-0 items-center border-black/5 border-b dark:border-white/5`}
-                  style={{
-                    height: ROW_HEIGHT,
-                    transform: `translateY(${item.start}px)`,
-                  }}
-                >
-                  <td role="cell" className="truncate px-2 text-muted">
-                    {row.pk}
-                  </td>
-                  <td role="cell" className="truncate px-2" title={row.column}>
-                    {row.column}
-                  </td>
-                  <td
-                    role="cell"
-                    className="truncate px-2"
-                    title={title(row.cell.before)}
-                  >
-                    <BeforeCell row={row} />
-                  </td>
-                  <td
-                    role="cell"
-                    className="min-w-0 px-2"
-                    title={title(row.cell.after)}
-                  >
-                    <AfterCell row={row} />
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-        // biome-ignore-end lint/a11y/noRedundantRoles: end of the virtualised table.
+          <VirtualRows
+            rows={rows}
+            items={virtualizer.getVirtualItems()}
+            totalSize={virtualizer.getTotalSize()}
+            captionId={captionId}
+          />
+        </div>
       )}
     </div>
+  );
+}
+
+interface WindowItem {
+  key: Key;
+  index: number;
+  start: number;
+  end: number;
+}
+
+function VirtualRows({
+  rows,
+  items,
+  totalSize,
+  captionId,
+}: {
+  rows: readonly CellRow[];
+  items: readonly WindowItem[];
+  totalSize: number;
+  captionId: string;
+}) {
+  const top = items[0]?.start ?? 0;
+  const bottom = Math.max(0, totalSize - (items.at(-1)?.end ?? 0));
+  return (
+    <table
+      aria-label="Before and after values"
+      aria-describedby={captionId}
+      aria-rowcount={rows.length + 1}
+      className="w-full min-w-78 table-fixed border-separate border-spacing-0 font-mono text-[0.6875rem]"
+    >
+      <colgroup>
+        {COLUMNS.map((width, i) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: fixed, positional columns.
+          <col key={i} style={width === "auto" ? undefined : { width }} />
+        ))}
+      </colgroup>
+      <thead>
+        <tr aria-rowindex={1}>
+          {["pk", "column", "before", "after"].map((h) => (
+            <th
+              key={h}
+              scope="col"
+              className="sticky top-0 z-10 border-black/10 border-b bg-glass-solid px-1.5 py-2 text-left font-medium font-sans text-muted dark:border-white/10"
+            >
+              {h}
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {/* Spacer rows stand in for the rows above/below the window; real
+            rows carry aria-rowindex, so the count stays correct. */}
+        {top > 0 && (
+          <tr>
+            <td
+              aria-hidden="true"
+              colSpan={4}
+              style={{ height: top, padding: 0 }}
+            />
+          </tr>
+        )}
+        {items.map((item) => {
+          const row = rows[item.index];
+          if (!row) return null;
+          return (
+            <tr
+              key={item.key}
+              aria-rowindex={item.index + 2}
+              style={{ height: ROW_HEIGHT }}
+            >
+              <td className={`${CELL} text-muted`} title={row.pk}>
+                {row.pk}
+              </td>
+              <td className={CELL} title={row.column}>
+                {row.column}
+              </td>
+              <td className={CELL} title={title(row.cell.before)}>
+                <BeforeCell row={row} />
+              </td>
+              <td className={CELL} title={title(row.cell.after)}>
+                <AfterCell row={row} />
+              </td>
+            </tr>
+          );
+        })}
+        {bottom > 0 && (
+          <tr>
+            <td
+              aria-hidden="true"
+              colSpan={4}
+              style={{ height: bottom, padding: 0 }}
+            />
+          </tr>
+        )}
+      </tbody>
+    </table>
   );
 }
 

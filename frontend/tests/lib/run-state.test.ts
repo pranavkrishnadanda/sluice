@@ -117,6 +117,48 @@ describe("reduceRunEvents", () => {
     expect(s4.finished).toBe(false);
   });
 
+  test("attemptsReported counts finished or failed attempts, not starts", () => {
+    const s1 = reduceAll([
+      started,
+      plan,
+      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+    ]);
+    expect(s1?.nodes[0]?.attemptsReported).toBe(0);
+    const s2 = reduceRunEvents(s1, {
+      seq: 4,
+      at: AT,
+      type: "attempt_failed",
+      nodeId: "n1",
+      attempt: 1,
+      maxAttempts: 3,
+      error: "x",
+      tokens: 0,
+      costUsd: 0,
+    });
+    expect(s2.nodes[0]?.attemptsReported).toBe(1);
+    const s3 = reduceRunEvents(s2, {
+      seq: 5,
+      at: AT,
+      type: "node_started",
+      nodeId: "n1",
+      attempt: 2,
+    });
+    expect(s3.nodes[0]?.attemptsReported).toBe(1);
+    const s4 = reduceRunEvents(s3, {
+      seq: 6,
+      at: AT,
+      type: "node_finished",
+      nodeId: "n1",
+      attempt: 2,
+      tier: "strong",
+      tokens: 0,
+      costUsd: 0,
+      latencyMs: 1,
+      transformId: "t-n1-2",
+    });
+    expect(s4.nodes[0]?.attemptsReported).toBe(2);
+  });
+
   test("a node's spend sums every attempt, failed ones included", () => {
     const s = reduceAll([
       started,

@@ -18,6 +18,12 @@ export interface NodeViewState {
   status: NodeStatus;
   /** Current (or last) attempt number; 0 before the node starts. */
   attempt: number;
+  /**
+   * Highest attempt that has produced a result (`attempt_failed` or
+   * `node_finished`); 0 until then. Unlike `attempt`, a `node_started`
+   * does not move it, so it is the count of attempts with a transform.
+   */
+  attemptsReported: number;
   /** Known once the backend reports a failed attempt; `null` until then. */
   maxAttempts: number | null;
   /** Planned tier, replaced by the tier that actually produced the result. */
@@ -98,6 +104,7 @@ function toNode(node: PlanNode): NodeViewState {
     dependsOn: [...node.dependsOn],
     status: "pending",
     attempt: 0,
+    attemptsReported: 0,
     maxAttempts: null,
     tier: node.tier,
     costUsd: 0,
@@ -125,6 +132,7 @@ function onNodeFinished(
     nodes: updateNode(state, e.nodeId, (n) => ({
       status: "done",
       attempt: e.attempt,
+      attemptsReported: Math.max(n.attemptsReported, e.attempt),
       tier: e.tier,
       costUsd: n.costUsd + e.costUsd,
       tokens: n.tokens + e.tokens,
@@ -151,6 +159,7 @@ function onAttemptFailed(
     nodes: updateNode(state, e.nodeId, (n) => ({
       status: e.attempt < e.maxAttempts ? "retrying" : "failed",
       attempt: e.attempt,
+      attemptsReported: Math.max(n.attemptsReported, e.attempt),
       maxAttempts: e.maxAttempts,
       lastError: e.error,
       costUsd: n.costUsd + e.costUsd,

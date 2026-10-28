@@ -31,22 +31,22 @@ export function visibleTransforms(
   state: RunViewState | null,
 ): Transform[] {
   if (!state || state.finished) return [...transforms];
-  const nodes = new Map(state.nodes.map((n) => [n.id, n]));
-  return transforms.filter((t) => {
-    const n = nodes.get(t.nodeId);
-    if (!n) return false;
-    return (
-      t.attempt < n.attempt ||
-      (t.attempt === n.attempt &&
-        (n.status === "done" || n.status === "failed"))
-    );
-  });
+  const reported = new Map(state.nodes.map((n) => [n.id, n.attemptsReported]));
+  return transforms.filter((t) => t.attempt <= (reported.get(t.nodeId) ?? 0));
 }
 
-/** Changes whenever a node starts, fails or finishes an attempt. */
-const progressKey = (state: RunViewState | null) =>
+/**
+ * Changes only when an attempt produces a transform (fails or finishes), so
+ * the Code tab refetches once per attempt rather than on every status change.
+ */
+const transformsKey = (state: RunViewState | null) =>
   state
-    ? `${state.finished}|${state.nodes.map((n) => `${n.id}:${n.attempt}:${n.status}`).join(",")}`
+    ? state.nodes
+        // Nodes with nothing reported yet don't affect the key, so the plan
+        // arriving (or a node starting) never triggers a refetch.
+        .filter((n) => n.attemptsReported > 0)
+        .map((n) => `${n.id}:${n.attemptsReported}`)
+        .join(",")
     : "static";
 
 function Unavailable({ what, retry }: { what: string; retry: () => void }) {
@@ -116,8 +116,8 @@ export interface SidePanelProps {
  * Run details: Data (before/after preview), Code (generated transforms and
  * repair diffs) and Plan (step DAG) tabs. Each tab's data is fetched the
  * first time the tab is opened and kept while switching tabs; the preview
- * refetches when the run finishes, transforms whenever a node reports an
- * attempt.
+ * refetches when the run finishes, transforms once per attempt that fails
+ * or finishes.
  */
 export function SidePanel({
   runId,
@@ -136,7 +136,7 @@ export function SidePanel({
     () => api.getPreview(runId, PREVIEW_LIMIT),
   );
   const transforms = useResource(
-    opened.has("code") ? `${runId}|${progressKey(state)}` : null,
+    opened.has("code") ? `${runId}|${transformsKey(state)}` : null,
     () => api.getTransforms(runId),
   );
 

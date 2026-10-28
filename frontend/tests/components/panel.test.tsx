@@ -78,8 +78,10 @@ describe("data tab", () => {
     await waitFor(() =>
       expect(within(table).getAllByRole("row").length).toBeGreaterThan(5),
     );
-    const rendered = container.querySelectorAll('[role="row"]').length;
-    expect(rendered).toBeLessThan(200);
+    // Native <tr> elements carry an implicit row role, so count both the
+    // accessible rows and the DOM rows (visible window + two spacers).
+    expect(within(table).getAllByRole("row").length).toBeLessThan(200);
+    expect(container.querySelectorAll("tr").length).toBeLessThan(200);
     // The accessible row count still reports every (changed) cell + header.
     expect(Number(table.getAttribute("aria-rowcount"))).toBeGreaterThan(10_000);
   });
@@ -138,7 +140,7 @@ describe("data tab", () => {
     const table = await screen.findByRole("table", {
       name: /before and after/i,
     });
-    const row = (await within(table).findByText("42")).closest('[role="row"]');
+    const row = (await within(table).findByText("42")).closest("tr");
     expect(row).not.toBeNull();
     expect(within(row as HTMLElement).getByText("flagged")).toBeInTheDocument();
     expect(within(row as HTMLElement).getByText("null")).toBeInTheDocument();
@@ -215,6 +217,57 @@ describe("code tab", () => {
     renderPanel("run-clean", stateOf(RUN_CLEAN_EVENTS));
     await user.click(screen.getByRole("tab", { name: "Code" }));
     expect(await screen.findByText(/no generated code/i)).toBeInTheDocument();
+  });
+
+  test("refetches transforms once per reported attempt, not per status change", async () => {
+    const user = userEvent.setup();
+    const base = new MockApiClient({ delayMs: 0 });
+    const getTransforms = vi.fn<ApiClient["getTransforms"]>((id) =>
+      base.getTransforms(id),
+    );
+    const client: ApiClient = {
+      ...withPreview({ columns: [], totalRows: 0, rows: [] }),
+      getTransforms,
+    };
+    let state = INITIAL_RUN_VIEW_STATE;
+    const view = (s: RunViewState) => (
+      <ApiProvider client={client}>
+        <SidePanel runId="run-repaired" state={s} dataViewportHeight={480} />
+      </ApiProvider>
+    );
+    const { rerender } = render(view(state));
+    await user.click(screen.getByRole("tab", { name: "Code" }));
+    await waitFor(() => expect(getTransforms).toHaveBeenCalledTimes(1));
+    for (const e of RUN_REPAIRED_EVENTS) {
+      state = reduceRunEvents(state, e);
+      rerender(view(state));
+      // Let each fetch settle before the next event, like the live stream.
+      await screen.findByRole("tabpanel");
+    }
+    const reported = RUN_REPAIRED_EVENTS.filter(
+      (e) => e.type === "attempt_failed" || e.type === "node_finished",
+    ).length;
+    await waitFor(() =>
+      expect(getTransforms).toHaveBeenCalledTimes(1 + reported),
+    );
+    expect(
+      await screen.findByRole("region", { name: /normalise amounts/i }),
+    ).toBeInTheDocument();
+  });
+
+  test("a failed attempt's code shows as soon as it is reported", async () => {
+    const user = userEvent.setup();
+    const failed = RUN_REPAIRED_EVENTS.find((e) => e.type === "attempt_failed");
+    const early = RUN_REPAIRED_EVENTS.filter(
+      (e) => e.seq <= (failed?.seq ?? 0),
+    );
+    renderPanel("run-repaired", stateOf(early));
+    await user.click(screen.getByRole("tab", { name: "Code" }));
+    const n1 = await screen.findByRole("region", {
+      name: /normalise amounts/i,
+    });
+    expect(within(n1).getAllByRole("radio")).toHaveLength(1);
+    expect(within(n1).getByRole("radio", { name: /attempt 1/i })).toBeChecked();
   });
 
   test("hides transforms the live stream has not reported yet", async () => {
