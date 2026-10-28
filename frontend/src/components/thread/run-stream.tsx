@@ -56,7 +56,12 @@ function useRunStreamSubscription(runId: string): RunStream {
     const settle = (outcome: "ended" | "error") => {
       if (!controller.signal.aborted) setSettled({ subscription, outcome });
     };
-    api.streamEvents(runId, dispatch, controller.signal).then(
+    // Gate every callback on this subscription's signal: a stream that
+    // ignores abort (or delivers late) must not touch state after cleanup.
+    const onEvent = (e: RunEvent) => {
+      if (!controller.signal.aborted) dispatch(e);
+    };
+    api.streamEvents(runId, onEvent, controller.signal).then(
       () => settle("ended"),
       () => settle("error"),
     );

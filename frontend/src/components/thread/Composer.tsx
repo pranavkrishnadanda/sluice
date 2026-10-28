@@ -35,6 +35,8 @@ export interface ComposerProps {
   /** Error from the last submit (e.g. the API refused the run). */
   submitError?: string | null;
   placeholder?: string;
+  /** A new valid file was chosen (e.g. to clear a stale `submitError`). */
+  onFileChange?: () => void;
 }
 
 /**
@@ -47,6 +49,7 @@ export function Composer({
   busy = false,
   submitError = null,
   placeholder = "Drop a CSV, JSON or Parquet file, or browse",
+  onFileChange,
 }: ComposerProps) {
   const [file, setFile] = useState<File | null>(null);
   const [table, setTable] = useState<TableName>("orders");
@@ -62,8 +65,9 @@ export function Composer({
     if (isAcceptedFile(picked)) {
       setFile(picked);
       setError(null);
+      onFileChange?.();
     } else {
-      setFile(null);
+      // Keep any earlier valid selection; only explain the rejection.
       setError(TYPE_ERROR);
     }
   };
@@ -107,6 +111,7 @@ export function Composer({
   const clear = () => {
     setFile(null);
     setError(null);
+    onFileChange?.();
     input.current?.focus();
   };
 

@@ -20,23 +20,38 @@ beforeEach(() => {
   nav.push.mockReset();
 });
 
+interface StreamCall {
+  runId: string;
+  onEvent: (e: RunEvent) => void;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  signal: AbortSignal;
+  /** Whether every earlier subscription was already aborted when this began. */
+  previousAborted: boolean;
+}
+
 /**
- * A client whose stream is driven by the test: `emitThrough(seq)` delivers
- * run-repaired's events up to `seq`, `end()` resolves the current stream.
- * Every `streamEvents` call replays from the first event (like a reconnect
- * without Last-Event-ID), so the reducer's seq de-dup is exercised.
+ * A client whose stream is driven by the test. Each `streamEvents` call is
+ * recorded; `emitThrough(seq)` delivers run-repaired's events up to `seq` on
+ * the latest call (or on `call`), `end()` resolves it. Every call replays
+ * from the first event (a reconnect without Last-Event-ID), so the reducer's
+ * seq de-dup is exercised. Like a misbehaving backend, it ignores `signal`:
+ * it keeps emitting after abort unless the component guards against it.
  */
 function controlledClient(events: readonly RunEvent[] = RUN_REPAIRED_EVENTS) {
-  let onEvent: ((e: RunEvent) => void) | null = null;
-  let finish: (() => void) | null = null;
-  let signal: AbortSignal | null = null;
+  const calls: StreamCall[] = [];
   const base = new MockApiClient({ delayMs: 0 });
   const streamEvents = vi.fn<ApiClient["streamEvents"]>(
-    (_runId, cb, sig) =>
-      new Promise<void>((resolve) => {
-        onEvent = cb;
-        finish = resolve;
-        signal = sig;
+    (runId, onEvent, signal) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({
+          runId,
+          onEvent,
+          resolve,
+          reject,
+          signal,
+          previousAborted: calls.every((c) => c.signal.aborted),
+        });
       }),
   );
   const client: ApiClient = {
@@ -48,18 +63,29 @@ function controlledClient(events: readonly RunEvent[] = RUN_REPAIRED_EVENTS) {
     getPreview: (id, n) => base.getPreview(id, n),
     getEvalSummary: () => base.getEvalSummary(),
   };
+  const pick = (call?: number) =>
+    call === undefined ? calls.at(-1) : calls[call];
   return {
     client,
     streamEvents,
-    signal: () => signal,
-    emitThrough(seq: number) {
+    calls,
+    signal: () => calls.at(-1)?.signal ?? null,
+    emitThrough(seq: number, call?: number) {
+      const target = pick(call);
       act(() => {
-        for (const e of events) if (e.seq <= seq) onEvent?.(structuredClone(e));
+        for (const e of events) {
+          if (e.seq <= seq) target?.onEvent(structuredClone(e));
+        }
       });
     },
-    async end() {
+    async end(call?: number) {
       await act(async () => {
-        finish?.();
+        pick(call)?.resolve();
+      });
+    },
+    async fail(call?: number) {
+      await act(async () => {
+        pick(call)?.reject(new Error("stream dropped"));
       });
     },
   };
@@ -192,6 +218,70 @@ describe("RunThread", () => {
     expect(stream.signal()?.aborted).toBe(true);
   });
 
+  test("events and rejections after unmount are ignored without warnings", async () => {
+    const errors = vi.spyOn(console, "error");
+    const stream = controlledClient();
+    const view = renderThread(stream.client);
+    stream.emitThrough(2);
+    view.unmount();
+
+    stream.emitThrough(13, 0);
+    await stream.fail(0);
+    expect(errors).not.toHaveBeenCalled();
+
+    // A fresh mount starts from an empty state, not the old run's.
+    renderThread(stream.client);
+    expect(screen.queryByText(/issues found/)).not.toBeInTheDocument();
+    expect(stream.calls).toHaveLength(2);
+  });
+
+  test("an aborted subscription cannot update the live thread", async () => {
+    const stream = controlledClient();
+    renderThread(stream.client);
+    stream.emitThrough(3);
+    await stream.end();
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(stream.calls[0]?.signal.aborted).toBe(true);
+
+    // The dropped stream wakes up late: none of it may reach the reducer.
+    stream.emitThrough(13, 0);
+    expect(screen.queryByText("Loaded 48,210 rows")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Renamed amt/)).not.toBeInTheDocument();
+
+    // ...nor may its rejection flip the new subscription to an error.
+    await stream.fail(0);
+    expect(
+      screen.queryByText("Couldn't load this run"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Connection lost")).not.toBeInTheDocument();
+
+    stream.emitThrough(13, 1);
+    await stream.end(1);
+    expect(steps().getByText("Loaded 48,210 rows")).toBeInTheDocument();
+  });
+
+  test("switching runId aborts the previous subscription before the next", () => {
+    const stream = controlledClient();
+    const view = renderThread(stream.client, "run-repaired");
+    stream.emitThrough(5);
+    view.rerender(
+      <ApiProvider client={stream.client}>
+        <RunThread runId="run-clean" />
+      </ApiProvider>,
+    );
+    expect(stream.calls.map((c) => c.runId)).toEqual([
+      "run-repaired",
+      "run-clean",
+    ]);
+    expect(stream.calls[0]?.signal.aborted).toBe(true);
+    expect(stream.calls[1]?.previousAborted).toBe(true);
+    expect(stream.calls[1]?.signal.aborted).toBe(false);
+    // The new run starts fresh: run-repaired's rows are gone.
+    expect(screen.queryByText(/issues found/)).not.toBeInTheDocument();
+    stream.emitThrough(13, 0);
+    expect(screen.queryByText(/issues found/)).not.toBeInTheDocument();
+  });
+
   test("a stream that rejects offers Retry", async () => {
     const client = new MockApiClient({ delayMs: 0 });
     renderThread(client, "run-missing");
@@ -246,6 +336,41 @@ describe("Composer", () => {
     await user.click(screen.getByRole("button", { name: "Start run" }));
     expect(createRun).toHaveBeenCalledWith(file, "orders");
     await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/runs/run-1"));
+  });
+
+  test("a rejected pick keeps the previous valid file", async () => {
+    const onSubmit = vi.fn<ComposerProps["onSubmit"]>();
+    render(<Composer onSubmit={onSubmit} />);
+    const user = userEvent.setup({ applyAccept: false });
+    const good = new File(["a,b"], "orders.csv", { type: "text/csv" });
+    await user.upload(screen.getByLabelText("Attach a file"), good);
+    await user.upload(
+      screen.getByLabelText("Attach a file"),
+      new File(["x"], "orders.xlsx"),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/\.csv, \.json/);
+    expect(screen.getByText("orders.csv")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(onSubmit).toHaveBeenCalledWith(good, "orders");
+  });
+
+  test("choosing a new file clears a failed submit's error", async () => {
+    const client = new MockApiClient({ delayMs: 0 });
+    vi.spyOn(client, "createRun").mockRejectedValueOnce(new Error("503"));
+    render(
+      <ApiProvider client={client}>
+        <NewRunComposer />
+      </ApiProvider>,
+    );
+    const user = userEvent.setup();
+    const input = screen.getByLabelText("Attach a file");
+    await user.upload(input, new File(["a"], "a.csv", { type: "text/csv" }));
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Couldn't start the run/,
+    );
+    await user.upload(input, new File(["b"], "b.csv", { type: "text/csv" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   test("submitting without a file explains what is missing", async () => {

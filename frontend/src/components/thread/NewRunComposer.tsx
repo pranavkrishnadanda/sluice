@@ -34,6 +34,7 @@ export function NewRunComposer({ placeholder }: { placeholder?: string }) {
       busy={busy}
       submitError={error}
       placeholder={placeholder}
+      onFileChange={() => setError(null)}
     />
   );
 }
