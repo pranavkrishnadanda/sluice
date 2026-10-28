@@ -206,6 +206,27 @@ def test_fk_break_quarantines(lineitem_df: pl.DataFrame) -> None:
     assert broken.height == 10
     parents = set(clean["l_orderkey"].to_list())
     assert parents.isdisjoint(broken["l_orderkey"].to_list())
+    # Truth is keyed by the drifted PK: the broken key is all a system can see.
+    assert state.quarantined == set(broken.select("l_orderkey", "l_linenumber").rows())
+
+
+def test_fk_break_duplicates_share_one_drifted_pk(lineitem_df: pl.DataFrame) -> None:
+    state = DriftState.start(load_contract("lineitem"), lineitem_df.head(20))
+    OPS["duplicate_rows"](state, _rng(), frac=1.0)
+    OPS["fk_break"](state, _rng(), column="l_orderkey", frac=0.5)
+    broken = state.df.filter(pl.col("l_orderkey") < 0)
+    assert broken.height == 20
+    assert state.quarantined == set(broken.select("l_orderkey", "l_linenumber").rows())
+    assert len(state.quarantined) == 10
+    assert all(type(v) is int for pk in state.quarantined for v in pk)
+
+
+def test_fk_break_twice_never_rebreaks_a_row(lineitem_df: pl.DataFrame) -> None:
+    state = DriftState.start(load_contract("lineitem"), lineitem_df.head(50))
+    OPS["fk_break"](state, _rng(), column="l_orderkey", frac=0.2)
+    OPS["fk_break"](state, _rng(SEED + 1), column="l_orderkey", frac=0.2)
+    assert len(state.quarantined) == 18 == state.df.filter(pl.col("l_orderkey") < 0).height
+    assert state.expected.height == 32
 
 
 def test_fk_break_rejects_non_fk_column(orders20: pl.DataFrame) -> None:
@@ -421,9 +442,8 @@ class _EdgeFkRng:
 def test_fk_break_keys_strictly_negative_at_edge_draws(lineitem_df: pl.DataFrame) -> None:
     state = DriftState.start(load_contract("lineitem"), lineitem_df.head(20))
     OPS["fk_break"](state, _EdgeFkRng(SEED), column="l_orderkey", frac=0.5)
-    moved = state.df.filter(
-        pl.Series([pk in state.quarantined for pk in state.row_pk], dtype=pl.Boolean)
-    )["l_orderkey"].to_list()
+    moved = state.df.filter(pl.col("l_orderkey") < 0)["l_orderkey"].to_list()
+    assert {k for k, _ in state.quarantined} == set(moved)
     assert len(moved) == 10
     assert all(-FK_BREAK_RANGE <= v <= -1 for v in moved)
     assert sorted(moved, reverse=True)[:2] == [-1, -2]

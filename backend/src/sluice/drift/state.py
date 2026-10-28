@@ -5,9 +5,10 @@ A :class:`DriftState` starts from a clean, contract-conforming frame. Drift ops 
 record that in ``expected`` / ``flags`` / ``quarantined``. Every op appends one
 :class:`ManifestEntry` so a run can be replayed and audited.
 
-Primary-key tuples always hold the *clean* PK values as Python-native ``int``/``str``, so they
-still compare equal after the drifted PK columns are renamed or rewritten, and after a JSON
-round-trip.
+Primary-key tuples hold Python-native ``int``/``str`` values, so they survive a JSON round-trip.
+``flags`` and ``row_pk`` use the *clean* PK values (stable across renames and rewrites);
+``quarantined`` uses the *drifted* PK, because a quarantined row's key was rewritten by
+``fk_break`` and the drifted key is all a system can report.
 """
 
 from dataclasses import dataclass, field
@@ -44,7 +45,8 @@ class DriftState:
         expected: Clean truth in the exact contract schema. Destroyed or dropped cells are null
             (even in non-nullable columns); quarantined rows are removed.
         flags: ``(clean_pk, contract_column)`` cells a healer is expected to flag.
-        quarantined: Clean PKs of rows expected to land in quarantine.
+        quarantined: PKs of rows expected to land in quarantine, as they appear in the
+            *drifted* input (after ``fk_break`` rewrote a PK-member foreign key).
         current_name: Contract column -> its current name in ``df`` (absent once dropped).
         entries: The manifest, one entry per applied op.
         row_pk: Clean PK of each ``df`` row, aligned with ``df`` row order. Lets ops map drifted

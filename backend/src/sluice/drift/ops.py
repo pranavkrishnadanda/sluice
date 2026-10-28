@@ -125,12 +125,13 @@ def _pick_pks(rng: np.random.Generator, candidates: list[PkTuple], frac: float) 
 
 
 def _distinct_live_pks(state: DriftState) -> list[PkTuple]:
-    """Distinct clean PKs of ``df`` rows not yet quarantined, in ``df`` row order."""
-    seen: dict[PkTuple, None] = {}
-    for pk in state.row_pk:
-        if pk not in state.quarantined:
-            seen.setdefault(pk, None)
-    return list(seen)
+    """Distinct clean PKs of ``df`` rows not yet quarantined, in ``df`` row order.
+
+    A row is live while its clean PK is still in ``expected`` (``fk_break`` is the only op that
+    removes truth rows); ``state.quarantined`` holds drifted PKs and cannot be used here.
+    """
+    live = set(_expected_pks(state))
+    return list(dict.fromkeys(pk for pk in state.row_pk if pk in live))
 
 
 def _row_mask(state: DriftState, pks: Iterable[PkTuple]) -> pl.Series:
@@ -361,7 +362,10 @@ def duplicate_rows(state: DriftState, rng: np.random.Generator, *, frac: float) 
 def fk_break(state: DriftState, rng: np.random.Generator, *, column: str, frac: float) -> None:
     """Set the FK of ``frac`` of clean PKs to distinct negative ints; quarantine those rows.
 
-    Quarantined rows leave ``expected`` and any flags they carried are dropped.
+    ``state.quarantined`` records each broken row's *drifted* PK (the clean PK with the new FK
+    value substituted when the FK is part of the PK, as in lineitem): the broken key is all a
+    system can see. Every ``df`` copy of a broken row carries the same drifted PK. Quarantined
+    rows leave ``expected`` and any flags they carried are dropped.
     """
     frac = _check_frac(frac)
     if column not in state.contract.foreign_keys:
@@ -377,7 +381,11 @@ def fk_break(state: DriftState, rng: np.random.Generator, *, column: str, frac: 
             values[i] = new_fk[pk]
             rows += 1
     _replace_column(state, name, values, state.df.schema[name])
-    state.quarantined.update(chosen)
+    pk_cols = state.contract.primary_key
+    state.quarantined.update(
+        tuple(new_fk[pk] if col == column else v for col, v in zip(pk_cols, pk, strict=True))
+        for pk in chosen
+    )
     keep = pl.Series([pk not in new_fk for pk in _expected_pks(state)], dtype=pl.Boolean)
     state.expected = state.expected.filter(keep)
     state.flags = {(pk, col) for pk, col in state.flags if pk not in new_fk}

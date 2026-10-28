@@ -35,7 +35,7 @@ class RulesOnlySystem:
                 file_quarantined=True,
                 cost_usd=0.0,
                 latency_s=time.perf_counter() - start,
-                meta={"actions": [f"file quarantined: {exc}"]},
+                meta={"actions": [f"file quarantined: {exc}"], "dropped_unkeyed_rows": 0},
             )
         return SystemOutput(
             df=result.df,
@@ -44,5 +44,5 @@ class RulesOnlySystem:
             file_quarantined=False,
             cost_usd=0.0,
             latency_s=time.perf_counter() - start,
-            meta={"actions": result.actions},
+            meta={"actions": result.actions, "dropped_unkeyed_rows": result.dropped_unkeyed_rows},
         )

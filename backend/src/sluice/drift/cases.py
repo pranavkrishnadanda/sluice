@@ -164,7 +164,7 @@ class Case:
         return {(tuple(pk), column) for pk, column in self.manifest["expected_flags"]}
 
     def quarantined(self) -> set[PkTuple]:
-        """Clean PKs of rows expected to land in quarantine."""
+        """PKs (as in the drifted input) of rows expected to land in quarantine."""
         return {tuple(pk) for pk in self.manifest["expected_quarantined"]}
 
 

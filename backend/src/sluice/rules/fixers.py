@@ -86,12 +86,14 @@ class RuleResult:
         flags: ``(pk, column)`` cells set null because they could not be recovered.
         quarantined: PKs of rows removed for foreign-key misses.
         actions: Human-readable log of what each rule did, in rule order.
+        dropped_unkeyed_rows: Rows dropped because their primary key could not be parsed.
     """
 
     df: pl.DataFrame
     flags: set[tuple[PK, str]]
     quarantined: set[PK]
     actions: list[str]
+    dropped_unkeyed_rows: int = 0
 
 
 # --- per-cell parsing -------------------------------------------------------------------------
@@ -300,18 +302,20 @@ def _repair_frame(df: pl.DataFrame, contract: Contract, actions: list[str]) -> p
     return pl.DataFrame([*data, *flags])
 
 
-def _drop_unkeyed(frame: pl.DataFrame, contract: Contract, actions: list[str]) -> pl.DataFrame:
+def _drop_unkeyed(
+    frame: pl.DataFrame, contract: Contract, actions: list[str]
+) -> tuple[pl.DataFrame, int]:
     keyed = pl.all_horizontal(pl.col(k).is_not_null() for k in contract.primary_key)
     out = frame.filter(keyed)
     if dropped := frame.height - out.height:
         actions.append(f"dropped {dropped} row(s) whose primary key could not be parsed")
-    return out
+    return out, dropped
 
 
 def _dedupe(frame: pl.DataFrame, contract: Contract, actions: list[str]) -> pl.DataFrame:
-    """Rule 10. Flag columns are a function of the data, so exact copies agree on them."""
-    columns = [c.name for c in contract.columns]
-    exact = frame.unique(subset=columns, keep="first", maintain_order=True)
+    """Rule 10. A row counts as an exact duplicate only if its flags match too, so a
+    null + flagged cell and a genuinely null cell are never collapsed into one another."""
+    exact = frame.unique(keep="first", maintain_order=True)  # data and flag columns
     if n := frame.height - exact.height:
         actions.append(f"dropped {n} exact duplicate row(s)")
     by_pk = exact.unique(subset=list(contract.primary_key), keep="first", maintain_order=True)
@@ -375,9 +379,9 @@ def apply_rules(
     actions: list[str] = []
     selected = _select_matched(df, prof, actions)
     frame = _repair_frame(selected, contract, actions)
-    frame = _drop_unkeyed(frame, contract, actions)
+    frame, unkeyed = _drop_unkeyed(frame, contract, actions)
     frame = _dedupe(frame, contract, actions)
     frame, quarantined = _quarantine_fk(frame, contract, reference, actions)
     flags = _collect_flags(frame, contract)
     out = frame.select([c.name for c in contract.columns])
-    return RuleResult(df=out, flags=flags, quarantined=quarantined, actions=actions)
+    return RuleResult(out, flags, quarantined, actions, dropped_unkeyed_rows=unkeyed)

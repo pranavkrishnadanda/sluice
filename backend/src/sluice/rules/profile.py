@@ -2,8 +2,9 @@
 
 Matching is deliberately literal: an input column matches a contract column when its name is
 identical, or identical after normalisation (strip, lower-case, ``-``/space -> ``_``). A name the
-reader produced by flattening nested JSON (``details.o_clerk``) is also tried by its leaf key
-(``o_clerk``): that undoes the reader's own flattening and recovers the producer's key verbatim.
+reader produced by flattening one level of nested JSON (``details.o_clerk``: exactly one dot,
+non-empty container and leaf) is also tried by its leaf key (``o_clerk``) under the same rule:
+that undoes the reader's own flattening. Deeper paths (``a.b.o_clerk``) never match.
 There is no fuzzy or semantic matching (``orderdate`` never matches ``o_orderdate``); that is
 the agent's job.
 
@@ -56,10 +57,15 @@ def normalise_name(name: str) -> str:
 
 
 def _candidates(name: str) -> list[str]:
-    """Normalised spellings an input column may match, most specific first."""
+    """Normalised spellings an input column may match, most specific first.
+
+    The leaf of a flattened name is tried only for exactly one non-empty ``<container>.``
+    prefix: that is the reader's own flattening of one nesting level, nothing deeper.
+    """
     names = [normalise_name(name)]
-    if _NEST_SEP in name:
-        names.append(normalise_name(name.rsplit(_NEST_SEP, 1)[1]))
+    container, sep, leaf = name.partition(_NEST_SEP)
+    if sep and container.strip() and leaf.strip() and _NEST_SEP not in leaf:
+        names.append(normalise_name(leaf))
     return names
 
 

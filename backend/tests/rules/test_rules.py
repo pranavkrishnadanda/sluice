@@ -5,7 +5,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from sluice.contracts.model import Contract, load_contract
+from sluice.contracts.model import ColumnSpec, Contract, load_contract
 from sluice.contracts.validate import validate
 from sluice.drift.cases import Recipe, build_case
 from sluice.drift.writers import write_input
@@ -359,3 +359,46 @@ def test_rules_only_ascii_digits_parse(orders: Contract, orders20, tmp_path, raw
     df = _set(df, "o_totalprice", [raw + ".00"])
     out = _run(df, orders)
     assert out.df["o_custkey"][0] is None and out.df["o_totalprice"][0] is None
+
+
+def test_rules_dedupe_keeps_flag_of_bad_row_over_true_null(orders: Contract, orders20, tmp_path):
+    # o_custkey nullable: "abc" repairs to null + flag, a true null to null without flag.
+    cols = tuple(
+        ColumnSpec(c.name, c.dtype, True) if c.name == "o_custkey" else c for c in orders.columns
+    )
+    nullable = Contract(orders.name, orders.version, orders.primary_key, cols)
+    text = _as_csv(orders20, tmp_path)
+    bad = _set(text[:1], "o_custkey", ["abc"])
+    true_null = _set(text[:1], "o_custkey", [None])
+    out = _run(pl.concat([bad, true_null, text[1:]]), nullable)
+    assert out.df.height == N
+    assert out.flags == {(_pk(orders20, 0, orders), "o_custkey")}
+
+
+def test_profile_nested_leaf_ambiguous_matches_nothing(orders: Contract) -> None:
+    df = pl.DataFrame({"o_orderkey": ["1"], "details.o_clerk": ["a"], "meta.O_CLERK": ["b"]})
+    prof = profile(df, orders)
+    assert prof.columns["details.o_clerk"].matched_contract_column is None
+    assert prof.columns["meta.O_CLERK"].matched_contract_column is None
+    assert "o_clerk" in prof.missing
+
+
+def test_profile_nested_leaf_needs_exactly_one_container(orders: Contract) -> None:
+    df = pl.DataFrame({"a.b.o_clerk": ["a"], ".o_comment": ["b"], "details.": ["c"]})
+    matched = {n: c.matched_contract_column for n, c in profile(df, orders).columns.items()}
+    assert matched == {"a.b.o_clerk": None, ".o_comment": None, "details.": None}
+
+
+def test_rules_unkeyed_rows_counted_in_meta(orders: Contract, orders20, tmp_path) -> None:
+    df = _set(_as_csv(orders20, tmp_path), "o_orderkey", ["abc", "1,000"])
+    path = tmp_path / "in.csv"
+    df.write_csv(path)
+    result = RulesOnlySystem().run(CaseInput(path, orders, {}))
+    assert result.meta["dropped_unkeyed_rows"] == 2
+    assert result.df.height == N - 2
+    assert any("primary key could not be parsed" in a for a in result.meta["actions"])
+
+
+def test_rules_meta_dropped_unkeyed_rows_zero_by_default(orders: Contract, orders20, tmp_path):
+    path = write_input(orders20, tmp_path / "input", "csv", "utf-8")
+    assert RulesOnlySystem().run(CaseInput(path, orders, {})).meta["dropped_unkeyed_rows"] == 0
