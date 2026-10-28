@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from sluice.settings import Settings, get_settings
 
@@ -79,3 +80,32 @@ def test_get_settings_is_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     for k, v in SECRETS.items():
         monkeypatch.setenv(k, v)
     assert get_settings() is get_settings()
+
+
+REQUIRED_SECRETS = [
+    "LITELLM_MASTER_KEY",
+    "POSTGRES_PASSWORD",
+    "RUSTFS_ACCESS_KEY",
+    "RUSTFS_SECRET_KEY",
+]
+
+
+@pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "whitespace"])
+@pytest.mark.parametrize("name", REQUIRED_SECRETS)
+def test_settings_rejects_blank_required_secret(tmp_path: Path, name: str, blank: str) -> None:
+    env = _write_env(tmp_path, {**SECRETS, name: blank})
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=env)
+    message = str(exc.value)
+    assert name in message
+    assert "input_value" not in message
+    for value in SECRETS.values():
+        assert value not in message
+
+
+@pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "whitespace"])
+def test_settings_blank_optional_llm_keys_are_none(tmp_path: Path, blank: str) -> None:
+    env = _write_env(tmp_path, {**SECRETS, "GROQ_API_KEY": blank, "GEMINI_API_KEY": blank})
+    s = Settings(_env_file=env)
+    assert s.groq_api_key is None
+    assert s.gemini_api_key is None

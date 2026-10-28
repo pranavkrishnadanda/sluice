@@ -59,6 +59,8 @@ services:
     # Healthy = API up AND warehouse bucket present. The check creates the bucket when missing
     # (idempotent), so `up --wait` returns only once the bucket exists. A one-shot init container
     # would make `up --wait` exit 1 when it finishes. curl signs the S3 calls with SigV4.
+    # Relies on the image shipping curl with `--aws-sigv4` and on rustfs serving GET /health, both
+    # verified for rustfs/rustfs:1.0.4 only: re-check this healthcheck on any image bump.
     healthcheck:
       test:
         - CMD-SHELL
