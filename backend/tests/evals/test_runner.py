@@ -247,7 +247,7 @@ LOCK = {
 def test_render_results_tables_and_footer() -> None:
     md = render_results([_summary()], LOCK)
     assert "| System | Split | n | Trials | Cell accuracy | Fabrication | Row recall |" in md
-    assert "| rules | dev | 2 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 84.2] |"  # exact 0/2 in md
+    assert "| rules | dev | 2 | 1 | 50.0% [40.0, 60.0] | 0.0% [0.0, 84.2] |" in md  # exact 0/2
     assert "| rules | dev | hard | 1 | — | — | — | — | — |" in md
     assert "abc123" in md
     assert "duckdb 2.0.0" in md and "polars 2.1.0" in md
@@ -262,6 +262,42 @@ def test_render_results_omits_latency_and_cost() -> None:
     b = render_results([_summary(metrics=other)], LOCK)
     assert a == b
     assert "12.3" not in a
+
+
+def test_render_results_degenerate_ratio_at_100_shows_all_cases_without_interval() -> None:
+    metrics = dict(_summary().metrics, cell_accuracy=(1.0, 1.0, 1.0), row_recall=(1.0, 1.0, 1.0))
+    md = render_results([_summary(metrics=metrics)], LOCK)
+    assert (
+        "| rules | dev | 2 | 1 | 100.0% (all 2 cases) | 0.0% [0.0, 84.2] | 100.0% (all 2 cases) |"
+        in md
+    )
+
+
+def test_render_results_degenerate_ratio_at_0_shows_all_cases_without_interval() -> None:
+    metrics = dict(_summary().metrics, cell_accuracy=(0.0, 0.0, 0.0))
+    md = render_results([_summary(metrics=metrics)], LOCK)
+    assert (
+        "| rules | dev | 2 | 1 | 0.0% (all 2 cases) | 0.0% [0.0, 84.2] | 50.0% [40.0, 60.0] |" in md
+    )
+
+
+def test_render_results_degenerate_ratio_uses_defined_count() -> None:
+    metrics = dict(_summary().metrics, row_recall=(1.0, 1.0, 1.0))
+    s = _summary(metrics=metrics, n_defined={"row_recall": 1})
+    md = render_results([s], LOCK)
+    assert "| 100.0% (all 1 cases) |" not in md
+    assert "| 100.0% (all 1 case) |" in md
+
+
+def test_render_results_non_degenerate_ratio_keeps_interval() -> None:
+    metrics = dict(_summary().metrics, cell_accuracy=(1.0, 0.9, 1.0), row_recall=(0.5, 0.5, 0.5))
+    md = render_results([_summary(metrics=metrics)], LOCK)
+    assert "| 100.0% [90.0, 100.0] | 0.0% [0.0, 84.2] | 50.0% [50.0, 50.0] |" in md
+
+
+def test_render_results_intro_explains_omitted_intervals() -> None:
+    md = render_results([_summary()], LOCK)
+    assert "the interval is omitted and the value is followed by `(all k cases)`" in md
 
 
 def test_latest_summaries_picks_newest_per_system_split(tmp_path: Path) -> None:
@@ -530,10 +566,12 @@ def test_render_results_boundary_contract_pass_and_success_overall() -> None:
     assert "0.0% [0.0, 1.2]" in overall  # success 0/300
 
 
-def test_render_results_keeps_bootstrap_for_non_boolean_metrics() -> None:
+def test_render_results_no_exact_interval_for_non_boolean_metrics() -> None:
     md = render_results([_boundary_summary()], LOCK)
     overall = next(r for r in md.splitlines() if r.startswith("| rules | dev | 300 |"))
-    assert "| 100.0% [100.0, 100.0] |" in overall  # cell accuracy is not a per-case boolean
+    # cell accuracy is not a per-case boolean: no Clopper-Pearson, and no zero-width interval
+    assert "| rules | dev | 300 | 1 | 100.0% (all 300 cases) |" in overall
+    assert "[100.0, 100.0]" not in overall
 
 
 def test_render_results_intro_names_the_exact_binomial_method() -> None:
