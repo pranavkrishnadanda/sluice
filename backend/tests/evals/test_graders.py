@@ -543,3 +543,9 @@ def test_nested_output_on_flag_truth_is_fabrication(tmp_path: Path, orders: Cont
     out_df = truth.with_columns(pl.Series("o_custkey", [{"a": 10}, {"a": 0}, {"a": 30}]))
     g = grade(_case(tmp_path, truth, FLAG_2), _out(out_df, FLAG_2), {})
     assert g.fabrication_rate == 1.0
+
+
+def test_grade_records_file_quarantine(tmp_path: Path, orders: Contract) -> None:
+    t = _truth(orders)
+    assert grade(_case(tmp_path, t), _out(t.clear(), file_quarantined=True), {}).file_quarantined
+    assert not grade(_case(tmp_path / "b", t), _out(t), {}).file_quarantined

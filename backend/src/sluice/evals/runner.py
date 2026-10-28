@@ -4,14 +4,17 @@ A run writes two files into its output directory:
 
 * ``results.jsonl`` -- one line per (case, trial), ordered by ``(case_id, trial)``, trials
   numbered from 0: ``case_id, trial, difficulty``, every :class:`~sluice.evals.graders.Grade`
-  field, then ``cost_usd`` and ``latency_s``. Booleans stay JSON booleans.
+  field (including ``file_quarantined``), then ``cost_usd`` and ``latency_s``. Booleans stay
+  JSON booleans.
 * ``summary.json`` -- the :class:`EvalSummary` plus ``created_at`` (UTC) and ``cases_sha256``
   (the :func:`~sluice.drift.cases.split_hash` of the cases actually evaluated).
 
 Aggregation: for each case, each metric is averaged over its trials (``None`` trials skipped;
 booleans as 0/1); :func:`~sluice.evals.stats.bootstrap_ci` (``seed=0``) then runs over the
 per-case means, dropping cases where the metric is undefined. ``pass_hat_k`` is the mean over
-cases of ``pass_hat_k(trials, successes, trials)``, ``None`` for a single trial.
+cases of ``pass_hat_k(trials, successes, trials)``, ``None`` for a single trial. A case counts
+as file-quarantined if any of its trials quarantined the whole file (rows without the field,
+from older runs, count as not quarantined).
 
 :func:`render_results` turns the latest summary per (system, split) into ``evals/RESULTS.md``.
 Latency and cost are not rendered: latency is wall-clock, so the file stays byte-identical
@@ -70,6 +73,7 @@ _TABLE_METRICS: tuple[tuple[str, str], ...] = (
     ("Contract pass", "contract_pass"),
     ("Success", "success"),
 )
+_QUARANTINE_HEADER = "Files quarantined"
 _NONE = "—"
 _CLI = "cd backend && PYTHONPATH=src uv run sluice"
 
@@ -107,6 +111,9 @@ class EvalSummary:
     n_defined: dict[str, int] = field(default_factory=dict)
     n_defined_by_difficulty: dict[str, dict[str, int]] = field(default_factory=dict)
     created_at: datetime | None = None
+    n_file_quarantined: int = 0
+    n_file_quarantined_by_difficulty: dict[str, int] = field(default_factory=dict)
+    n_file_quarantined_fabrication_defined: int = 0
 
     def to_json(self, cases_sha256: str | None = None) -> dict[str, Any]:
         """JSON-ready dict; CIs become ``[mean, lo, hi]`` lists."""
@@ -126,6 +133,9 @@ class EvalSummary:
                 d: dict(m) for d, m in self.n_defined_by_difficulty.items()
             },
             "created_at": None if self.created_at is None else _iso(self.created_at),
+            "n_file_quarantined": self.n_file_quarantined,
+            "n_file_quarantined_by_difficulty": dict(self.n_file_quarantined_by_difficulty),
+            "n_file_quarantined_fabrication_defined": self.n_file_quarantined_fabrication_defined,
             "cases_sha256": cases_sha256,
         }
 
@@ -150,6 +160,13 @@ class EvalSummary:
                 for d, counts in raw.get("n_defined_by_difficulty", {}).items()
             },
             created_at=None if created is None else datetime.fromisoformat(created),
+            n_file_quarantined=int(raw.get("n_file_quarantined", 0)),
+            n_file_quarantined_by_difficulty={
+                d: int(n) for d, n in raw.get("n_file_quarantined_by_difficulty", {}).items()
+            },
+            n_file_quarantined_fabrication_defined=int(
+                raw.get("n_file_quarantined_fabrication_defined", 0)
+            ),
         )
 
     def write(self, path: Path, cases_sha256: str | None = None) -> None:
@@ -201,6 +218,7 @@ def summarize(
         raise ValueError("no rows to summarise")
 
     per_case: list[dict[str, float | None]] = []
+    quarantined: list[bool] = []
     difficulty: list[str] = []
     pass_hats: list[float] = []
     for case_id, case_rows in by_case.items():
@@ -208,6 +226,7 @@ def summarize(
             raise ValueError(f"{case_id}: {len(case_rows)} rows, expected {trials} trials")
         per_case.append({m: _mean(r[m] for r in case_rows) for m in METRICS})
         difficulty.append(case_rows[0]["difficulty"])
+        quarantined.append(any(r.get("file_quarantined", False) for r in case_rows))
         if trials > 1:
             successes = sum(1 for r in case_rows if r["success"])
             pass_hats.append(pass_hat_k(trials, successes, trials))
@@ -215,11 +234,15 @@ def summarize(
     by_difficulty: dict[str, dict[str, CI | None]] = {}
     n_by_difficulty: dict[str, int] = {}
     n_defined_by_difficulty: dict[str, dict[str, int]] = {}
+    n_quarantined_by_difficulty: dict[str, int] = {}
     for d in _difficulty_order(difficulty):
         group = [c for c, cd in zip(per_case, difficulty, strict=True) if cd == d]
         by_difficulty[d] = _cis(group)
         n_by_difficulty[d] = len(group)
         n_defined_by_difficulty[d] = _defined(group)
+        n_quarantined_by_difficulty[d] = sum(
+            q for q, cd in zip(quarantined, difficulty, strict=True) if cd == d
+        )
 
     return EvalSummary(
         system=system,
@@ -233,6 +256,13 @@ def summarize(
         n_defined=_defined(per_case),
         n_defined_by_difficulty=n_defined_by_difficulty,
         created_at=created_at,
+        n_file_quarantined=sum(quarantined),
+        n_file_quarantined_by_difficulty=n_quarantined_by_difficulty,
+        n_file_quarantined_fabrication_defined=sum(
+            q
+            for q, c in zip(quarantined, per_case, strict=True)
+            if c["fabrication_rate"] is not None
+        ),
     )
 
 
@@ -348,6 +378,31 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
+def _notes(s: EvalSummary) -> list[str]:
+    """The per-summary sentences under the overall table (fabrication denominator, quarantines)."""
+    notes: list[str] = []
+    fab_n = s.n_defined.get("fabrication_rate")
+    if fab_n is not None:
+        notes.append(
+            f"Fabrication is defined on {fab_n} of {s.n_cases} `{s.split}` cases for "
+            f"`{s.system}` (those with at least one unrecoverable cell)."
+        )
+    if s.n_file_quarantined:
+        among = (
+            ""
+            if fab_n is None
+            else f" ({s.n_file_quarantined_fabrication_defined} of the {fab_n} cases where "
+            "fabrication is defined)"
+        )
+        notes.append(
+            f"For `{s.system}`, {s.n_file_quarantined} of {s.n_cases} `{s.split}` files were "
+            f"quarantined whole{among}. A quarantined file has no output, so quarantined files "
+            "contribute no fabrications (their fabrication is 0%) and fail Contract pass and "
+            "Success."
+        )
+    return notes
+
+
 def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) -> str:
     """Render ``evals/RESULTS.md`` from summaries (one per (system, split)) and ``LOCK.json``."""
     if not summaries:
@@ -372,31 +427,29 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         "among those unrecoverable cells, the share where the system wrote a value instead of "
         "flagging it (lower is better). **Row recall** is the share of expected rows present in "
         "the output. **Contract pass** is the share of cases whose output passes the table "
-        "contract. Contract pass ignores cells the system flagged as unrecoverable, so a case "
-        "can pass the contract and still fail Success. **Success** is the share of cases that "
-        "are perfect: every cell right, the "
-        "contract passing and no invented rows. Every value is the mean over cases with its "
-        "95% percentile-bootstrap confidence interval in brackets (10,000 resamples, seed 0); "
-        "each case's metric is first averaged over its trials, and a case where a metric is "
-        "undefined (for example fabrication when nothing needed flagging) is left out of that "
-        "metric. Latency and cost are not shown. Reproduce from the repository root with "
-        f"`{reproduce}`. A value followed by `(n=k)` is defined on only k of the row's cases."
+        "contract; a file the system quarantined whole has no output and fails it. Contract "
+        "pass ignores cells the system flagged as unrecoverable, so a case can pass the "
+        "contract and still fail Success. **Success** is the share of cases that are perfect: "
+        "every cell right, the contract passing and no invented rows. Every value is the mean "
+        "over cases with its 95% percentile-bootstrap confidence interval in brackets (10,000 "
+        "resamples, seed 0); each case's metric is first averaged over its trials, and a case "
+        "where a metric is undefined (for example fabrication when nothing needed flagging) is "
+        "left out of that metric. Latency and cost are not shown. Reproduce from the repository "
+        f"root with `{reproduce}`. A value followed by `(n=k)` is defined on only k of the "
+        "row's cases. **Files quarantined** counts cases whose whole file the system rejected "
+        "(k of n)."
     )
 
-    headers = [h for h, _ in _TABLE_METRICS]
+    headers = [h for h, _ in _TABLE_METRICS] + [_QUARANTINE_HEADER]
     main = [
         _row(["System", "Split", "n", "Trials", *headers]),
         _row(["---"] * (4 + len(headers))),
     ]
     for s in summaries:
         cells = [_cell(s.metrics.get(k), s.n_defined.get(k), s.n_cases) for _, k in _TABLE_METRICS]
+        cells.append(f"{s.n_file_quarantined}/{s.n_cases}")
         main.append(_row([s.system, s.split, s.n_cases, s.trials, *cells]))
-    notes = [
-        f"Fabrication is defined on {s.n_defined['fabrication_rate']} of {s.n_cases} `{s.split}` "
-        f"cases for `{s.system}` (those with at least one unrecoverable cell)."
-        for s in summaries
-        if "fabrication_rate" in s.n_defined
-    ] + [
+    notes = [note for s in summaries for note in _notes(s)] + [
         "Contract pass checks the output against the table contract with flagged cells exempt, "
         "so a system that flags what it cannot recover can pass the contract and still fail "
         "Success, which also requires every cell to be right."
@@ -411,6 +464,8 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
             n_d = s.n_by_difficulty.get(d)
             counts = s.n_defined_by_difficulty.get(d, {})
             cells = [_cell(m.get(k), counts.get(k), n_d) for _, k in _TABLE_METRICS]
+            q_d = s.n_file_quarantined_by_difficulty.get(d)
+            cells.append(_NONE if q_d is None or n_d is None else f"{q_d}/{n_d}")
             diff.append(_row([s.system, s.split, d, _NONE if n_d is None else n_d, *cells]))
 
     pass_hats = [

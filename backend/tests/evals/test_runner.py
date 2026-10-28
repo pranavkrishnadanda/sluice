@@ -416,3 +416,74 @@ def test_summary_round_trips_defined_per_difficulty(tmp_path: Path) -> None:
     s = _summary(n_defined_by_difficulty={"easy": {"fabrication_rate": 0}})
     s.write(tmp_path / "summary.json")
     assert load_summary(tmp_path / "summary.json") == s
+
+
+# --- file quarantines (final review) ---------------------------------------------------------
+
+
+def test_summarize_counts_file_quarantined_cases() -> None:
+    rows = [
+        _row("a", 0, "easy"),
+        _row("b", 0, "hard", file_quarantined=True, fabrication_rate=0.0, n_flag_cells=3),
+        _row("c", 0, "hard", file_quarantined=True),
+        _row("d", 0, "hard", fabrication_rate=0.0, n_flag_cells=2),
+    ]
+    s = summarize(rows, "rules", "dev", 1)
+    assert s.n_file_quarantined == 2
+    assert s.n_file_quarantined_by_difficulty == {"easy": 0, "hard": 2}
+    assert s.n_file_quarantined_fabrication_defined == 1
+
+
+def test_summarize_treats_missing_file_quarantined_as_false() -> None:
+    s = summarize([_row("a", 0, "easy")], "rules", "dev", 1)
+    assert s.n_file_quarantined == 0
+
+
+def test_summary_round_trips_file_quarantine_counts(tmp_path: Path) -> None:
+    s = _summary(
+        n_file_quarantined=1,
+        n_file_quarantined_by_difficulty={"easy": 0, "hard": 1},
+        n_file_quarantined_fabrication_defined=1,
+    )
+    s.write(tmp_path / "summary.json")
+    assert load_summary(tmp_path / "summary.json") == s
+
+
+def test_old_summary_json_loads_with_zero_file_quarantines(tmp_path: Path) -> None:
+    raw = _summary().to_json()
+    for key in (
+        "n_file_quarantined",
+        "n_file_quarantined_by_difficulty",
+        "n_file_quarantined_fabrication_defined",
+    ):
+        raw.pop(key, None)
+    s = EvalSummary.from_json(raw)
+    assert (s.n_file_quarantined, s.n_file_quarantined_by_difficulty) == (0, {})
+
+
+def test_render_results_has_files_quarantined_column_in_both_tables() -> None:
+    s = _summary(
+        n_file_quarantined=1,
+        n_file_quarantined_by_difficulty={"easy": 0, "hard": 1},
+    )
+    md = render_results([s], LOCK)
+    overall = md.split("## Overall", 1)[1].split("## By difficulty", 1)[0]
+    by_diff = md.split("## By difficulty", 1)[1]
+    assert "| Success | Files quarantined |" in overall
+    assert "| Success | Files quarantined |" in by_diff
+    assert [r for r in overall.splitlines() if r.startswith("| rules")][0].endswith("| 1/2 |")
+    diff_rows = [r for r in by_diff.splitlines() if r.startswith("| rules")]
+    assert diff_rows[0].endswith("| 0/1 |") and diff_rows[1].endswith("| 1/1 |")
+
+
+def test_render_results_explains_quarantined_files_behind_fabrication() -> None:
+    s = _summary(
+        n_cases=300,
+        n_defined={"fabrication_rate": 67},
+        n_file_quarantined=16,
+        n_file_quarantined_fabrication_defined=9,
+    )
+    md = render_results([s], LOCK)
+    assert "16 of 300 `dev` files were quarantined whole" in md
+    assert "9 of the 67 cases where fabrication is defined" in md
+    assert "contribute no fabrications" in md

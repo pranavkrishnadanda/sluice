@@ -13,7 +13,7 @@ PK (``O`` is empty when ``out.file_quarantined``).
 * ``fabrication_rate = |truth FLAG and prediction a non-null value| / n_flag_cells`` (``None``
   if ``n_flag_cells == 0``).
 * ``fabricated_rows = |PK(O) - (PK(E) | case.quarantined())|``; ``extra_columns`` are output
-  columns not in the contract.
+  columns not in the contract; ``file_quarantined`` echoes ``out.file_quarantined``.
 * ``contract_pass`` is ``False`` when ``out.file_quarantined`` (a quarantined file has no final
   output) or when the output has no rows while ``E`` has rows; otherwise it is
   ``validate(contract, out.df, reference, flags=out.flags).passed``.
@@ -74,6 +74,7 @@ class Grade:
     success: bool
     n_cells: int
     n_flag_cells: int
+    file_quarantined: bool = False
 
 
 def _ratio(num: int, den: int) -> float | None:
@@ -281,4 +282,5 @@ def grade(case: Case, out: SystemOutput, reference: dict[str, set[Any]]) -> Grad
         success=cell_accuracy == 1.0 and contract_pass and fabricated_rows == 0,
         n_cells=n_cells,
         n_flag_cells=n_flag_cells,
+        file_quarantined=out.file_quarantined,
     )
