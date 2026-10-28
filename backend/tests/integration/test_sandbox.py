@@ -8,11 +8,13 @@ is contained (it fails, or its probe shows the action was refused), and the host
 import contextlib
 import hashlib
 import json
+import os
 import shutil
 import socket
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import docker
 import polars as pl
@@ -59,14 +61,14 @@ def isolated(
     snapshots: dict[str, dict[str, str]] = {}
     real_remove = runner._remove_workdir
 
-    def snapshot_then_remove(path: Path) -> None:
-        in_dir = path / "in"
+    def snapshot_then_remove(work: Any) -> None:
+        in_dir = work.path / "in"
         snapshots["in"] = {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(in_dir.iterdir())
             if p.is_file()
         } | {p.name: "<dir>" for p in in_dir.iterdir() if not p.is_file()}
-        real_remove(path)
+        real_remove(work)
 
     monkeypatch.setattr(runner, "_remove_workdir", snapshot_then_remove)
     yield snapshots
@@ -92,7 +94,11 @@ def _in_hashes(code: str) -> dict[str, str]:
     tmp = IT_ROOT / ("ref-" + uuid.uuid4().hex)
     tmp.mkdir(parents=True)
     try:
-        runner._write_inputs(tmp, code, VALUES)
+        fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            runner._write_inputs(fd, code, VALUES)
+        finally:
+            os.close(fd)
         return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(tmp.iterdir())}
     finally:
         shutil.rmtree(tmp)
@@ -126,6 +132,7 @@ def test_container_identity_and_limits() -> None:
     code = _probe(
         """
 from pathlib import Path
+from typing import Any
 status = dict(
     line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines()
 )

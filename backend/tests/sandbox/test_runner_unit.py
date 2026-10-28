@@ -665,3 +665,122 @@ def test_unreachable_daemon_while_waiting_raises_without_hot_loop(work_root: Pat
     # POLL_INTERVAL_S is 0.01 here: sleeping between retries bounds this near 100.
     assert calls["n"] <= 150
     _assert_cleaned(client, work_root)
+
+
+# --- fix round 2: fd-based work dir (symlink race, Linux portability) ----------------------
+
+
+def test_symlink_swap_after_check_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Swap ``sluice-sandbox`` for a symlink to an attacker tree after the dir was opened."""
+    base = tmp_path / "base"
+    monkeypatch.setenv(runner.WORK_DIR_ENV, str(base))
+    moved = base / "moved"
+    evil = tmp_path / "evil"
+    real_write = runner._write_inputs
+
+    def write_then_swap(*args: Any) -> None:
+        real_write(*args)
+        (base / runner.RUNNER_SUBDIR).rename(moved)
+        (run_name,) = [p.name for p in moved.iterdir()]
+        for sub in ("in", "out"):
+            (evil / run_name / sub).mkdir(parents=True)
+        (base / runner.RUNNER_SUBDIR).symlink_to(evil, target_is_directory=True)
+
+    monkeypatch.setattr(runner, "_write_inputs", write_then_swap)
+    client = FakeClient()
+    with pytest.raises(SandboxError, match="changed"):
+        _run(client)
+    assert client.container is None  # nothing was mounted
+    assert all(not any(d.iterdir()) for d in evil.glob("*/*"))  # attacker tree untouched
+    assert list(moved.iterdir()) == []  # our real run dir was still removed, through its fd
+
+
+def test_inputs_are_written_through_the_held_fd_not_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path / "base"
+    monkeypatch.setenv(runner.WORK_DIR_ENV, str(base))
+    real_make = runner._make_workdir
+    evil = tmp_path / "evil"
+    evil.mkdir()
+
+    def make_then_swap() -> Any:
+        work = real_make()
+        (base / runner.RUNNER_SUBDIR).rename(base / "moved")
+        (base / runner.RUNNER_SUBDIR).symlink_to(evil, target_is_directory=True)
+        return work
+
+    monkeypatch.setattr(runner, "_make_workdir", make_then_swap)
+    with pytest.raises(SandboxError, match="changed"):
+        _run(FakeClient())
+    assert list(evil.iterdir()) == []
+
+
+def test_no_chmod_without_following_symlinks(
+    monkeypatch: pytest.MonkeyPatch, work_root: Path
+) -> None:
+    """Linux has no lchmod: ``os.chmod(..., follow_symlinks=False)`` raises NotImplementedError."""
+    real_chmod = os.chmod
+
+    def linux_chmod(*args: Any, follow_symlinks: bool = True, **kwargs: Any) -> None:
+        if not follow_symlinks:
+            raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+        real_chmod(*args, **kwargs)
+
+    monkeypatch.setattr(runner.os, "chmod", linux_chmod)
+
+    def lock_everything(in_dir: Path, out_dir: Path) -> dict[str, Any]:
+        _echo(in_dir, out_dir)
+        locked = out_dir / "locked"
+        locked.mkdir()
+        (locked / "f").write_text("x")
+        locked.chmod(0)
+        out_dir.chmod(0o500)
+        return {"StatusCode": 1}
+
+    _run(FakeClient(lock_everything))
+    assert list(work_root.iterdir()) == []
+
+
+def test_runner_source_never_chmods_with_follow_symlinks_false() -> None:
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(runner))
+    bad = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", getattr(node.func, "id", "")) in {"chmod", "lchmod"}
+        and any(
+            kw.arg == "follow_symlinks"
+            and not (isinstance(kw.value, ast.Constant) and kw.value.value is True)
+            for kw in node.keywords
+        )
+    ]
+    lchmod_uses = [
+        n.lineno for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "lchmod"
+    ]
+    assert bad == [] and lchmod_uses == []
+
+
+def test_locked_subdir_in_out_counts_as_over_the_limit() -> None:
+    """A dir the host cannot list could hide a flood, so the watchdog kills the container."""
+    client = FakeClient(wait_exc=requests.exceptions.ReadTimeout("running"))
+    original_run = client.containers.run
+
+    def run(image: str, **kwargs: Any) -> FakeContainer:
+        container = original_run(image, **kwargs)
+        hidden = container.out_dir / "hidden"
+        hidden.mkdir()
+        (hidden / "flood").write_bytes(b"x" * 100)
+        hidden.chmod(0)
+        return container
+
+    client.containers.run = run  # type: ignore[method-assign]
+    result = _run(client, timeout_s=10)
+    assert result.ok is False
+    assert result.error is not None and "limit" in result.error
+    assert client.container is not None and client.container.kills >= 1

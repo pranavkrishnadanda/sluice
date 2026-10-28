@@ -42,11 +42,9 @@ import contextlib
 import io
 import logging
 import os
-import shutil
 import stat
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -206,12 +204,12 @@ def run_transform(
     start = time.monotonic()
     docker_client = client if client is not None else get_docker_client()
     try:
-        workdir = _make_workdir()
+        work = _make_workdir()
         try:
-            _write_inputs(workdir / "in", code, values)
-            outcome = _run_container(docker_client, workdir, len(values), timeout_s)
+            _write_inputs(work.in_fd, code, values)
+            outcome = _run_container(docker_client, work, len(values), timeout_s)
         finally:
-            _remove_workdir(workdir)
+            _remove_workdir(work)
     finally:
         if client is None:  # opened here, so closed here: no socket leak across many runs
             docker_client.close()
@@ -224,71 +222,156 @@ def run_transform(
 
 
 # --- per-run directory ---------------------------------------------------------------------
+#
+# Everything below the configured base directory is handled through directory file descriptors
+# opened with O_NOFOLLOW, so swapping a path component for a symlink after a check cannot
+# redirect a write, a read or a removal. The bind-mount paths are the one place Docker needs
+# strings; they are checked against the open descriptors (same device and inode) immediately
+# before the container starts. Only portable calls are used (fchmod, *at with dir_fd); there is
+# no ``chmod(..., follow_symlinks=False)``, which is not portable (NotImplementedError on Linux).
+
+_DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def _work_root() -> Path:
-    """The runner-owned ``<$SLUICE_SANDBOX_DIR>/sluice-sandbox`` directory, mode 0700.
+@dataclass(slots=True)
+class _WorkDir:
+    """A per-run directory, held open: ``path`` is only used for bind mounts and messages."""
 
-    The configured directory itself is created if missing but never chmodded. The subdirectory
-    is refused if it is a symlink, not a directory, or owned by another user.
+    path: Path
+    root_fd: int
+    run_fd: int
+    in_fd: int
+    out_fd: int
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    def close(self) -> None:
+        for fd in (self.in_fd, self.out_fd, self.run_fd, self.root_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _open_owned_dir(name: str, parent_fd: int, shown: Path) -> int:
+    """Open ``name`` under ``parent_fd`` without following links; it must be our directory."""
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:  # ELOOP (symlink) or ENOTDIR
+        raise SandboxError(
+            f"sandbox work dir {shown} is a symlink or not a directory; refusing to use it"
+        ) from exc
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        os.close(fd)
+        raise SandboxError(f"sandbox work dir {shown} is not a directory owned by the current user")
+    return fd
+
+
+def _make_subdir(name: str, mode: int, parent_fd: int, shown: Path) -> int:
+    os.mkdir(name, 0o700, dir_fd=parent_fd)
+    fd = _open_owned_dir(name, parent_fd, shown)
+    os.fchmod(fd, mode)  # explicit: mkdir's mode is filtered by the umask
+    return fd
+
+
+def _make_workdir() -> _WorkDir:
+    """Create ``<$SLUICE_SANDBOX_DIR>/sluice-sandbox/<uuid>/{in,out}`` and hold it open.
+
+    The configured directory is created if missing but never chmodded. ``sluice-sandbox`` is
+    refused if it is a symlink, not a directory, or owned by another user; it is kept at 0700.
     """
     base = Path(os.environ.get(WORK_DIR_ENV) or DEFAULT_WORK_ROOT).expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True)
     root = base / RUNNER_SUBDIR
-    with contextlib.suppress(FileExistsError):
-        root.mkdir(mode=0o700)
-    info = os.lstat(root)
-    if stat.S_ISLNK(info.st_mode):
-        raise SandboxError(f"sandbox work dir {root} is a symlink; refusing to use it")
-    if not stat.S_ISDIR(info.st_mode):
-        raise SandboxError(f"sandbox work dir {root} is not a directory")
-    if info.st_uid != os.getuid():
-        raise SandboxError(f"sandbox work dir {root} is owned by another user")
-    os.chmod(root, 0o700, follow_symlinks=False)
-    return root
-
-
-def _make_workdir() -> Path:
-    root = _work_root()
-    workdir = root / uuid.uuid4().hex
-    workdir.mkdir(mode=0o700)
-    (workdir / "in").mkdir(mode=0o755)
-    out_dir = workdir / "out"
-    out_dir.mkdir()
-    out_dir.chmod(0o777)  # uid 10001 writes here; the 0o700 parents keep other host users out
-    return workdir
-
-
-def _write_inputs(in_dir: Path, code: str, values: pl.Series) -> None:
-    """Write ``transform.py`` and ``values.parquet`` (one String column) into ``in_dir``."""
-    in_dir.mkdir(exist_ok=True)
-    code_path = in_dir / CODE_FILE
-    code_path.write_text(code, encoding="utf-8")
-    values_path = in_dir / VALUES_FILE
-    pl.DataFrame({COLUMN: values}).write_parquet(values_path)
-    for path in (code_path, values_path):
-        path.chmod(0o644)
-
-
-def _remove_workdir(path: Path) -> None:
-    """Delete a per-run directory, including anything the container made unreadable."""
-
-    def unlock_and_retry(func: Callable[..., Any], failed: str, exc: BaseException) -> None:
-        for target in (os.path.dirname(failed), failed):
-            with contextlib.suppress(OSError):
-                if stat.S_ISDIR(os.lstat(target).st_mode):  # never chmod through a symlink
-                    os.chmod(target, 0o700)
-        if func in (os.rmdir, os.unlink, os.remove):
-            func(failed)
-        else:  # os.open / os.scandir / os.lstat on a locked directory
-            shutil.rmtree(failed, onexc=unlock_and_retry)
-
+    base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        shutil.rmtree(path, onexc=unlock_and_retry)
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(RUNNER_SUBDIR, 0o700, dir_fd=base_fd)
+        root_fd = _open_owned_dir(RUNNER_SUBDIR, base_fd, root)
+    finally:
+        os.close(base_fd)
+    fds = [root_fd]
+    try:
+        os.fchmod(root_fd, 0o700)
+        name = uuid.uuid4().hex
+        run_fd = _make_subdir(name, 0o700, root_fd, root / name)
+        fds.append(run_fd)
+        in_fd = _make_subdir("in", 0o755, run_fd, root / name / "in")
+        fds.append(in_fd)
+        # uid 10001 writes here; the 0o700 parents keep other host users out.
+        out_fd = _make_subdir("out", 0o777, run_fd, root / name / "out")
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
+    return _WorkDir(root / name, root_fd, run_fd, in_fd, out_fd)
+
+
+def _write_file_at(dir_fd: int, name: str, data: bytes) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, 0o644)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+    finally:
+        os.close(fd)
+
+
+def _write_inputs(in_fd: int, code: str, values: pl.Series) -> None:
+    """Write ``transform.py`` and ``values.parquet`` (one String column) into the ``in`` dir."""
+    _write_file_at(in_fd, CODE_FILE, code.encode("utf-8"))
+    buffer = io.BytesIO()
+    pl.DataFrame({COLUMN: values}).write_parquet(buffer)
+    _write_file_at(in_fd, VALUES_FILE, buffer.getvalue())
+
+
+def _verify_mount_paths(work: _WorkDir) -> None:
+    """The bind-mount path strings must still name the directories we hold open."""
+    for sub, fd in (("in", work.in_fd), ("out", work.out_fd)):
+        held = os.fstat(fd)
+        try:
+            seen = os.stat(work.path / sub)
+        except OSError:
+            seen = None
+        if seen is None or (seen.st_dev, seen.st_ino) != (held.st_dev, held.st_ino):
+            raise SandboxError(f"sandbox work dir {work.path} changed under us; refusing to run")
+
+
+def _rmtree_at(parent_fd: int, name: str) -> None:
+    """Remove ``name`` under ``parent_fd`` without following symlinks, unlocking dirs as needed.
+
+    Runs after the container is gone, so nothing races the lstat → chmod of a locked directory.
+    """
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except PermissionError:  # the container made it mode 000: it is a real dir (lstat above)
+        os.chmod(name, 0o700, dir_fd=parent_fd)
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        os.fchmod(fd, 0o700)  # write permission to unlink the entries
+        for entry in os.listdir(fd):
+            _rmtree_at(fd, entry)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _remove_workdir(work: _WorkDir) -> None:
+    """Delete a per-run directory (fd-relative) and close its descriptors."""
+    try:
+        _rmtree_at(work.root_fd, work.name)
     except FileNotFoundError:
         pass
     except OSError:
-        log.exception("could not remove sandbox work dir %s", path)
+        log.exception("could not remove sandbox work dir %s", work.path)
+    finally:
+        work.close()
 
 
 # --- container -----------------------------------------------------------------------------
@@ -324,30 +407,31 @@ def _container_kwargs(workdir: Path, name: str) -> dict[str, Any]:
 
 
 def _run_container(
-    client: docker.DockerClient, workdir: Path, expected_len: int, timeout_s: int
+    client: docker.DockerClient, work: _WorkDir, expected_len: int, timeout_s: int
 ) -> pl.Series | str:
     """Run the container; return the output series or the reason it failed."""
-    name = f"sluice-sandbox-{workdir.name}"
-    out_dir = workdir / "out"
+    name = f"sluice-sandbox-{work.name}"
+    out_fd = work.out_fd
     container: Any = None
     try:
+        _verify_mount_paths(work)
         try:
-            container = client.containers.run(SANDBOX_IMAGE, **_container_kwargs(workdir, name))
+            container = client.containers.run(SANDBOX_IMAGE, **_container_kwargs(work.path, name))
         except docker.errors.ImageNotFound as exc:
             raise SandboxError(
                 f"sandbox image {SANDBOX_IMAGE} not found: run `make sandbox-image`"
             ) from exc
-        exit_code, reason = _wait(container, out_dir, timeout_s)
+        exit_code, reason = _wait(container, out_fd, timeout_s)
         if reason is not None:
             return reason
-        if _out_size_exceeds(out_dir, SANDBOX_OUTPUT_MAX_BYTES):  # written after the last poll
+        if _out_size_exceeds(out_fd, SANDBOX_OUTPUT_MAX_BYTES):  # written after the last poll
             return f"output exceeded the {SANDBOX_OUTPUT_MAX_BYTES} byte limit"
-        return _collect(container, out_dir, exit_code, expected_len)
+        return _collect(container, out_fd, exit_code, expected_len)
     finally:
         _remove_container(client, container, name)
 
 
-def _wait(container: Any, out_dir: Path, timeout_s: int) -> tuple[int, str | None]:
+def _wait(container: Any, out_fd: int, timeout_s: int) -> tuple[int, str | None]:
     """Wait for the container to stop; kill it on timeout or when its output grows too large."""
     deadline = time.monotonic() + timeout_s
     unreachable = False
@@ -371,7 +455,7 @@ def _wait(container: Any, out_dir: Path, timeout_s: int) -> tuple[int, str | Non
             unreachable = not _is_read_timeout(exc)
             if unreachable:  # refused at once: back off instead of spinning
                 time.sleep(min(POLL_INTERVAL_S, max(deadline - time.monotonic(), 0)))
-        if _out_size_exceeds(out_dir, SANDBOX_OUTPUT_MAX_BYTES):
+        if _out_size_exceeds(out_fd, SANDBOX_OUTPUT_MAX_BYTES):
             _kill(container)
             return -1, f"output exceeded the {SANDBOX_OUTPUT_MAX_BYTES} byte limit"
 
@@ -392,35 +476,42 @@ def _remove_container(client: docker.DockerClient, container: Any, name: str) ->
         log.exception("could not remove sandbox container %s", name)
 
 
-def _out_size_exceeds(out_dir: Path, limit: int) -> bool:
+def _out_size_exceeds(out_fd: int, limit: int) -> bool:
+    """Total size of the out dir, fd-relative and without following links.
+
+    A subdirectory the host cannot list (the container locked it) could hide any amount of
+    data, so it counts as exceeding the limit.
+    """
+    unreadable: list[OSError] = []
     total = 0
     entries = 0
-    for dirpath, dirnames, filenames in os.walk(out_dir, followlinks=False):
+    walk = os.fwalk(".", dir_fd=out_fd, follow_symlinks=False, onerror=unreadable.append)
+    for _, dirnames, filenames, dir_fd in walk:
         for entry in (*dirnames, *filenames):
             entries += 1
             with contextlib.suppress(OSError):
-                total += os.lstat(os.path.join(dirpath, entry)).st_size
+                total += os.stat(entry, dir_fd=dir_fd, follow_symlinks=False).st_size
             if total > limit or entries > MAX_OUT_ENTRIES:
                 return True
-    return False
+    return bool(unreadable)
 
 
 # --- results -------------------------------------------------------------------------------
 
 
-def _collect(container: Any, out_dir: Path, exit_code: int, expected_len: int) -> pl.Series | str:
+def _collect(container: Any, out_fd: int, exit_code: int, expected_len: int) -> pl.Series | str:
     with contextlib.suppress(docker.errors.APIError):
         container.reload()
     state = (getattr(container, "attrs", None) or {}).get("State") or {}
     if state.get("OOMKilled"):
         return f"memory limit exceeded ({SANDBOX_MEM_MB} MiB): the container was OOM-killed"
     try:
-        error_bytes = _read_regular(out_dir / ERROR_FILE, MAX_ERROR_CHARS * 4)
+        error_bytes = _read_regular(out_fd, ERROR_FILE, MAX_ERROR_CHARS * 4)
         if error_bytes is not None:
             return error_bytes.decode("utf-8", errors="replace")[:MAX_ERROR_CHARS]
         if exit_code != 0:
             return f"sandbox exited with exit code {exit_code}: {_logs_tail(container)}"
-        return _read_output(out_dir / VALUES_FILE, expected_len)
+        return _read_output(out_fd, expected_len)
     except _Rejected as exc:
         return str(exc)
 
@@ -433,21 +524,21 @@ def _logs_tail(container: Any) -> str:
     return raw[-MAX_ERROR_CHARS:].decode("utf-8", errors="replace")
 
 
-def _read_regular(path: Path, limit: int, *, truncate: bool = True) -> bytes | None:
+def _read_regular(dir_fd: int, name: str, limit: int, *, truncate: bool = True) -> bytes | None:
     """Read at most ``limit`` bytes of a regular file without following links or blocking.
 
     Returns ``None`` when the file does not exist. Raises :class:`_Rejected` for symlinks, FIFOs,
     devices and directories, and, unless ``truncate``, for files larger than ``limit``.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
     except OSError as exc:  # ELOOP: a symlink
-        raise _Rejected(f"{path.name} is not a regular file") from exc
+        raise _Rejected(f"{name} is not a regular file") from exc
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _Rejected(f"{path.name} is not a regular file")
+            raise _Rejected(f"{name} is not a regular file")
         chunks: list[bytes] = []
         remaining = limit if truncate else limit + 1  # one extra byte detects "too large"
         while remaining > 0:
@@ -464,9 +555,9 @@ def _read_regular(path: Path, limit: int, *, truncate: bool = True) -> bytes | N
     return data
 
 
-def _read_output(path: Path, expected_len: int) -> pl.Series:
+def _read_output(out_fd: int, expected_len: int) -> pl.Series:
     """Validate and load ``values.parquet``: uncompressed, one String column, right length."""
-    data = _read_regular(path, SANDBOX_OUTPUT_MAX_BYTES, truncate=False)
+    data = _read_regular(out_fd, VALUES_FILE, SANDBOX_OUTPUT_MAX_BYTES, truncate=False)
     if data is None:
         raise _Rejected("transform produced no output (values.parquet missing)")
     try:
