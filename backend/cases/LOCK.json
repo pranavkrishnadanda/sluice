@@ -1,0 +1,10 @@
+{
+  "dev": {
+    "n_cases": 300,
+    "sha256": "60fdf3dfde1b9eb0fdebeabca2a067d6688c8db4f641bd34d9240ecaab5e5984"
+  },
+  "holdout": {
+    "n_cases": 300,
+    "sha256": "c2ff9f295dbeee6f43f27d7f9a2c106be17ca4cfce568f9d9e04baca6c562a75"
+  }
+}
