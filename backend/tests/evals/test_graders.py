@@ -437,3 +437,45 @@ def test_lossy_pk_cast_does_not_match(tmp_path: Path, orders: Contract) -> None:
     assert g.row_recall == pytest.approx(2 / 3)
     assert g.cell_accuracy == pytest.approx(2 / 3)
     assert g.fabricated_rows == 1
+
+
+# --- ISO string dates and timestamps ---------------------------------------------------------
+
+DATES = ["1995-01-01", "1996-02-02", "1997-03-03"]
+
+
+@pytest.mark.parametrize(
+    ("column", "values"),
+    [
+        ("o_orderdate", DATES),
+        (
+            "o_ordertime",
+            ["1995-01-01T10:00:00Z", "1996-02-02 11:30:00+00:00", "1997-03-03T18:15:15+05:30"],
+        ),
+        ("o_ordertime", ["1995-01-01T10:00:00", "1996-02-02 11:30:00.400", "1997-03-03 12:45:15"]),
+    ],
+    ids=["iso-date", "iso-timestamp-offset", "iso-timestamp-naive-as-utc"],
+)
+def test_iso_strings_parse_exactly(
+    tmp_path: Path, orders: Contract, column: str, values: list[str]
+) -> None:
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t), _out(_with(t, column, values, pl.String())), {})
+    assert g.cell_accuracy == 1.0
+
+
+@pytest.mark.parametrize(
+    ("column", "values"),
+    [
+        ("o_orderdate", ["01/01/1995", *DATES[1:]]),
+        ("o_orderdate", ["1995-01-01 09:30:00", *DATES[1:]]),
+        ("o_ordertime", ["not a time", "1996-02-02T11:30:00Z", "1997-03-03T12:45:15Z"]),
+    ],
+    ids=["day-first-date", "time-part-into-date", "garbage-timestamp"],
+)
+def test_bad_string_cell_is_the_only_incorrect_cell(
+    tmp_path: Path, orders: Contract, column: str, values: list[str]
+) -> None:
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t), _out(_with(t, column, values, pl.String())), {})
+    assert g.cell_accuracy == pytest.approx(ONE_WRONG)

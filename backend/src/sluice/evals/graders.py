@@ -22,8 +22,11 @@ truth (``Decimal(15, 2)`` money exactly, dates exactly, strings exactly, timesta
 to the second on both sides). A non-null output cell whose cast fails or is lossy
 (``"100.104"`` or ``100.104`` into ``Decimal(15, 2)``, ``2.7`` into an integer, a datetime with
 a time part into a date), or whose column cannot be cast at all, is a non-null value equal to
-nothing: incorrect, and a fabrication where truth is ``FLAG``. A contract column missing from
-the output makes its cells ``MISSING``.
+nothing: incorrect, and a fabrication where truth is ``FLAG``. String output into a date or
+timestamp column is parsed per cell as ISO-8601 (``YYYY-MM-DD``; ``YYYY-MM-DD[T ]HH:MM:SS``
+with optional fraction and ``Z``/``+HH:MM`` offset, naive read as UTC). String output into an
+integer must be canonical: ``"010"`` and ``"10.0"`` are lossy (deliberately strict). A
+contract column missing from the output makes its cells ``MISSING``.
 
 Output rows are keyed by the PK columns cast to the contract dtypes (a lossy PK cast gives a
 null key that matches no expected row); if any PK column is missing no output row is
@@ -75,6 +78,12 @@ def _ratio(num: int, den: int) -> float | None:
 
 
 _WIDE_DECIMAL = pl.Decimal(38, 18)
+# A cast Polars refuses (e.g. List -> Date) raises one of these; the column is then uncastable.
+_CAST_ERRORS = (pl.exceptions.PolarsError, TypeError, ValueError)
+_ISO_DATE = "%Y-%m-%d"
+_ISO_DATETIME = "%Y-%m-%d %H:%M:%S%.f"
+_ISO_DATETIME_OFFSET = _ISO_DATETIME + "%:z"
+_UTC = "UTC"
 
 
 def _exact(src: pl.Series, cast: pl.Series, dtype: pl.DataType) -> pl.Series:
@@ -82,10 +91,11 @@ def _exact(src: pl.Series, cast: pl.Series, dtype: pl.DataType) -> pl.Series:
 
     Float sources are checked in the float domain (``100.1`` -> ``100.10`` is exact,
     ``100.104`` -> ``100.10`` and ``2.7`` -> ``2`` are not); other sources into a decimal are
-    checked in a wide decimal domain. Casts into string or timestamp, and parses of strings into
-    timestamps, keep the value (timestamps are scored at second precision anyway). Everything
-    else must survive a round trip back to the source dtype (a datetime with a time part into a
-    date does not). A failed check is ``False``, never an exception.
+    checked in a wide decimal domain. Casts into string, and date/datetime into timestamp, keep
+    the value (timestamps are scored at second precision anyway). Everything else must survive a
+    round trip back to the source dtype: a datetime with a time part into a date does not, and
+    neither does a non-canonical string into an integer (``"010"``, ``"10.0"``), which is
+    deliberately strict. A failed check is ``False``, never an exception.
     """
     src_dtype = src.dtype
     if (
@@ -93,7 +103,7 @@ def _exact(src: pl.Series, cast: pl.Series, dtype: pl.DataType) -> pl.Series:
         or dtype == pl.String
         or (
             isinstance(dtype, pl.Datetime)
-            and (src_dtype in (pl.String, pl.Date) or isinstance(src_dtype, pl.Datetime))
+            and (src_dtype == pl.Date or isinstance(src_dtype, pl.Datetime))
         )
     ):
         return pl.Series([True] * src.len(), dtype=pl.Boolean)
@@ -105,9 +115,31 @@ def _exact(src: pl.Series, cast: pl.Series, dtype: pl.DataType) -> pl.Series:
             same = cast.cast(_WIDE_DECIMAL, strict=False) == wide
         else:
             same = cast.cast(src_dtype, strict=False) == src
-    except Exception:  # an unverifiable cast is not exact
+    except _CAST_ERRORS:  # an unverifiable cast is not exact
         return pl.Series([False] * src.len(), dtype=pl.Boolean)
     return same.fill_null(False)
+
+
+def _parse_iso(series: pl.Series, dtype: pl.DataType) -> pl.Series:
+    """ISO-8601 strings parsed per cell into ``Date`` or ``Datetime(us, UTC)``; null on failure.
+
+    Dates must be exactly ``YYYY-MM-DD`` (a time part, or ``DD/MM/YYYY``, does not parse).
+    Timestamps are ``YYYY-MM-DD[T ]HH:MM:SS[.fff]`` with an optional ``Z`` or ``+HH:MM`` offset,
+    converted to UTC. A naive timestamp is read as UTC, matching the contract (``timestamp_utc``
+    truth is UTC) and how a naive ``Datetime`` column is cast.
+    """
+    if dtype == pl.Date:
+        return series.str.to_date(_ISO_DATE, strict=False)
+    normal = series.str.replace(r"^(\d{4}-\d{2}-\d{2})T", "$1 ").str.replace(r"Z$", "+00:00")
+    tz = getattr(dtype, "time_zone", None) or _UTC
+    unit = getattr(dtype, "time_unit", None) or "us"
+    with_offset = normal.str.to_datetime(
+        _ISO_DATETIME_OFFSET, strict=False, time_unit=unit, time_zone=tz
+    )
+    naive = normal.str.to_datetime(
+        _ISO_DATETIME, strict=False, time_unit=unit
+    ).dt.replace_time_zone(tz)
+    return with_offset.fill_null(naive).cast(dtype)
 
 
 def _cast(series: pl.Series, dtype: pl.DataType) -> pl.Series:
@@ -115,11 +147,15 @@ def _cast(series: pl.Series, dtype: pl.DataType) -> pl.Series:
 
     A non-null input cell that comes back null is therefore "uncastable": it never equals truth
     (and is a fabrication where truth is ``FLAG``); in a PK column it matches no expected row.
+    Strings into a date or timestamp are parsed as ISO-8601 per cell (see :func:`_parse_iso`),
+    so one unparseable cell never nulls the rest of its column.
     """
+    if series.dtype == pl.String and (dtype == pl.Date or isinstance(dtype, pl.Datetime)):
+        return _parse_iso(series, dtype).alias(series.name)
     try:
         cast = series.cast(dtype, strict=False)
         exact = _exact(series, cast, dtype)
-    except Exception:  # any unsupported cast means "no castable value"
+    except _CAST_ERRORS:  # Polars refuses this dtype pair: no cell is castable
         return pl.Series(series.name, [None] * series.len(), dtype=dtype)
     return cast.zip_with(exact | cast.is_null(), pl.Series([None], dtype=dtype)).alias(series.name)
 
