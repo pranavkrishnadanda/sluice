@@ -65,6 +65,8 @@ _TS_RE = re.compile(
 )
 _DMY_FORMAT = "%d/%m/%Y"
 _FLAG_PREFIX = "__flag__"
+_ROW_INDEX = "__row__"
+_FLAG_COUNT = "__n_flags__"
 
 # Why a cell became null + flagged.
 SENTINEL = "sentinel"
@@ -313,12 +315,23 @@ def _drop_unkeyed(
 
 
 def _dedupe(frame: pl.DataFrame, contract: Contract, actions: list[str]) -> pl.DataFrame:
-    """Rule 10. A row counts as an exact duplicate only if its flags match too, so a
-    null + flagged cell and a genuinely null cell are never collapsed into one another."""
+    """Rule 10: exact duplicates (data and flags) first, then one row per PK, preferring the
+    row that carries the most flags."""
     exact = frame.unique(keep="first", maintain_order=True)  # data and flag columns
     if n := frame.height - exact.height:
         actions.append(f"dropped {n} exact duplicate row(s)")
-    by_pk = exact.unique(subset=list(contract.primary_key), keep="first", maintain_order=True)
+    # Among rows sharing a PK keep the one with the most flags (earliest on ties), so a
+    # null + flagged cell is never replaced by a look-alike null that carries no flag. The
+    # sort is stable and the original row order is restored afterwards: deterministic.
+    flag_cols = [_flag_col(c.name) for c in contract.columns]
+    by_pk = (
+        exact.with_row_index(_ROW_INDEX)
+        .with_columns(pl.sum_horizontal(flag_cols).alias(_FLAG_COUNT))
+        .sort([_FLAG_COUNT, _ROW_INDEX], descending=[True, False])
+        .unique(subset=list(contract.primary_key), keep="first", maintain_order=True)
+        .sort(_ROW_INDEX)
+        .drop(_ROW_INDEX, _FLAG_COUNT)
+    )
     if n := exact.height - by_pk.height:
         actions.append(f"dropped {n} row(s) repeating an earlier primary key")
     return by_pk

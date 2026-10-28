@@ -402,3 +402,17 @@ def test_rules_unkeyed_rows_counted_in_meta(orders: Contract, orders20, tmp_path
 def test_rules_meta_dropped_unkeyed_rows_zero_by_default(orders: Contract, orders20, tmp_path):
     path = write_input(orders20, tmp_path / "input", "csv", "utf-8")
     assert RulesOnlySystem().run(CaseInput(path, orders, {})).meta["dropped_unkeyed_rows"] == 0
+
+
+def test_rules_dedupe_prefers_flagged_row_even_when_second(orders: Contract, orders20, tmp_path):
+    # Same PK: a genuinely null cell first, a null + flagged cell second -> the flag survives.
+    cols = tuple(
+        ColumnSpec(c.name, c.dtype, True) if c.name == "o_custkey" else c for c in orders.columns
+    )
+    nullable = Contract(orders.name, orders.version, orders.primary_key, cols)
+    text = _as_csv(orders20, tmp_path)
+    true_null = _set(text[:1], "o_custkey", [None])
+    bad = _set(text[:1], "o_custkey", ["abc"])
+    out = _run(pl.concat([true_null, bad, text[1:]]), nullable)
+    assert out.flags == {(_pk(orders20, 0, orders), "o_custkey")}
+    assert out.df["o_orderkey"].to_list() == orders20["o_orderkey"].to_list()  # order kept
