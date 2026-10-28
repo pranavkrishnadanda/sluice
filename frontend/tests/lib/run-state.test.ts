@@ -68,6 +68,8 @@ describe("reduceRunEvents", () => {
       attempt: 1,
       maxAttempts: 3,
       error: "contract check failed: 14 rows in paise",
+      tokens: 0,
+      costUsd: 0,
     });
     expect(s2.nodes[0]).toMatchObject({
       status: "retrying",
@@ -115,6 +117,60 @@ describe("reduceRunEvents", () => {
     expect(s4.finished).toBe(false);
   });
 
+  test("a node's spend sums every attempt, failed ones included", () => {
+    const s = reduceAll([
+      started,
+      plan,
+      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+      {
+        seq: 4,
+        at: AT,
+        type: "attempt_failed",
+        nodeId: "n1",
+        attempt: 1,
+        maxAttempts: 3,
+        error: "contract check failed: 14 rows in paise",
+        tokens: 1480,
+        costUsd: 0.0011,
+      },
+    ]);
+    expect(s?.nodes[0]).toMatchObject({ tokens: 1480, costUsd: 0.0011 });
+    expect(s?.totals).toMatchObject({ tokens: 1480, costUsd: 0.0011 });
+
+    const done = reduceAll([
+      ...[started, plan],
+      { seq: 3, at: AT, type: "node_started", nodeId: "n1", attempt: 1 },
+      {
+        seq: 4,
+        at: AT,
+        type: "attempt_failed",
+        nodeId: "n1",
+        attempt: 1,
+        maxAttempts: 3,
+        error: "contract check failed: 14 rows in paise",
+        tokens: 1480,
+        costUsd: 0.0011,
+      },
+      { seq: 5, at: AT, type: "node_started", nodeId: "n1", attempt: 2 },
+      {
+        seq: 6,
+        at: AT,
+        type: "node_finished",
+        nodeId: "n1",
+        attempt: 2,
+        tier: "strong",
+        tokens: 3120,
+        costUsd: 0.0186,
+        latencyMs: 2140,
+        transformId: "t-n1-2",
+      },
+    ]);
+    expect(done?.nodes[0]?.tokens).toBe(4600);
+    expect(done?.nodes[0]?.costUsd).toBeCloseTo(0.0197, 10);
+    expect(done?.totals.tokens).toBe(4600);
+    expect(done?.totals.costUsd).toBeCloseTo(0.0197, 10);
+  });
+
   test("attempt_failed on the last attempt marks the node failed", () => {
     const s = reduceAll([
       started,
@@ -128,6 +184,8 @@ describe("reduceRunEvents", () => {
         attempt: 3,
         maxAttempts: 3,
         error: "boom",
+        tokens: 0,
+        costUsd: 0,
       },
     ]);
     expect(s?.nodes[0]?.status).toBe("failed");

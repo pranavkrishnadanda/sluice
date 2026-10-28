@@ -100,6 +100,8 @@ export const RUN_REPAIRED_EVENTS = buildEvents(RUN_REPAIRED.createdAt, [
       attempt: 1,
       maxAttempts: 3,
       error: "contract check failed: 14 rows in paise",
+      tokens: 1_480,
+      costUsd: 0.0011,
     },
   ],
   [30, { type: "node_started", nodeId: "n1", attempt: 2 }],

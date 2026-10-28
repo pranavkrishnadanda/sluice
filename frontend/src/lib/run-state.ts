@@ -22,6 +22,7 @@ export interface NodeViewState {
   maxAttempts: number | null;
   /** Planned tier, replaced by the tier that actually produced the result. */
   tier: ModelTier;
+  /** Spend summed over every attempt of this node, failed ones included. */
   costUsd: number;
   tokens: number;
   latencyMs: number | null;
@@ -51,8 +52,9 @@ export interface RunViewState {
     snapshotId: string;
   } | null;
   /**
-   * Running totals from `node_finished`; replaced by the authoritative
-   * `run_finished` figures (which include failed attempts).
+   * Running totals: spend from every attempt (`attempt_failed` and
+   * `node_finished`) plus accepted-attempt latency; cost and tokens are
+   * replaced by the authoritative `run_finished` figures.
    */
   totals: { costUsd: number; tokens: number; latencyMs: number };
   summary: string | null;
@@ -134,6 +136,30 @@ function onNodeFinished(
   };
 }
 
+function onAttemptFailed(
+  state: RunViewState,
+  e: RunEventOf<"attempt_failed">,
+): Partial<RunViewState> {
+  const known = state.nodes.some((n) => n.id === e.nodeId);
+  return {
+    nodes: updateNode(state, e.nodeId, (n) => ({
+      status: e.attempt < e.maxAttempts ? "retrying" : "failed",
+      attempt: e.attempt,
+      maxAttempts: e.maxAttempts,
+      lastError: e.error,
+      costUsd: n.costUsd + e.costUsd,
+      tokens: n.tokens + e.tokens,
+    })),
+    totals: known
+      ? {
+          ...state.totals,
+          costUsd: state.totals.costUsd + e.costUsd,
+          tokens: state.totals.tokens + e.tokens,
+        }
+      : state.totals,
+  };
+}
+
 function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
   switch (e.type) {
     case "run_started":
@@ -163,14 +189,7 @@ function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
         })),
       };
     case "attempt_failed":
-      return {
-        nodes: updateNode(state, e.nodeId, () => ({
-          status: e.attempt < e.maxAttempts ? "retrying" : "failed",
-          attempt: e.attempt,
-          maxAttempts: e.maxAttempts,
-          lastError: e.error,
-        })),
-      };
+      return onAttemptFailed(state, e);
     case "node_finished":
       return onNodeFinished(state, e);
     case "verified":

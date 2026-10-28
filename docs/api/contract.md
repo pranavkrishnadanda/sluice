@@ -46,7 +46,8 @@ export type RunEvent = EventBase & (
   | { type: "rules_applied"; actions: string[] }
   | { type: "plan_created"; nodes: PlanNode[] }
   | { type: "node_started"; nodeId: string; attempt: number }
-  | { type: "attempt_failed"; nodeId: string; attempt: number; maxAttempts: number; error: string }
+  | { type: "attempt_failed"; nodeId: string; attempt: number; maxAttempts: number; error: string;
+      tokens: number; costUsd: number }
   | { type: "node_finished"; nodeId: string; attempt: number; tier: ModelTier; tokens: number;
       costUsd: number; latencyMs: number; transformId: string }
   | { type: "verified"; checksPassed: number; checksTotal: number }
@@ -135,5 +136,7 @@ deterministic rules handled everything and no model was called.
 
 `node_finished.tier` is the tier that produced the accepted transform, which
 may be higher than the planned `PlanNode.tier` after escalation.
+`attempt_failed.tokens` / `costUsd` are the spend of that failed attempt.
 `run_finished.costUsd` / `tokens` are the run totals, including failed
-attempts.
+attempts: they equal the sum of every `node_finished` and `attempt_failed`
+`tokens` / `costUsd` in the run.

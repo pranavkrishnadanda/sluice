@@ -71,6 +71,9 @@ export type RunEvent = EventBase &
         attempt: number;
         maxAttempts: number;
         error: string;
+        /** Spend of the failed attempt; counted in `run_finished` totals. */
+        tokens: number;
+        costUsd: number;
       }
     | {
         type: "node_finished";
