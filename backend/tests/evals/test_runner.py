@@ -336,6 +336,7 @@ def test_cli_eval_and_results(small_cases: Path, tmp_path: Path) -> None:
     )
     out = tmp_path / "RESULTS.md"
     args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 0, res.output
     assert sha in out.read_text(encoding="utf-8")
@@ -371,6 +372,7 @@ def test_cli_results_refuses_cases_not_matching_lock(tmp_path: Path) -> None:
     lock.write_text(json.dumps(LOCK), encoding="utf-8")
     out = tmp_path / "RESULTS.md"
     args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 1
     assert not out.exists()
@@ -380,6 +382,7 @@ def test_cli_results_without_runs_fails(tmp_path: Path) -> None:
     lock = tmp_path / "LOCK.json"
     lock.write_text(json.dumps(LOCK), encoding="utf-8")
     args = ["results", "--runs-dir", str(tmp_path / "none"), "--lock", str(lock)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     args += ["--out", str(tmp_path / "RESULTS.md")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 1
@@ -582,3 +585,149 @@ def test_render_results_intro_names_the_exact_binomial_method() -> None:
 def test_render_results_labels_the_case_build_environment() -> None:
     md = render_results([_summary()], LOCK)
     assert "- Case-build environment (from `LOCK.json`): duckdb 2.0.0, polars 2.1.0" in md
+
+
+# --- --limit (subset runs, Ruling P3) ---------------------------------------------------------
+
+
+def test_run_eval_limit_takes_first_cases_by_id(small_cases: Path, tmp_path: Path) -> None:
+    s = run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=2)
+    ids = [r["case_id"] for r in _lines(tmp_path / "out" / "results.jsonl")]
+    assert ids == sorted(c.case_id for c in load_split(small_cases))[:2]
+    assert (s.n_cases, s.limit) == (2, 2)
+
+
+def test_run_eval_limit_records_subset_and_full_split_hash(
+    small_cases: Path, tmp_path: Path
+) -> None:
+    run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=2)
+    raw = json.loads((tmp_path / "out" / "summary.json").read_text(encoding="utf-8"))
+    cases = sorted(load_split(small_cases), key=lambda c: c.case_id)
+    assert raw["limit"] == 2
+    assert raw["cases_sha256"] == split_hash(cases[:2])
+    assert raw["split_sha256"] == split_hash(cases)
+    assert load_summary(tmp_path / "out" / "summary.json").limit == 2
+
+
+def test_run_eval_limit_larger_than_split_is_whole_split(small_cases: Path, tmp_path: Path) -> None:
+    s = run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=100)
+    assert s.n_cases == 6
+    assert s.limit is None
+
+
+def test_run_eval_rejects_zero_limit(small_cases: Path, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=0)
+
+
+def test_render_results_marks_subset_runs() -> None:
+    md = render_results([_summary(system="agent", limit=2), _summary()], LOCK)
+    assert "| agent | dev (subset n=2) | 2 |" in md
+    assert "| rules | dev | 2 |" in md
+    assert "--system agent --split dev --trials 1 --limit 2" in md
+    assert "first 2 cases by id" in md
+
+
+def test_render_results_without_limit_is_unchanged_by_subset_support() -> None:
+    md = render_results([_summary()], LOCK)
+    assert "subset" not in md and "--limit" not in md
+
+
+def test_systems_registry_has_agent() -> None:
+    from sluice.systems.agent import AgentSystem
+
+    assert SYSTEMS["agent"] is AgentSystem
+
+
+def test_cli_eval_limit_and_results_accept_subset(small_cases: Path, tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    run_dir = runs / "20261028T120000Z-rules-dev"
+    res = CliRunner().invoke(
+        app,
+        ["eval", "--system", "rules", "--split", "dev", "--limit", "3"]
+        + ["--cases-dir", str(small_cases.parent), "--out-dir", str(run_dir)],
+    )
+    assert res.exit_code == 0, res.output
+    assert "3 cases" in res.output
+    lock = tmp_path / "LOCK.json"
+    sha = split_hash(load_split(small_cases))
+    lock.write_text(
+        json.dumps({"environment": LOCK["environment"], "splits": {"dev": {"sha256": sha}}}),
+        encoding="utf-8",
+    )
+    out = tmp_path / "RESULTS.md"
+    args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
+    res = CliRunner().invoke(app, args)
+    assert res.exit_code == 0, res.output
+    assert "dev (subset n=3)" in out.read_text(encoding="utf-8")
+
+
+def test_cli_eval_rejects_zero_limit(small_cases: Path, tmp_path: Path) -> None:
+    res = CliRunner().invoke(
+        app,
+        ["eval", "--system", "rules", "--split", "dev", "--limit", "0"]
+        + ["--cases-dir", str(small_cases.parent), "--out-dir", str(tmp_path / "r")],
+    )
+    assert res.exit_code != 0
+
+
+# --- final review I-4 / Ruling F4: (system, split, limit) keys and published summaries -------
+
+
+def _put(root: Path, name: str, s: EvalSummary, sha: str = "abc123") -> None:
+    (root / name).mkdir(parents=True)
+    if s.limit is None:
+        s.write(root / name / "summary.json", cases_sha256=sha)
+    else:
+        s.write(root / name / "summary.json", cases_sha256="subset-hash", split_sha256=sha)
+
+
+def test_latest_summaries_keeps_full_and_subset_runs_apart(tmp_path: Path) -> None:
+    _put(tmp_path, "20261027T000000Z-rules-dev", _summary(n_cases=300))
+    _put(tmp_path, "20261028T000000Z-rules-dev", _summary(n_cases=30, limit=30))
+    got = latest_summaries(tmp_path)
+    assert [(s.system, s.limit, s.n_cases) for s, _ in got] == [
+        ("rules", None, 300),
+        ("rules", 30, 30),
+    ]
+    assert all(sha == "abc123" for _, sha in got)
+
+
+def test_latest_summaries_published_wins_for_agent_and_subset_rows(tmp_path: Path) -> None:
+    runs, published = tmp_path / "runs", tmp_path / "published"
+    _put(runs, "20261028T000000Z-rules-dev", _summary(n_cases=300))
+    _put(runs, "20261028T000001Z-agent-dev", _summary("agent", n_cases=7, limit=30))
+    _put(runs, "20261028T000002Z-rules-dev", _summary(n_cases=8, limit=30))
+    _put(published, "20261001T000000Z-rules-dev", _summary(n_cases=299))
+    _put(published, "20261001T000001Z-agent-dev", _summary("agent", n_cases=30, limit=30))
+    _put(published, "20261001T000002Z-rules-dev", _summary(n_cases=30, limit=30))
+    got = latest_summaries(runs, published)
+    assert [(s.system, s.limit, s.n_cases) for s, _ in got] == [
+        ("agent", 30, 30),  # published
+        ("rules", None, 300),  # fresh: the full rules row is always reproduced
+        ("rules", 30, 30),  # published: an explicit subset row
+    ]
+
+
+def test_latest_summaries_published_fills_a_missing_rules_row(tmp_path: Path) -> None:
+    published = tmp_path / "published"
+    _put(published, "20261001T000000Z-rules-dev", _summary(n_cases=299))
+    (published / "README.md").write_text("not a run\n", encoding="utf-8")
+    got = latest_summaries(tmp_path / "runs", published)
+    assert [(s.system, s.n_cases) for s, _ in got] == [("rules", 299)]
+
+
+def test_cli_results_renders_fresh_rules_and_published_agent_rows(tmp_path: Path) -> None:
+    runs, published = tmp_path / "runs", tmp_path / "published"
+    _put(runs, "20261028T000000Z-rules-dev", _summary())
+    _put(published, "20261001T000000Z-agent-dev", _summary("agent", limit=2))
+    lock = tmp_path / "LOCK.json"
+    lock.write_text(json.dumps(LOCK), encoding="utf-8")
+    out = tmp_path / "RESULTS.md"
+    args = ["results", "--runs-dir", str(runs), "--published-dir", str(published)]
+    res = CliRunner().invoke(app, [*args, "--lock", str(lock), "--out", str(out)])
+    assert res.exit_code == 0, res.output
+    md = out.read_text(encoding="utf-8")
+    assert "| rules | dev | 2 |" in md
+    assert "| agent | dev (subset n=2) | 2 |" in md

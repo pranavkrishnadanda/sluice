@@ -220,7 +220,11 @@ backend/tests/{llm,sandbox,agent,integration}/...
 
 - [ ] **Step 1:** `make sandbox-image && make test-integration` PASS; `uv run python -m pytest -m live` PASS.
 - [ ] **Step 2:** `cd backend && PYTHONPATH=src uv run sluice eval --system agent --split dev --trials 1 --limit 30`, the same for `rules`, then `sluice results`. RESULTS.md shows both rows on the same 30 cases with cost and the subset size. Fabrication must be 0.0 — if not, stop and report the cases.
-- [ ] **Step 3:** Report: models used, cache hit rate on a second run (expect ≈ 100%, $0), total spend, failures by step.
+- [ ] **Step 3:** Report: models used, total spend, failures by step, and the cache hit rate measured with a repeat `sluice run` of one file. Eval trials bypass the LiteLLM response cache (Ruling F3), so a second eval run is not a cache check.
+  - Pick one dev case and run `cd backend && PYTHONPATH=src uv run sluice run <case input> --table <table>`.
+  - A plain repeat is skipped before the pipeline runs, because the file's idempotency key is recorded. So first delete that key row: `docker compose --env-file backend/.env exec postgres psql -U sluice -d sluice -c "DELETE FROM loads WHERE file_sha256 = '<sha256 of the file>'"`.
+  - Then run the same command again. The pipeline runs in full. The loader finds the earlier Iceberg commit in the snapshot ancestry and appends nothing; its summary says "recovered an earlier commit".
+  - Expect ≈ 100% cached calls and $0 on the second run (`tokens` and `costUsd` in its `run_finished`).
 - [ ] **Step 4: Commit** `docs: publish first agent results on a dev subset`
 
 ---

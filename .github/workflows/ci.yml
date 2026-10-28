@@ -29,8 +29,10 @@ jobs:
       - name: Test
         run: make test
 
-      # Rebuild both splits from scratch, check them against LOCK.json, re-run the rules eval and
-      # fail if the published RESULTS.md would change (the run-date footer line is ignored).
+      # Rebuild both splits from scratch, check them against LOCK.json, re-run the full rules
+      # eval, then render RESULTS.md from that fresh rules run plus the committed summaries in
+      # evals/published/ (agent and subset rows, which need model keys; see its README). Fail if
+      # the published RESULTS.md would change (the run-date footer line is ignored).
       - name: Reproduce published results
         run: |
           make cases eval-rules results
