@@ -7,13 +7,14 @@ column to a fresh per-run directory, starts a locked-down container on it and re
 Container hardening (see :func:`_container_kwargs`): no network (``network_disabled`` plus
 ``network_mode="none"``, loopback only), read-only root filesystem, non-root uid 10001, every
 capability dropped, ``no-new-privileges``, memory limit with swap equal to it (no swap spill),
-pids limit, ``nofile`` limit, size-capped ``noexec`` tmpfs at ``/tmp``, empty environment, the
-input mount read-only and only the output mount writable, bounded container logs.
+one CPU, pids limit, ``nofile`` limit, size-capped ``noexec`` tmpfs at ``/tmp``, empty
+environment, the input mount read-only and only the output mount writable, bounded container logs.
 
 Host-side defences against a hostile container:
 
 * wall-clock timeout, then ``kill``; the out mount is polled and the container killed once it
-  holds more than :data:`SANDBOX_OUTPUT_MAX_BYTES` (no disk flooding through the bind mount);
+  holds more than :data:`SANDBOX_OUTPUT_MAX_BYTES` (no disk flooding through the bind mount),
+  and checked once more after the container exits;
 * output files are opened with ``O_NOFOLLOW | O_NONBLOCK`` and must be regular files (a symlink
   to a host file or a FIFO is refused, never followed or blocked on);
 * the output parquet must be uncompressed, one String column ``values`` with the input's length,
@@ -26,11 +27,13 @@ Failures caused by the transform return ``SandboxResult(ok=False, error=...)``. 
 sandbox itself (no Docker daemon, missing image) raise :class:`SandboxError`, so they are not
 blamed on the generated code. Other Docker API errors propagate after cleanup.
 
-Docker daemon: :func:`get_docker_client` tries ``docker.from_env()`` (``DOCKER_HOST`` etc.) and,
-if that fails, the host of the current Docker CLI context (what ``docker context inspect`` shows),
-which is how Colima is found without ``DOCKER_HOST``.
+Docker daemon: :func:`get_docker_client` uses ``docker.from_env()``. An explicit ``DOCKER_HOST``
+is final (unreachable means :class:`SandboxError`); only when it is unset does it fall back to the
+host of the current Docker CLI context (what ``docker context inspect`` shows), which is how
+Colima is found.
 
-Per-run directories live under ``$SLUICE_SANDBOX_DIR`` (default ``~/.cache/sluice/sandbox``).
+Per-run directories live in ``<$SLUICE_SANDBOX_DIR>/sluice-sandbox`` (default
+``~/.cache/sluice/sluice-sandbox``), a 0700 directory the runner owns.
 On Colima a bind-mounted directory must be inside a path shared into the VM; Colima shares
 ``$HOME`` but not ``/private/tmp``, which is why the system temp dir is not used.
 """
@@ -55,11 +58,13 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
+import urllib3
 from docker.context import ContextAPI
 from docker.types import LogConfig, Ulimit
 
 from sluice.agent.caps import (
     MAX_ERROR_CHARS,
+    SANDBOX_CPUS,
     SANDBOX_MEM_MB,
     SANDBOX_OUTPUT_MAX_BYTES,
     SANDBOX_PIDS,
@@ -82,7 +87,10 @@ SANDBOX_IMAGE: Final = "sluice-sandbox:dev"
 WORK_DIR_ENV: Final = "SLUICE_SANDBOX_DIR"
 """Environment variable overriding the root of the per-run directories."""
 
-DEFAULT_WORK_ROOT: Final = Path("~/.cache/sluice/sandbox")
+DEFAULT_WORK_ROOT: Final = Path("~/.cache/sluice")
+
+RUNNER_SUBDIR: Final = "sluice-sandbox"
+"""Directory inside the work root that the runner creates, owns and keeps at mode 0700."""
 
 CONTAINER_LABEL: Final = {"sluice.sandbox": "1"}
 IN_MOUNT: Final = "/work/in"
@@ -102,9 +110,11 @@ DOCKER_API_TIMEOUT_S: Final = 30
 MAX_OUT_ENTRIES: Final = 1_000
 """More entries than this in the out mount counts as exceeding the output limit."""
 
-# What ``container.wait(timeout=...)`` raises while the container is still running (over a unix
-# socket a read timeout surfaces as a ConnectionError).
-_STILL_RUNNING = (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError)
+
+def _is_read_timeout(exc: requests.exceptions.ConnectionError) -> bool:
+    """Over a unix socket, a ``wait(timeout=...)`` read timeout surfaces as a ConnectionError
+    wrapping urllib3's ReadTimeoutError; any other ConnectionError means the daemon is gone."""
+    return any(isinstance(arg, urllib3.exceptions.ReadTimeoutError) for arg in exc.args)
 
 
 class SandboxError(RuntimeError):
@@ -129,26 +139,44 @@ class _Rejected(Exception):
 
 
 def get_docker_client() -> docker.DockerClient:
-    """Connect to the Docker daemon: the environment first, then the current CLI context.
+    """Connect to the Docker daemon.
+
+    An explicit ``DOCKER_HOST`` is honoured and never second-guessed: if it is unreachable this
+    raises rather than sending containers to another daemon. Only when ``DOCKER_HOST`` is unset
+    does it try the default socket and then the host of the current Docker CLI context (how
+    Colima is found).
 
     Raises:
-        SandboxError: neither reaches a daemon.
+        SandboxError: no daemon is reachable (the message never includes the host URL, which
+            may carry credentials).
     """
+    explicit = bool(os.environ.get("DOCKER_HOST"))
     try:
         client = docker.from_env(timeout=DOCKER_API_TIMEOUT_S)
         client.ping()
         return client
     except docker.errors.DockerException as env_error:
+        if explicit:
+            raise SandboxError(
+                "DOCKER_HOST is set but no Docker daemon is reachable there "
+                f"({type(env_error).__name__}); fix or unset DOCKER_HOST"
+            ) from None
         context = ContextAPI.get_current_context()
         host = getattr(context, "Host", None)
         if not host:
-            raise SandboxError(f"Docker daemon not reachable: {env_error}") from env_error
+            raise SandboxError(
+                f"Docker daemon not reachable ({type(env_error).__name__}) and the current "
+                "Docker context names no host"
+            ) from None
         try:
             client = docker.DockerClient(base_url=host, timeout=DOCKER_API_TIMEOUT_S)
             client.ping()
             return client
         except docker.errors.DockerException as ctx_error:
-            raise SandboxError(f"Docker daemon not reachable at {host}: {ctx_error}") from ctx_error
+            raise SandboxError(
+                "Docker daemon of the current Docker context is not reachable "
+                f"({type(ctx_error).__name__})"
+            ) from None
 
 
 def run_transform(
@@ -199,13 +227,29 @@ def run_transform(
 
 
 def _work_root() -> Path:
-    return Path(os.environ.get(WORK_DIR_ENV) or DEFAULT_WORK_ROOT).expanduser().resolve()
+    """The runner-owned ``<$SLUICE_SANDBOX_DIR>/sluice-sandbox`` directory, mode 0700.
+
+    The configured directory itself is created if missing but never chmodded. The subdirectory
+    is refused if it is a symlink, not a directory, or owned by another user.
+    """
+    base = Path(os.environ.get(WORK_DIR_ENV) or DEFAULT_WORK_ROOT).expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    root = base / RUNNER_SUBDIR
+    with contextlib.suppress(FileExistsError):
+        root.mkdir(mode=0o700)
+    info = os.lstat(root)
+    if stat.S_ISLNK(info.st_mode):
+        raise SandboxError(f"sandbox work dir {root} is a symlink; refusing to use it")
+    if not stat.S_ISDIR(info.st_mode):
+        raise SandboxError(f"sandbox work dir {root} is not a directory")
+    if info.st_uid != os.getuid():
+        raise SandboxError(f"sandbox work dir {root} is owned by another user")
+    os.chmod(root, 0o700, follow_symlinks=False)
+    return root
 
 
 def _make_workdir() -> Path:
     root = _work_root()
-    root.mkdir(parents=True, exist_ok=True)
-    root.chmod(0o700)
     workdir = root / uuid.uuid4().hex
     workdir.mkdir(mode=0o700)
     (workdir / "in").mkdir(mode=0o755)
@@ -264,6 +308,7 @@ def _container_kwargs(workdir: Path, name: str) -> dict[str, Any]:
         "mem_limit": mem,
         "memswap_limit": mem,  # equal to mem_limit: no swap on top (memory.swap.max = 0)
         "pids_limit": SANDBOX_PIDS,
+        "nano_cpus": int(SANDBOX_CPUS * 1_000_000_000),
         "ulimits": [Ulimit(name="nofile", soft=NOFILE_LIMIT, hard=NOFILE_LIMIT)],
         "tmpfs": {"/tmp": TMPFS_OPTS},
         "environment": {},
@@ -295,6 +340,8 @@ def _run_container(
         exit_code, reason = _wait(container, out_dir, timeout_s)
         if reason is not None:
             return reason
+        if _out_size_exceeds(out_dir, SANDBOX_OUTPUT_MAX_BYTES):  # written after the last poll
+            return f"output exceeded the {SANDBOX_OUTPUT_MAX_BYTES} byte limit"
         return _collect(container, out_dir, exit_code, expected_len)
     finally:
         _remove_container(client, container, name)
@@ -303,16 +350,27 @@ def _run_container(
 def _wait(container: Any, out_dir: Path, timeout_s: int) -> tuple[int, str | None]:
     """Wait for the container to stop; kill it on timeout or when its output grows too large."""
     deadline = time.monotonic() + timeout_s
+    unreachable = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if unreachable:
+                with contextlib.suppress(Exception):
+                    container.kill()
+                raise SandboxError(
+                    f"Docker daemon unreachable while waiting for the sandbox ({timeout_s}s)"
+                )
             _kill(container)
             return -1, f"timeout: transform did not finish within {timeout_s}s"
         try:
             status = container.wait(timeout=min(POLL_INTERVAL_S, remaining))
             return int(status.get("StatusCode", -1)), None
-        except _STILL_RUNNING:
-            pass
+        except requests.exceptions.ReadTimeout:
+            unreachable = False
+        except requests.exceptions.ConnectionError as exc:
+            unreachable = not _is_read_timeout(exc)
+            if unreachable:  # refused at once: back off instead of spinning
+                time.sleep(min(POLL_INTERVAL_S, max(deadline - time.monotonic(), 0)))
         if _out_size_exceeds(out_dir, SANDBOX_OUTPUT_MAX_BYTES):
             _kill(container)
             return -1, f"output exceeded the {SANDBOX_OUTPUT_MAX_BYTES} byte limit"

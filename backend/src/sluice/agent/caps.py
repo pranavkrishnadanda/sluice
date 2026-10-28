@@ -17,6 +17,9 @@ SANDBOX_TIMEOUT_S: Final = 20
 SANDBOX_MEM_MB: Final = 512
 """Memory limit of the sandbox container, in MiB."""
 
+SANDBOX_CPUS: Final = 1.0
+"""CPUs the sandbox container may use (Docker ``nano_cpus``)."""
+
 SANDBOX_PIDS: Final = 64
 """Process limit of the sandbox container (fork-bomb guard)."""
 

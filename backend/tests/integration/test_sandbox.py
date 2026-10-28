@@ -72,7 +72,8 @@ def isolated(
     yield snapshots
     leftover = client.containers.list(all=True, filters={"label": "sluice.sandbox=1"})
     assert leftover == [], "sandbox container leaked"
-    assert not root.exists() or list(root.iterdir()) == [], "work dir leaked"
+    runner_dir = root / runner.RUNNER_SUBDIR
+    assert not runner_dir.exists() or list(runner_dir.iterdir()) == [], "work dir leaked"
     shutil.rmtree(root, ignore_errors=True)
 
 
@@ -121,7 +122,7 @@ def test_indian_grouping_is_rewritten() -> None:
 
 
 def test_container_identity_and_limits() -> None:
-    """Non-root, no capabilities, no-new-privs, seccomp, cgroup memory/swap/pids limits."""
+    """Non-root, no capabilities, no-new-privs, seccomp, cgroup memory/swap/pids/cpu limits."""
     code = _probe(
         """
 from pathlib import Path
@@ -142,6 +143,7 @@ result = __import__("json").dumps({
     "mem_max": read("memory.max"),
     "swap_max": read("memory.swap.max"),
     "pids_max": read("pids.max"),
+    "cpu_max": read("cpu.max"),
     "nofile": __import__("resource").getrlimit(__import__("resource").RLIMIT_NOFILE),
 })
 """
@@ -157,6 +159,8 @@ result = __import__("json").dumps({
     assert probe["mem_max"] == str(caps.SANDBOX_MEM_MB * 1024 * 1024)
     assert probe["swap_max"] == "0"
     assert probe["pids_max"] == str(caps.SANDBOX_PIDS)
+    quota, period = probe["cpu_max"].split()
+    assert int(quota) / int(period) == caps.SANDBOX_CPUS
     assert probe["nofile"] == [256, 256]
 
 

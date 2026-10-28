@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import requests
+import urllib3
 
 from sluice.agent import caps
 from sluice.sandbox import runner
@@ -112,10 +113,11 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def work_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    root = tmp_path / "sandbox-root"
-    monkeypatch.setenv(runner.WORK_DIR_ENV, str(root))
+    """The runner-owned directory inside ``$SLUICE_SANDBOX_DIR``."""
+    base = tmp_path / "sandbox-base"
+    monkeypatch.setenv(runner.WORK_DIR_ENV, str(base))
     monkeypatch.setattr(runner, "POLL_INTERVAL_S", 0.01)
-    return root
+    return base / runner.RUNNER_SUBDIR
 
 
 def _run(
@@ -162,6 +164,7 @@ def test_run_transform_passes_hardening_flags() -> None:
     assert kw["tmpfs"] == {"/tmp": "size=64m,noexec,nosuid,nodev"}
     assert kw["environment"] == {}
     assert kw["detach"] is True
+    assert kw["nano_cpus"] == int(caps.SANDBOX_CPUS * 1_000_000_000) == 1_000_000_000
     assert kw["name"].startswith("sluice-sandbox-")
     assert kw["labels"] == {"sluice.sandbox": "1"}
     assert [(u.name, u.soft, u.hard) for u in kw["ulimits"]] == [("nofile", 256, 256)]
@@ -259,7 +262,9 @@ def test_timeout_kills_container_and_reports_timeout(work_root: Path) -> None:
 
 
 def test_unix_socket_read_timeout_counts_as_still_running() -> None:
-    client = FakeClient(wait_exc=requests.exceptions.ConnectionError("Read timed out"))
+    # What docker-py really raises for a wait timeout over a unix socket.
+    read_timeout = urllib3.exceptions.ReadTimeoutError(None, None, "Read timed out.")  # type: ignore[arg-type]
+    client = FakeClient(wait_exc=requests.exceptions.ConnectionError(read_timeout))
     result = _run(client, timeout_s=1)
     assert result.ok is False and result.error is not None and "timeout" in result.error
 
@@ -460,6 +465,7 @@ def test_get_docker_client_falls_back_to_current_context(monkeypatch: pytest.Mon
     def broken(**kwargs: Any) -> None:
         raise docker.errors.DockerException("no DOCKER_HOST socket")
 
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
     monkeypatch.setattr(runner.docker, "from_env", broken)
     monkeypatch.setattr(runner.docker, "DockerClient", Pingable)
     monkeypatch.setattr(runner.ContextAPI, "get_current_context", staticmethod(lambda: Ctx()))
@@ -474,10 +480,49 @@ def test_get_docker_client_raises_sandbox_error_when_no_daemon(
     def broken(**kwargs: Any) -> None:
         raise docker.errors.DockerException("down")
 
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
     monkeypatch.setattr(runner.docker, "from_env", broken)
     monkeypatch.setattr(runner.ContextAPI, "get_current_context", staticmethod(lambda: None))
     with pytest.raises(SandboxError, match="Docker"):
         runner.get_docker_client()
+
+
+def test_get_docker_client_explicit_docker_host_unreachable_does_not_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = "tcp://user:s3cret@10.0.0.9:2376"
+    contexts: list[bool] = []
+
+    def broken(**kwargs: Any) -> None:
+        raise docker.errors.DockerException(f"Error connecting to {host}")
+
+    def context() -> Any:
+        contexts.append(True)
+        return type("Ctx", (), {"Host": "unix:///colima.sock"})()
+
+    monkeypatch.setenv("DOCKER_HOST", host)
+    monkeypatch.setattr(runner.docker, "from_env", broken)
+    monkeypatch.setattr(runner.ContextAPI, "get_current_context", staticmethod(context))
+    with pytest.raises(SandboxError, match="DOCKER_HOST") as excinfo:
+        runner.get_docker_client()
+    assert contexts == []
+    assert "s3cret" not in str(excinfo.value)
+
+
+def test_get_docker_client_explicit_docker_host_reachable_is_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pingable:
+        def ping(self) -> bool:
+            return True
+
+    monkeypatch.setenv("DOCKER_HOST", "unix:///custom/docker.sock")
+    made = Pingable()
+    monkeypatch.setattr(runner.docker, "from_env", lambda **kwargs: made)
+    monkeypatch.setattr(
+        runner.ContextAPI, "get_current_context", staticmethod(lambda: pytest.fail("no fallback"))
+    )
+    assert runner.get_docker_client() is made
 
 
 # --- image requirements come from uv.lock --------------------------------------------------
@@ -534,3 +579,89 @@ def test_caller_client_is_left_open() -> None:
     client = Closable()
     _run(client)
     assert client.closed is False
+
+
+# --- fix round 1: owned work dir, post-exit size check, unreachable daemon -----------------
+
+
+def test_work_dir_env_is_not_chmodded_runner_uses_own_subdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path / "shared"
+    base.mkdir(mode=0o755)
+    base.chmod(0o755)
+    monkeypatch.setenv(runner.WORK_DIR_ENV, str(base))
+    seen: dict[str, Path] = {}
+
+    def hook(in_dir: Path, out_dir: Path) -> dict[str, Any]:
+        seen["root"] = in_dir.parent.parent
+        return _echo(in_dir, out_dir)
+
+    _run(FakeClient(hook))
+    assert seen["root"] == base / runner.RUNNER_SUBDIR
+    assert stat.S_IMODE(base.stat().st_mode) == 0o755
+    assert stat.S_IMODE((base / runner.RUNNER_SUBDIR).stat().st_mode) == 0o700
+
+
+def test_symlinked_runner_dir_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (base / runner.RUNNER_SUBDIR).symlink_to(elsewhere)
+    monkeypatch.setenv(runner.WORK_DIR_ENV, str(base))
+    client = FakeClient()
+    with pytest.raises(SandboxError, match="symlink"):
+        _run(client)
+    assert client.container is None
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_runner_dir_owned_by_someone_else_is_refused(
+    work_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_root.mkdir(parents=True)
+    monkeypatch.setattr(runner.os, "getuid", lambda: os.stat(work_root).st_uid + 1)
+    client = FakeClient()
+    with pytest.raises(SandboxError, match="owned"):
+        _run(client)
+    assert client.container is None
+
+
+def test_output_over_cap_after_exit_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A burst written between the last poll and exit is caught by a final size check."""
+    monkeypatch.setattr(runner, "SANDBOX_OUTPUT_MAX_BYTES", 5_000)
+
+    def hook(in_dir: Path, out_dir: Path) -> dict[str, Any]:
+        _echo(in_dir, out_dir)
+        (out_dir / "junk").write_bytes(b"x" * 10_000)
+        return {"StatusCode": 0}
+
+    result = _run(FakeClient(hook))
+    assert result.ok is False
+    assert result.error is not None and "output" in result.error and "limit" in result.error
+
+
+def test_unreachable_daemon_while_waiting_raises_without_hot_loop(work_root: Path) -> None:
+    client = FakeClient(wait_exc=requests.exceptions.ConnectionError("Connection refused"))
+    calls = {"n": 0}
+    original_run = client.containers.run
+
+    def run(image: str, **kwargs: Any) -> FakeContainer:
+        container = original_run(image, **kwargs)
+        real_wait_exc = container.wait_exc
+
+        def wait(timeout: float | None = None) -> dict[str, Any]:
+            calls["n"] += 1
+            assert real_wait_exc is not None
+            raise real_wait_exc
+
+        container.wait = wait  # type: ignore[method-assign]
+        return container
+
+    client.containers.run = run  # type: ignore[method-assign]
+    with pytest.raises(SandboxError, match="unreachable"):
+        _run(client, timeout_s=1)
+    # POLL_INTERVAL_S is 0.01 here: sleeping between retries bounds this near 100.
+    assert calls["n"] <= 150
+    _assert_cleaned(client, work_root)
