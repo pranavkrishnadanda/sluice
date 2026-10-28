@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   formatCI,
+  formatCIParts,
   formatCount,
   formatMs,
   formatPct,
@@ -28,6 +29,21 @@ describe("format", () => {
       "81.4% [79.0, 83.6]",
     );
     expect(formatCI(null)).toBe("—");
+  });
+
+  test("formatCIParts splits the mean from its interval", () => {
+    expect(formatCIParts({ mean: 0.861, lo: 0.842, hi: 0.879 })).toEqual({
+      mean: "86.1%",
+      interval: "[84.2, 87.9]",
+    });
+    expect(formatCIParts({ mean: 0.12, lo: 0.1, hi: 0.15 }, "usd")).toEqual({
+      mean: "$0.12",
+      interval: "[$0.10, $0.15]",
+    });
+    expect(formatCIParts({ mean: 1_120, lo: 940, hi: 1_310 }, "ms")).toEqual({
+      mean: "1.1 s",
+      interval: "[940 ms, 1.3 s]",
+    });
   });
 
   test("formatCI can format latency intervals", () => {

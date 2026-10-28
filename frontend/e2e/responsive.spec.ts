@@ -1,5 +1,9 @@
 import { expect, type Page, test } from "@playwright/test";
-import { emulateReducedTransparency, openFinishedRun } from "./helpers";
+import {
+  emulateReducedTransparency,
+  openEvals,
+  openFinishedRun,
+} from "./helpers";
 
 const PHONE = { width: 390, height: 844 };
 
@@ -74,5 +78,23 @@ test.describe("reduced motion and transparency", () => {
     expect(style.glass).toBe(true);
     expect(style.backdropFilter).toBe("none");
     expect(style.transitionDuration).toBe("0s");
+  });
+});
+
+test.describe("desktop width", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("the results table fits its card without sideways scrolling", async ({
+    page,
+  }) => {
+    await openEvals(page);
+    const scroller = page.getByRole("region", {
+      name: "Results by system, scrollable",
+    });
+    const { scrollWidth, clientWidth } = await scroller.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+    }));
+    expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
   });
 });

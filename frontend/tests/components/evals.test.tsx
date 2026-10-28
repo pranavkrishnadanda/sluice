@@ -108,12 +108,19 @@ describe("ResultsTable", () => {
   test("renders each metric with its 95% interval in brackets", () => {
     render(<ResultsTable summary={EVAL_SUMMARY} />);
     const row = screen.getByRole("row", { name: /sluice/ });
-    expect(within(row).getByText("86.1% [84.2, 87.9]")).toBeInTheDocument();
-    expect(within(row).getByText("1.2% [0.7, 1.9]")).toBeInTheDocument();
-    expect(within(row).getByText("81.0% [76.0, 85.0]")).toBeInTheDocument();
-    expect(within(row).getByText("97.5% [96.0, 98.6]")).toBeInTheDocument();
-    expect(within(row).getByText("1.1 s [940 ms, 1.3 s]")).toBeInTheDocument();
-    expect(within(row).getByText("$0.12 [$0.10, $0.15]")).toBeInTheDocument();
+    // Mean and interval sit on two lines but read as one string per cell.
+    expect(
+      within(row)
+        .getAllByRole("cell")
+        .map((c) => c.textContent),
+    ).toEqual([
+      "86.1% [84.2, 87.9]",
+      "1.2% [0.7, 1.9]",
+      "97.5% [96.0, 98.6]",
+      "81.0% [76.0, 85.0]",
+      "1.1 s [940 ms, 1.3 s]",
+      "$0.12 [$0.10, $0.15]",
+    ]);
   });
 
   test("a null metric renders an em dash", () => {

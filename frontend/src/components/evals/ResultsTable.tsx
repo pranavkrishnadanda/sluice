@@ -1,5 +1,5 @@
 import type { CI, EvalSummary } from "@/lib/api/types";
-import { formatCI } from "@/lib/format";
+import { type CIUnit, formatCIParts } from "@/lib/format";
 
 type SystemRow = EvalSummary["systems"][number];
 
@@ -13,9 +13,19 @@ function NotMeasured() {
   );
 }
 
-function Interval({ ci, unit }: { ci: CI | null; unit?: "usd" | "ms" }) {
+/**
+ * Mean over its bracketed interval, on two lines so seven columns fit the
+ * card; the text still reads "86.1% [84.2, 87.9]" as one string.
+ */
+function Interval({ ci, unit }: { ci: CI | null; unit?: CIUnit }) {
   if (!ci) return <NotMeasured />;
-  return <span className="whitespace-nowrap">{formatCI(ci, unit)}</span>;
+  const { mean, interval } = formatCIParts(ci, unit);
+  return (
+    <span className="block whitespace-nowrap">
+      <span className="block font-medium text-fg">{mean}</span>{" "}
+      <span className="block text-[0.6875rem] text-muted">{interval}</span>
+    </span>
+  );
 }
 
 const COLUMNS: ReadonlyArray<{ label: string; hint: string }> = [
@@ -27,15 +37,16 @@ const COLUMNS: ReadonlyArray<{ label: string; hint: string }> = [
   { label: "Cost / 1k rows", hint: "lower is better" },
 ];
 
-const TH = "whitespace-nowrap px-2 py-2.5 text-left align-bottom font-medium";
-const TD = "px-2 py-3 font-mono text-xs tabular-nums";
+const TH = "px-1.5 py-2.5 text-left align-bottom font-medium";
+const TD = "px-1.5 py-2.5 align-top font-mono text-xs tabular-nums";
 
 function Row({ row }: { row: SystemRow }) {
   return (
     <tr className="border-fg/8 border-t transition-colors duration-150 hover:bg-chip">
       <th
         scope="row"
-        className={`${TD} whitespace-nowrap text-left font-medium text-fg`}
+        // Names may wrap at their hyphens ("always-" / "strong").
+        className={`${TD} text-left font-medium text-fg`}
       >
         {row.system}
       </th>
@@ -96,7 +107,7 @@ export function ResultsTable({ summary }: ResultsTableProps) {
         // positioned and would otherwise escape this scroller's clipping.
         className="relative -mx-1 overflow-x-auto rounded-xl px-1 focus-visible:outline-offset-0"
       >
-        <table className="w-full min-w-[56rem] border-collapse text-sm">
+        <table className="w-full min-w-[36rem] border-collapse text-sm">
           <caption className="pb-2 text-left font-medium text-muted text-xs uppercase tracking-[0.08em]">
             {`${summary.split} · n = ${summary.n}`}
           </caption>
