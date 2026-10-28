@@ -78,6 +78,13 @@ const COLOURS: ChartColours = {
   routers: ["#2a63d6", "#c2501b"],
 };
 
+function xTickLabel(option: { xAxis?: unknown }): (v: number) => string {
+  const axis = option.xAxis as {
+    axisLabel: { formatter: (v: number) => string };
+  };
+  return axis.axisLabel.formatter;
+}
+
 function lastOption(): Record<string, unknown> {
   const call = ec.setOption.mock.calls.at(-1);
   if (!call) throw new Error("setOption was never called");
@@ -113,6 +120,15 @@ describe("ResultsTable", () => {
     const cells = within(row).getAllByRole("cell");
     // System is the row header; cells: accuracy, fabrication, pass^4, cost.
     expect(cells[2]).toHaveTextContent("—");
+  });
+
+  test("explains pass^4 as the tau-bench all-runs-succeed estimate", () => {
+    render(<ResultsTable summary={EVAL_SUMMARY} />);
+    expect(
+      screen.getByText(
+        /pass\^4 is the estimated chance that all 4 runs of a case succeed \(τ-bench pass\^k estimator\)/,
+      ),
+    ).toBeInTheDocument();
   });
 
   test("captions the table with split and n, one row per system", () => {
@@ -159,9 +175,11 @@ describe("buildParetoOption", () => {
     expect(router.data.map((d) => d.lambda)).toEqual([2, 1, 0.5, 0.25, 0.1]);
   });
 
-  test("a zero-cost point sits on the axis floor (log has no zero)", () => {
+  test("zero-cost points get their own decade below every real tick", () => {
     const option = buildParetoOption(EVAL_SUMMARY, COLOURS);
-    expect(option.xAxis).toMatchObject({ min: 0.01, max: 1 });
+    // Cheapest paid point is $0.02, so real ticks start at $0.01; the zero
+    // draw position is one decade lower.
+    expect(option.xAxis).toMatchObject({ min: 0.001, max: 1 });
     const series = option.series as Array<{
       type: string;
       data: Array<{ name: string; value: [number, number]; cost: number }>;
@@ -169,7 +187,59 @@ describe("buildParetoOption", () => {
     const rules = series
       .find((s) => s.type === "scatter")
       ?.data.find((d) => d.name === "rules");
-    expect(rules).toMatchObject({ value: [0.01, 0.712], cost: 0 });
+    expect(rules).toMatchObject({ value: [0.001, 0.712], cost: 0 });
+    const label = xTickLabel(option);
+    expect(label(0.001)).toBe("$0");
+    expect(label(0.01)).toBe("$0.01");
+    expect(label(0.1)).toBe("$0.10");
+  });
+
+  test("a real tick at the paid floor keeps its value when a zero is present", () => {
+    const summary: EvalSummary = {
+      ...EVAL_SUMMARY,
+      pareto: [
+        {
+          system: "free",
+          kind: "baseline",
+          points: [{ costPer1kRowsUsd: 0, quality: 0.7 }],
+        },
+        {
+          system: "mid",
+          kind: "baseline",
+          points: [{ costPer1kRowsUsd: 0.5, quality: 0.8 }],
+        },
+        {
+          system: "dear",
+          kind: "baseline",
+          points: [{ costPer1kRowsUsd: 0.9, quality: 0.85 }],
+        },
+      ],
+    };
+    const option = buildParetoOption(summary, COLOURS);
+    expect(option.xAxis).toMatchObject({ min: 0.01, max: 1 });
+    const label = xTickLabel(option);
+    expect(label(0.1)).toBe("$0.10");
+    expect(label(0.01)).toBe("$0");
+    const free = (
+      option.series as Array<{ data: Array<{ name: string; value: number[] }> }>
+    )[0]?.data.find((d) => d.name === "free");
+    expect(free?.value[0]).toBe(0.01);
+  });
+
+  test("without a zero-cost point no tick is relabelled", () => {
+    const summary: EvalSummary = {
+      ...EVAL_SUMMARY,
+      pareto: [
+        {
+          system: "mid",
+          kind: "baseline",
+          points: [{ costPer1kRowsUsd: 0.5, quality: 0.8 }],
+        },
+      ],
+    };
+    const option = buildParetoOption(summary, COLOURS);
+    expect(option.xAxis).toMatchObject({ min: 0.1, max: 1 });
+    expect(xTickLabel(option)(0.1)).toBe("$0.10");
   });
 
   test("tooltip text is HTML-escaped and states the real cost and lambda", () => {
@@ -212,6 +282,10 @@ describe("ParetoChart", () => {
       .getAllByRole("row")
       .find((r) => within(r).queryByText("0.5"));
     expect(half).toHaveTextContent(/sluice.*router.*\$0\.12.*86\.1%/);
+    const rules = within(body)
+      .getAllByRole("row")
+      .find((r) => within(r).queryByText("rules"));
+    expect(rules).toHaveTextContent(/rules.*baseline.*\$0.*71\.2%/);
   });
 
   test("passes an option with a log x axis to setOption", async () => {

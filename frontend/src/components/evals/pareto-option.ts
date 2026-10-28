@@ -54,9 +54,10 @@ export function paretoRows(summary: EvalSummary): ParetoRow[] {
 }
 
 /**
- * Log-axis bounds: decades around the positive costs. A log axis has no
- * zero, so zero-cost points are drawn on the floor (one decade below the
- * cheapest paid point when that point is itself a power of ten).
+ * Log-axis bounds: whole decades around the positive costs. A log axis has
+ * no zero, so when zero-cost points exist they get a decade of their own
+ * below the cheapest paid point's decade: `min` is then only ever their draw
+ * position (labelled "$0"), never a real cost tick.
  */
 export function costAxisBounds(rows: readonly ParetoRow[]): {
   min: number;
@@ -69,10 +70,8 @@ export function costAxisBounds(rows: readonly ParetoRow[]): {
   if (positive.length === 0) return { min: 0.01, max: 1, hasZero };
   const lo = Math.min(...positive);
   const hi = Math.max(...positive);
-  let minExp = Math.floor(Math.log10(lo));
-  if (hasZero && 10 ** minExp >= lo) minExp -= 1;
-  let maxExp = Math.ceil(Math.log10(hi));
-  if (maxExp <= minExp) maxExp = minExp + 1;
+  const minExp = Math.floor(Math.log10(lo)) - (hasZero ? 1 : 0);
+  const maxExp = Math.max(Math.ceil(Math.log10(hi)), minExp + 1);
   // Round away float noise (10 ** -2 is 0.01 exactly, but be explicit).
   const pow = (e: number) => Number((10 ** e).toPrecision(1));
   return { min: pow(minExp), max: pow(maxExp), hasZero };
@@ -143,6 +142,8 @@ export function buildParetoOption(
   const y = qualityAxisBounds(rows);
   const logSpan = Math.log10(x.max) - Math.log10(x.min);
   const drawAt = (cost: number) => (cost > 0 ? cost : x.min);
+  const isZeroPosition = (v: number) =>
+    Math.abs(Math.log10(v) - Math.log10(x.min)) < 1e-9;
   /**
    * Labels sit right of a point, except near the dear end of the axis where
    * they drop below it (clear of router lines, which rise from the left).
@@ -280,9 +281,10 @@ export function buildParetoOption(
       nameGap: 28,
       axisLabel: {
         ...axisCommon.axisLabel,
-        // Zero-cost systems are drawn on the floor tick, so label it "$0".
+        // Only the zero-cost draw position reads "$0"; real ticks keep
+        // their values (it sits a decade below every paid cost).
         formatter: (v: number) =>
-          x.hasZero && v <= x.min ? "$0" : formatUsd(v),
+          x.hasZero && isZeroPosition(v) ? "$0" : formatUsd(v),
       },
     },
     yAxis: {
