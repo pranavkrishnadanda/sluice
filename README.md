@@ -6,7 +6,7 @@ A file lands with renamed columns, prices in paise instead of rupees, timestamps
 
 Every accuracy claim is graded **by code against exact ground truth**, with a baseline, a sample size and a 95% confidence interval.
 
-> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline) and the web UI are on `main`; the LLM agent pipeline (plan 2) is next. The only published numbers so far are the rules-only baseline below; the UI runs on a clearly labelled demo backend until plan 2 connects it.
+> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline), the web UI and the LLM agent pipeline (plan 2: LiteLLM routing, sandboxed transforms, verifier, Iceberg load with lineage) are on `main`. The only published numbers so far are the rules-only baseline below; the first agent results need live model keys and are next. The UI runs on a clearly labelled demo backend until the API (plan 4) connects it.
 
 ---
 
@@ -126,7 +126,7 @@ A chat-style interface: drop a file, watch the plan execute step by step, and in
 **v1: promotable core**
 - [x] **Plan 1, foundations:** TPC-H generation, drift generator, data contracts, code graders, statistics, rules-only baseline
 - [x] **UI shell:** liquid-glass UI (light/dark), live run thread, Data/Code/Plan panel, evals page, API contract, e2e + accessibility checks
-- [ ] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(next)*
+- [x] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(first agent results pending live keys)*
 - [ ] **Plan 3, evals at scale:** hostile set, CI eval gate, routing matrix and cost-vs-quality chart
 - [ ] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF
 
@@ -166,3 +166,5 @@ Requires [uv](https://docs.astral.sh/uv/) (installs Python 3.14) and [Bun](https
 
 - [Design document](docs/superpowers/specs/2026-10-28-sluice-design.md): goals, anti-goals, architecture, eval method, decisions
 - [Plan 1: foundations](docs/superpowers/plans/2026-10-28-sluice-v1-p1-foundations.md)
+- [Plan 2: agent pipeline](docs/superpowers/plans/2026-10-28-sluice-v1-p2-agent-pipeline.md)
+- [API and event contract](docs/api/contract.md)
