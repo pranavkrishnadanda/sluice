@@ -6,7 +6,7 @@ A file lands with renamed columns, prices in paise instead of rupees, timestamps
 
 Every accuracy claim is graded **by code against exact ground truth**, with a baseline, a sample size and a 95% confidence interval.
 
-> **Status:** early build. v1 · plan 1 (foundations) is in progress on [`feat/v1-p1-foundations`](https://github.com/pranavkrishnadanda/sluice/tree/feat/v1-p1-foundations). No results are published yet. The tables below show what will be measured, not numbers.
+> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline) and the web UI are on `main`; the LLM agent pipeline (plan 2) is next. The only published numbers so far are the rules-only baseline below; the UI runs on a clearly labelled demo backend until plan 2 connects it.
 
 ---
 
@@ -91,13 +91,15 @@ All headline numbers come with bootstrap 95% CIs; version comparisons use McNema
 
 **Results**
 
-| System | Cell accuracy | Fabrication | pass^4 | Cost / 1k rows |
-|---|---|---|---|---|
-| Rules only (baseline) | — | — | — | — |
-| Always strongest model (baseline) | — | — | — | — |
-| Sluice | — | — | — | — |
+Rules-only baseline on the `dev` split (300 cases, 1 trial), 95% CIs; full tables, definitions and the reproduce command are in [`evals/RESULTS.md`](evals/RESULTS.md), and CI re-renders that file on every push:
 
-*Pending. The rules-only baseline is the first number this repo will publish (end of v1 · plan 1).*
+| System | Cell accuracy | Fabrication | Contract pass | Success | Files quarantined |
+|---|---|---|---|---|---|
+| Rules only (baseline) | 88.9% [86.2, 91.2] | 0.0% [0.0, 5.4] (n=66) | 94.7% [92.0, 97.0] | 38.7% [33.3, 44.3] | 16/300 |
+| Always strongest model (baseline) | — | — | — | — | — |
+| Sluice agent | — | — | — | — | — |
+
+*The agent and model baselines arrive with plan 2. The rules baseline never guesses: it flags what it cannot parse, which is why fabrication is 0% and success is low on medium and hard cases.*
 
 ## Stack
 
@@ -122,10 +124,11 @@ A chat-style interface: drop a file, watch the plan execute step by step, and in
 ## Roadmap
 
 **v1: promotable core**
-- [ ] **Plan 1, foundations:** TPC-H generation, drift generator, data contracts, code graders, statistics, rules-only baseline *(in progress)*
-- [ ] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage
+- [x] **Plan 1, foundations:** TPC-H generation, drift generator, data contracts, code graders, statistics, rules-only baseline
+- [x] **UI shell:** liquid-glass UI (light/dark), live run thread, Data/Code/Plan panel, evals page, API contract, e2e + accessibility checks
+- [ ] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(next)*
 - [ ] **Plan 3, evals at scale:** hostile set, CI eval gate, routing matrix and cost-vs-quality chart
-- [ ] **Plan 4, UI and README results:** liquid-glass UI, live streaming, traces
+- [ ] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF
 
 **v2: production depth.** Event streaming (Redpanda), SLO dashboard and alerts, chaos drills and runbook, k6 load test, vLLM benchmark on a free GPU (throughput, prefix caching, self-hosted vs API cost), single-agent vs orchestrator comparison, learned router.
 
@@ -134,7 +137,10 @@ A chat-style interface: drop a file, watch the plan execute step by step, and in
 ## Repository layout
 
 ```
-backend/                Python package `sluice` (src layout), tests, data contracts
+backend/                Python package `sluice` (src layout), tests, data contracts, locked cases
+frontend/               Next.js web UI (Bun), unit + Playwright e2e tests
+evals/RESULTS.md        published results (regenerated and checked in CI)
+docs/api/contract.md    UI ↔ backend API contract
 docs/superpowers/specs  design document
 docs/superpowers/plans  implementation plans
 docs/design             UI mockup
@@ -142,16 +148,19 @@ docs/design             UI mockup
 
 ## Getting started
 
-Code currently lives on [`feat/v1-p1-foundations`](https://github.com/pranavkrishnadanda/sluice/tree/feat/v1-p1-foundations) until plan 1 merges.
-
 ```bash
-git clone https://github.com/pranavkrishnadanda/sluice.git
-cd sluice && git checkout feat/v1-p1-foundations
-cd backend && uv sync
-cd .. && make lint && make test
+git clone https://github.com/pranavkrishnadanda/sluice.git && cd sluice
+
+# backend: build the locked cases, run tests, reproduce RESULTS.md
+make cases && make test
+cd backend && PYTHONPATH=src uv run sluice eval --system rules --split dev --trials 1 \
+  && PYTHONPATH=src uv run sluice results && cd ..
+
+# web UI (demo backend): http://localhost:3000
+cd frontend && bun install && bun run dev
 ```
 
-Requires [uv](https://docs.astral.sh/uv/). Python 3.14 is installed by uv.
+Requires [uv](https://docs.astral.sh/uv/) (installs Python 3.14) and [Bun](https://bun.sh/). The UI shows a "Demo data" badge until it is pointed at a real backend; see [`frontend/README.md`](frontend/README.md).
 
 ## Read more
 
