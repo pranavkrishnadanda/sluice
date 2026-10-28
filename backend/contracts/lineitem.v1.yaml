@@ -1,0 +1,24 @@
+# TPC-H lineitem, dtypes exactly as DuckDB dbgen emits them.
+name: lineitem
+version: v1
+locale: en_IN
+primary_key: [l_orderkey, l_linenumber]
+foreign_keys:
+  l_orderkey: orders.o_orderkey
+columns:
+  - {name: l_orderkey, dtype: int64}
+  - {name: l_partkey, dtype: int64}
+  - {name: l_suppkey, dtype: int64}
+  - {name: l_linenumber, dtype: int64}
+  - {name: l_quantity, dtype: decimal}
+  - {name: l_extendedprice, dtype: decimal, unit: INR, min: 0}
+  - {name: l_discount, dtype: decimal}
+  - {name: l_tax, dtype: decimal}
+  - {name: l_returnflag, dtype: string, enum: [A, N, R]}
+  - {name: l_linestatus, dtype: string, enum: [F, O]}
+  - {name: l_shipdate, dtype: date}
+  - {name: l_commitdate, dtype: date}
+  - {name: l_receiptdate, dtype: date}
+  - {name: l_shipinstruct, dtype: string}
+  - {name: l_shipmode, dtype: string}
+  - {name: l_comment, dtype: string}
