@@ -279,6 +279,32 @@ def test_violation_order_is_deterministic(orders_df: pl.DataFrame) -> None:
     ]
 
 
+def test_not_null_reported_when_pk_column_missing(orders_df: pl.DataFrame) -> None:
+    bad = _set_at(orders_df, "o_clerk", 4, None).drop("o_orderkey")
+    report = validate(load_contract("orders"), bad)
+    _only(report, "missing_column", "o_orderkey")
+    v = _only(report, "not_null", "o_clerk")
+    assert v.pk_values == []
+    assert "1 row(s)" in v.message
+
+
+def test_foreign_key_reported_when_pk_column_missing(
+    orders_df: pl.DataFrame, lineitem_df: pl.DataFrame
+) -> None:
+    first = lineitem_df.row(0, named=True)
+    bad = lineitem_df.with_columns(
+        pl.when((pl.col("l_orderkey") == first["l_orderkey"]) & (pl.col("l_linenumber") == 1))
+        .then(pl.lit(-5, dtype=pl.Int64))
+        .otherwise(pl.col("l_orderkey"))
+        .alias("l_orderkey")
+    ).drop("l_linenumber")
+    report = validate(load_contract("lineitem"), bad, reference=_orders_ref(orders_df))
+    _only(report, "missing_column", "l_linenumber")
+    v = _only(report, "foreign_key", "l_orderkey")
+    assert v.pk_values == []
+    assert "1 row(s)" in v.message
+
+
 def test_validate_does_not_mutate_input(orders_df: pl.DataFrame) -> None:
     before = orders_df.clone()
     validate(load_contract("orders"), orders_df.drop("o_clerk"))

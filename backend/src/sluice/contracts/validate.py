@@ -70,7 +70,17 @@ def _column_checks(spec: ColumnSpec) -> tuple[list[pa.Check], list[str]]:
     return checks, names
 
 
-def _message(column: str | None, check: str, pks: list[PkTuple], detail: str = "") -> str:
+def _message(
+    column: str | None,
+    check: str,
+    pks: list[PkTuple],
+    detail: str = "",
+    n_rows: int | None = None,
+) -> str:
+    """Human-readable violation text.
+
+    ``n_rows`` gives the offending-row count when PKs are unavailable (PK column missing).
+    """
     where = f"column {column!r}" if column is not None else "table"
     text = f"{where}: check {check!r} failed"
     if detail:
@@ -79,6 +89,8 @@ def _message(column: str | None, check: str, pks: list[PkTuple], detail: str = "
         shown = ", ".join(str(pk) for pk in pks[:MAX_PKS_IN_MESSAGE])
         more = f" (+{len(pks) - MAX_PKS_IN_MESSAGE} more)" if len(pks) > MAX_PKS_IN_MESSAGE else ""
         text += f" for {len(pks)} row(s); PKs: {shown}{more}"
+    elif n_rows:
+        text += f" for {n_rows} row(s); PKs unavailable (primary key column missing)"
     return text
 
 
@@ -179,15 +191,20 @@ def _pandera_violations(
     for column, check in sorted(hits, key=sort_key):
         if column in bad_dtype and check in _VALUE_CHECKS:
             continue  # value checks on a mistyped column are noise; dtype already reported
-        pk_values = _dedupe(pks.rows(hits[(column, check)]))
+        indices = hits[(column, check)]
+        pk_values = _dedupe(pks.rows(indices))
+        n_rows = len(set(indices))
         detail = ""
-        if check == "not_null":
+        # Flags are keyed by PK: without a PK lookup no cell can match a flag, so a not_null
+        # violation is then reported as-is (pk_values=[], row count in the message).
+        if check == "not_null" and pks.available:
             pk_values = [pk for pk in pk_values if (pk, column) not in flags]
             if not pk_values:
                 continue
         elif check == "dtype":
             detail = f"expected {expected_dtypes[column]}, got {df.schema[column]}"
-        out.append(Violation(column, check, pk_values, _message(column, check, pk_values, detail)))
+        msg = _message(column, check, pk_values, detail, n_rows)
+        out.append(Violation(column, check, pk_values, msg))
     return out
 
 
@@ -204,9 +221,10 @@ def _fk_violations(
             continue
         allowed = pl.Series(list(reference[ref_key]), dtype=df.schema[column], strict=False)
         mask = pl.col(column).is_not_null() & ~pl.col(column).is_in(allowed.implode())
-        pk_values = pks.mask(mask, df)
-        if pk_values:
-            msg = _message(column, "foreign_key", pk_values, f"not in {ref_key}")
+        n_rows = int(df.select(mask.sum()).item())
+        if n_rows:
+            pk_values = pks.mask(mask, df)
+            msg = _message(column, "foreign_key", pk_values, f"not in {ref_key}", n_rows)
             out.append(Violation(column, "foreign_key", pk_values, msg))
     return out
 
