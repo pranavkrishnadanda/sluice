@@ -7,7 +7,8 @@ cases built from one seed; :func:`split_hash` locks its exact bytes.
 
 Recipe sampling guarantees every recipe applies without :class:`~sluice.drift.ops.DriftError`:
 each column-targeting op owns its column (so no column ever gets two dtype-changing ops),
-destroy/drop_column and value-changing ops never touch primary-key columns, ``unicode_text``
+destroy/drop_column and value-changing ops never touch primary-key columns, ``whitespace``
+only hits enum columns (never free text, whose edge spaces can be real), ``unicode_text``
 only hits free-text ``*_comment`` columns, ``case_noise`` only enum columns, ``unit_paise`` only
 ``INR`` money columns, and ``fk_break`` only foreign keys (lineitem).
 
@@ -214,7 +215,9 @@ def _eligible_columns(contract: Contract) -> dict[str, list[str]]:
         ],
         "tz_ist": [n for n in non_pk if cols[n].dtype == "timestamp_utc"],
         "date_format_mix": [n for n in non_pk if cols[n].dtype == "date"],
-        "whitespace": [n for n in non_pk if cols[n].dtype == "string"],
+        # Enum columns only: TPC-H free text carries real edge spaces, so padded free text
+        # has no unambiguous truth (and every other non-free-text column is not a string).
+        "whitespace": [n for n in non_pk if cols[n].enum is not None],
         "case_noise": [n for n in non_pk if cols[n].enum is not None],
         "destroy": non_pk,
         "fk_break": [n for n in contract.foreign_keys if cols[n].dtype in ("int64", "int32")],

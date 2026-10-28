@@ -544,3 +544,16 @@ def test_forced_severe_recipes_never_raise(table: str, clean: dict[str, pl.DataF
             _assert_recipe_rules(recipe)
             assert severe in [op for op, _ in recipe.ops]
             apply_recipe(recipe, clean, seed=i)
+
+
+@pytest.mark.parametrize("table", ["orders", "lineitem"])
+def test_whitespace_never_targets_free_text(table: str) -> None:
+    # Free-text columns carry real edge spaces in TPC-H, so padded free text has no truth.
+    contract = load_contract(table)
+    targeted = set()
+    for difficulty in ("easy", "medium", "hard"):
+        for i in range(300):
+            recipe = sample_recipe(table, difficulty, np.random.default_rng([i, 7]))
+            targeted |= {p["column"] for op, p in recipe.ops if op == "whitespace"}
+    assert targeted
+    assert all(contract.column(c).enum is not None for c in targeted), targeted

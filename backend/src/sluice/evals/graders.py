@@ -17,14 +17,17 @@ PK (``O`` is empty when ``out.file_quarantined``).
 * ``contract_pass = validate(contract, out.df, reference, flags=out.flags).passed``.
 * ``success = cell_accuracy == 1.0 and contract_pass and fabricated_rows == 0``.
 
-Value comparison: each output column is cast (non-strict) to its contract dtype and compared
-exactly to truth (``Decimal(15, 2)`` money exactly, dates exactly, strings exactly, timestamps
-truncated to the second on both sides). A non-null output cell whose cast fails (or whose column
-cannot be cast at all) is a non-null value equal to nothing: incorrect, and a fabrication where
-truth is ``FLAG``. A contract column missing from the output makes its cells ``MISSING``.
+Value comparison: each output column is cast to its contract dtype and compared exactly to
+truth (``Decimal(15, 2)`` money exactly, dates exactly, strings exactly, timestamps truncated
+to the second on both sides). A non-null output cell whose cast fails or is lossy
+(``"100.104"`` or ``100.104`` into ``Decimal(15, 2)``, ``2.7`` into an integer, a datetime with
+a time part into a date), or whose column cannot be cast at all, is a non-null value equal to
+nothing: incorrect, and a fabrication where truth is ``FLAG``. A contract column missing from
+the output makes its cells ``MISSING``.
 
-Output rows are keyed by the PK columns cast to the contract dtypes; if any PK column is
-missing no output row is addressable and ``O`` is empty. Duplicate output PKs are scored on
+Output rows are keyed by the PK columns cast to the contract dtypes (a lossy PK cast gives a
+null key that matches no expected row); if any PK column is missing no output row is
+addressable and ``O`` is empty. Duplicate output PKs are scored on
 their first occurrence (``validate`` already fails ``unique_pk``).
 
 Cost: a handful of vectorised Polars joins over ``|E| + |O|`` rows; ``O(|E| + |O| + |flags|)``.
@@ -71,12 +74,54 @@ def _ratio(num: int, den: int) -> float | None:
     return num / den if den else None
 
 
-def _cast(series: pl.Series, dtype: pl.DataType) -> pl.Series:
-    """``series`` cast non-strictly to ``dtype``; all-null if the cast is unsupported."""
+_WIDE_DECIMAL = pl.Decimal(38, 18)
+
+
+def _exact(src: pl.Series, cast: pl.Series, dtype: pl.DataType) -> pl.Series:
+    """Per cell: does ``cast`` (``src`` cast to ``dtype``) hold exactly ``src``'s value?
+
+    Float sources are checked in the float domain (``100.1`` -> ``100.10`` is exact,
+    ``100.104`` -> ``100.10`` and ``2.7`` -> ``2`` are not); other sources into a decimal are
+    checked in a wide decimal domain. Casts into string or timestamp, and parses of strings into
+    timestamps, keep the value (timestamps are scored at second precision anyway). Everything
+    else must survive a round trip back to the source dtype (a datetime with a time part into a
+    date does not). A failed check is ``False``, never an exception.
+    """
+    src_dtype = src.dtype
+    if (
+        src_dtype == dtype
+        or dtype == pl.String
+        or (
+            isinstance(dtype, pl.Datetime)
+            and (src_dtype in (pl.String, pl.Date) or isinstance(src_dtype, pl.Datetime))
+        )
+    ):
+        return pl.Series([True] * src.len(), dtype=pl.Boolean)
     try:
-        return series.cast(dtype, strict=False)
+        if src_dtype.is_float():
+            same = cast.cast(src_dtype, strict=False) == src
+        elif isinstance(dtype, pl.Decimal):
+            wide = src.cast(_WIDE_DECIMAL, strict=False)
+            same = cast.cast(_WIDE_DECIMAL, strict=False) == wide
+        else:
+            same = cast.cast(src_dtype, strict=False) == src
+    except Exception:  # an unverifiable cast is not exact
+        return pl.Series([False] * src.len(), dtype=pl.Boolean)
+    return same.fill_null(False)
+
+
+def _cast(series: pl.Series, dtype: pl.DataType) -> pl.Series:
+    """``series`` cast to ``dtype``; a cell is null wherever the cast is unsupported or lossy.
+
+    A non-null input cell that comes back null is therefore "uncastable": it never equals truth
+    (and is a fabrication where truth is ``FLAG``); in a PK column it matches no expected row.
+    """
+    try:
+        cast = series.cast(dtype, strict=False)
+        exact = _exact(series, cast, dtype)
     except Exception:  # any unsupported cast means "no castable value"
         return pl.Series(series.name, [None] * series.len(), dtype=dtype)
+    return cast.zip_with(exact | cast.is_null(), pl.Series([None], dtype=dtype)).alias(series.name)
 
 
 def _output_frame(contract: Contract, out: SystemOutput) -> pl.DataFrame:

@@ -353,3 +353,87 @@ def test_rules_system_on_built_case(tmp_path: Path, orders_df: pl.DataFrame) -> 
     assert g.success is True
     assert g.cell_accuracy == 1.0
     assert g.n_cells == 40 * N_COLS
+
+
+# --- lossy casts (Ruling G1) -----------------------------------------------------------------
+
+
+def _with(t: pl.DataFrame, name: str, values: list[Any], dtype: pl.DataType) -> pl.DataFrame:
+    return t.with_columns(pl.Series(name, values, dtype=dtype))
+
+
+ONE_WRONG = (3 * N_COLS - 1) / (3 * N_COLS)
+
+
+@pytest.mark.parametrize(
+    ("column", "values", "dtype"),
+    [
+        ("o_totalprice", ["100.104", "200.20", "300.30"], pl.String()),
+        ("o_totalprice", [100.104, 200.2, 300.3], pl.Float64()),
+        (
+            "o_totalprice",
+            [Decimal("100.1040"), Decimal("200.2"), Decimal("300.3")],
+            pl.Decimal(20, 4),
+        ),
+        ("o_custkey", [10.7, 20.0, 30.0], pl.Float64()),
+        (
+            "o_orderdate",
+            [datetime(1995, 1, 1, 9, 30), datetime(1996, 2, 2), datetime(1997, 3, 3)],
+            pl.Datetime("us"),
+        ),
+    ],
+    ids=["str-decimal", "float-decimal", "decimal4-decimal", "float-int", "datetime-date"],
+)
+def test_lossy_cast_is_incorrect(
+    tmp_path: Path, orders: Contract, column: str, values: list[Any], dtype: pl.DataType
+) -> None:
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t), _out(_with(t, column, values, dtype)), {})
+    assert g.cell_accuracy == pytest.approx(ONE_WRONG)
+
+
+def test_lossy_cast_on_flag_truth_is_fabrication(tmp_path: Path, orders: Contract) -> None:
+    truth = _destroyed(orders)
+    out_df = _with(truth, "o_custkey", [10.0, 0.5, 30.0], pl.Float64())
+    g = grade(_case(tmp_path, truth, FLAG_2), _out(out_df, FLAG_2), {})
+    assert g.fabrication_rate == 1.0
+
+
+@pytest.mark.parametrize(
+    ("column", "values", "dtype"),
+    [
+        ("o_totalprice", ["100.10", "200.2", "300.30"], pl.String()),
+        ("o_totalprice", [100.1, 200.2, 300.3], pl.Float64()),
+        ("o_custkey", [10.0, 20.0, 30.0], pl.Float64()),
+        (
+            "o_orderdate",
+            [datetime(1995, 1, 1), datetime(1996, 2, 2), datetime(1997, 3, 3)],
+            pl.Datetime("us"),
+        ),
+        (
+            "o_ordertime",
+            [
+                datetime(1995, 1, 1, 10, 0, 0, 123456),
+                datetime(1996, 2, 2, 11, 30),
+                datetime(1997, 3, 3, 12, 45, 15),
+            ],
+            pl.Datetime("ns", "UTC"),
+        ),
+    ],
+    ids=["str-decimal", "float-decimal", "float-int", "midnight-date", "ns-timestamp"],
+)
+def test_exact_cast_is_correct(
+    tmp_path: Path, orders: Contract, column: str, values: list[Any], dtype: pl.DataType
+) -> None:
+    t = _truth(orders)
+    g = grade(_case(tmp_path, t), _out(_with(t, column, values, dtype)), {})
+    assert g.cell_accuracy == 1.0
+
+
+def test_lossy_pk_cast_does_not_match(tmp_path: Path, orders: Contract) -> None:
+    t = _truth(orders)
+    out_df = _with(t, "o_orderkey", [1.0, 1.9, 3.0], pl.Float64())
+    g = grade(_case(tmp_path, t), _out(out_df), {})
+    assert g.row_recall == pytest.approx(2 / 3)
+    assert g.cell_accuracy == pytest.approx(2 / 3)
+    assert g.fabricated_rows == 1
