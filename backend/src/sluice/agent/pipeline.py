@@ -20,7 +20,9 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
    own reason).
-   A node whose dependency was not accepted never starts.
+   A node whose dependency was not accepted never starts. ``depends_on`` only orders and
+   gates: a dependent node still reads the mapped input frame (never its dependency's
+   rewritten column), and every accepted column is applied together in rules pass 2.
    **Failure path** (contract): when a node's final attempt fails, no new node starts (nodes in
    flight finish), there is no ``verified``, and the whole input is quarantined
    (``file_quarantined``, empty output) with ``run_finished`` status ``quarantined``.
@@ -353,7 +355,9 @@ async def _run_nodes(
     renamed it), which is what the worker is shown: unit hints such as ``_paise`` live there.
 
     A wave is every not-yet-run node whose dependencies have all finished; its nodes run
-    concurrently. A node whose dependency was not accepted is skipped (0 attempts). Once a
+    concurrently. A node whose dependency was not accepted is skipped (0 attempts).
+    ``depends_on`` is a gate and an order only, not a data flow: every node transforms its
+    column of the same ``frame`` (the mapped input), never a dependency's output. Once a
     node's final attempt fails (``run.halted``) no later wave starts; nodes already in flight
     run to completion and their events are still emitted.
     """
