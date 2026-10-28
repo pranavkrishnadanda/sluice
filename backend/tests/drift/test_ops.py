@@ -105,7 +105,7 @@ def test_indian_number_string(orders20: pl.DataFrame) -> None:
     assert col.dtype == pl.String
     assert col.to_list()[:2] == ["1,24,500.50", "999.00"]
     assert state.expected.equals(df)
-    assert state.entries[-1].rows_affected == 20
+    assert state.entries[-1].rows_affected == 19  # "999.00" is unchanged by grouping
 
 
 @pytest.mark.parametrize(
@@ -447,3 +447,20 @@ def test_fk_break_keys_strictly_negative_at_edge_draws(lineitem_df: pl.DataFrame
     assert len(moved) == 10
     assert all(-FK_BREAK_RANGE <= v <= -1 for v in moved)
     assert sorted(moved, reverse=True)[:2] == [-1, -2]
+
+
+def test_indian_number_string_counts_only_changed_cells(orders20: pl.DataFrame) -> None:
+    # 999.00 renders identically with or without grouping; only cells that gain a comma count.
+    values = [Decimal("124500.50"), Decimal("999.00"), Decimal("1000.00"), None]
+    df = _set_first(orders20, "o_totalprice", values)
+    small = [Decimal("5.00")] * 16
+    df = _set_first(df, "o_totalprice", values + small)
+    state = _orders_state(df)
+    OPS["indian_number_string"](state, _rng(), column="o_totalprice")
+    assert state.entries[-1].rows_affected == 2
+
+
+def test_indian_number_string_on_small_ints_changes_nothing(orders20: pl.DataFrame) -> None:
+    state = _orders_state(orders20)  # o_shippriority is always 0
+    OPS["indian_number_string"](state, _rng(), column="o_shippriority")
+    assert state.entries[-1].rows_affected == 0

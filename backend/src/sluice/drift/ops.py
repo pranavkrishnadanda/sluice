@@ -15,7 +15,8 @@ primary keys* and apply the change to every ``df`` row carrying that key, so dup
 never disagree with the truth. Presentation-only ops select ``df`` rows.
 
 ``rows_affected`` counts ``df`` rows whose cell (or row) the op changed; whole-column
-conversions count non-null cells.
+conversions count non-null cells, except ``indian_number_string``, which counts only cells
+whose text actually gains a group separator.
 
 Complexity: every op is O(n) in the frame height (a few Python-level passes for the per-cell
 string work); memory is O(n) for one rewritten column.
@@ -181,13 +182,18 @@ def _replace_nth_letter(text: str, nth: int, char: str) -> str:
     raise DriftError(f"text has fewer than {nth + 1} ASCII letters: {text!r}")
 
 
+def _plain(value: Decimal | int) -> str:
+    """The ungrouped decimal rendering :func:`format_indian` starts from."""
+    return format(value, "f") if isinstance(value, Decimal) else str(value)
+
+
 def format_indian(value: Decimal | int) -> str:
     """Format a number with Indian digit grouping: ``Decimal("124500.50")`` -> ``"1,24,500.50"``.
 
     The last three integer digits form one group; groups of two follow leftwards. The fractional
     part is kept exactly as the Decimal carries it.
     """
-    text = format(value, "f") if isinstance(value, Decimal) else str(value)
+    text = _plain(value)
     sign = "-" if text.startswith("-") else ""
     whole, dot, frac = text.lstrip("-").partition(".")
     if len(whole) > 3:
@@ -214,13 +220,18 @@ def rename(state: DriftState, rng: np.random.Generator, *, column: str, new_name
 
 
 def indian_number_string(state: DriftState, rng: np.random.Generator, *, column: str) -> None:
-    """Rewrite a numeric column as strings with Indian digit grouping."""
+    """Rewrite a numeric column as strings with Indian digit grouping.
+
+    ``rows_affected`` counts only cells whose text differs from the plain decimal rendering
+    (values of magnitude 1000 and up gain a comma; ``999.00`` is unchanged).
+    """
     name = _require(
         state, column, lambda d: isinstance(d, pl.Decimal) or d.is_integer(), "decimal or integer"
     )
-    values = [None if v is None else format_indian(v) for v in state.df[name].to_list()]
+    raw = state.df[name].to_list()
+    values = [None if v is None else format_indian(v) for v in raw]
     _replace_column(state, name, values, pl.String())
-    rows = sum(v is not None for v in values)
+    rows = sum(v is not None and text != _plain(v) for v, text in zip(raw, values, strict=True))
     _record(state, "indian_number_string", {"column": column}, [column], rows)
 
 

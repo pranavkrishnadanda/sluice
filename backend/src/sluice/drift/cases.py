@@ -8,7 +8,9 @@ cases built from one seed; :func:`split_hash` locks its exact bytes.
 Recipe sampling guarantees every recipe applies without :class:`~sluice.drift.ops.DriftError`:
 each column-targeting op owns its column (so no column ever gets two dtype-changing ops),
 destroy/drop_column and value-changing ops never touch primary-key columns, ``whitespace``
-only hits enum columns (never free text, whose edge spaces can be real), ``unicode_text``
+only hits enum columns (never free text, whose edge spaces can be real),
+``indian_number_string`` only numeric columns whose values reach 1000 (see
+``SMALL_VALUED_COLUMNS``; if none is free, another op of the same set is drawn), ``unicode_text``
 only hits free-text ``*_comment`` columns, ``case_noise`` only enum columns, ``unit_paise`` only
 ``INR`` money columns, and ``fk_break`` only foreign keys (lineitem).
 
@@ -63,6 +65,14 @@ DATE_FORMAT_CHOICES: tuple[list[str], ...] = (
 )
 ADD_COLUMN_NAMES: tuple[str, ...] = ("source_system", "ingest_batch", "loaded_by")
 MONEY_UNIT = "INR"
+# Known-range rule for ``indian_number_string``: Indian grouping only inserts a comma from 1000
+# up, so a numeric column is eligible only if its TPC-H value range at ``TPCH_SF`` reaches 1000.
+# These never do (TPC-H spec ranges): o_shippriority is always 0, l_quantity is 1-50,
+# l_discount 0.00-0.10, l_tax 0.00-0.08, l_suppkey 1-(SF * 10000) = 1-100, l_linenumber 1-7.
+# A test checks this set against the real sf 0.01 data in both directions.
+SMALL_VALUED_COLUMNS: frozenset[str] = frozenset(
+    {"o_shippriority", "l_quantity", "l_discount", "l_tax", "l_suppkey", "l_linenumber"}
+)
 COMMENT_SUFFIX = "_comment"
 
 EASY_OPS: tuple[str, ...] = ("whitespace", "case_noise", "duplicate_rows", "date_format_mix")
@@ -208,7 +218,9 @@ def _eligible_columns(contract: Contract) -> dict[str, list[str]]:
     return {
         "rename": list(cols),
         "indian_number_string": [
-            n for n in non_pk if cols[n].dtype in ("decimal", "int64", "int32")
+            n
+            for n in non_pk
+            if cols[n].dtype in ("decimal", "int64", "int32") and n not in SMALL_VALUED_COLUMNS
         ],
         "unit_paise": [
             n for n in non_pk if cols[n].dtype == "decimal" and cols[n].unit == MONEY_UNIT

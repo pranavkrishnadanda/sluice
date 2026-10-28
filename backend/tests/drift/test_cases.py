@@ -16,6 +16,7 @@ from sluice.drift.cases import (
     MANIFEST_KEYS,
     Case,
     Recipe,
+    _eligible_columns,
     allocate,
     apply_recipe,
     build_case,
@@ -557,3 +558,55 @@ def test_whitespace_never_targets_free_text(table: str) -> None:
             targeted |= {p["column"] for op, p in recipe.ops if op == "whitespace"}
     assert targeted
     assert all(contract.column(c).enum is not None for c in targeted), targeted
+
+
+INDIAN_MIN = 1000  # a comma only appears from four integer digits up
+
+
+@pytest.mark.parametrize("table", TABLES)
+def test_indian_number_string_targets_only_columns_reaching_1000(
+    table: str, clean: dict[str, pl.DataFrame]
+) -> None:
+    # A column whose clean values never reach 1000 would be a no-op under Indian grouping.
+    frame = clean[table]
+    targeted = set()
+    for difficulty in ("medium", "hard"):
+        for i in range(300):
+            recipe = sample_recipe(table, difficulty, np.random.default_rng([i, 11]))
+            targeted |= {p["column"] for op, p in recipe.ops if op == "indian_number_string"}
+    assert targeted
+    small = {c for c in targeted if frame[c].cast(pl.Float64).abs().max() < INDIAN_MIN}
+    assert not small, small
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [
+        ("orders", "o_shippriority"),
+        ("lineitem", "l_quantity"),
+        ("lineitem", "l_discount"),
+        ("lineitem", "l_tax"),
+        ("lineitem", "l_suppkey"),
+    ],
+)
+def test_indian_number_string_excludes_small_valued_columns(table: str, column: str) -> None:
+    for difficulty in ("medium", "hard"):
+        for i in range(300):
+            recipe = sample_recipe(table, difficulty, np.random.default_rng([i, 13]))
+            assert ("indian_number_string", {"column": column}) not in recipe.ops
+
+
+@pytest.mark.parametrize("table", TABLES)
+def test_indian_eligible_columns_reach_1000_in_clean_data(
+    table: str, clean: dict[str, pl.DataFrame]
+) -> None:
+    # The static known-range rule must agree with the actual sf 0.01 data, both ways.
+    contract = load_contract(table)
+    eligible = set(_eligible_columns(contract)["indian_number_string"])
+    numeric = {
+        c.name
+        for c in contract.columns
+        if c.dtype in ("decimal", "int64", "int32") and c.name not in contract.primary_key
+    }
+    reaches = {c for c in numeric if clean[table][c].cast(pl.Float64).abs().max() >= INDIAN_MIN}
+    assert eligible == reaches
