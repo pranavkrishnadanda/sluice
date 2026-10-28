@@ -210,20 +210,33 @@ A run emits, in order: `run_started`, `profiled`, `rules_applied`,
 `plan_created`, then for each plan node `node_started` followed by either
 `node_finished` or `attempt_failed`. An `attempt_failed` with
 `attempt < maxAttempts` is followed by a `node_started` for the next attempt
-of the same node, unless the run ends there: an `attempt_failed` may be
-followed directly by `run_finished` when the run ends (a provider outage, a
-spend/time cap or a crash). Then `verified`, `loaded`, and finally
-`run_finished`. An empty `plan_created.nodes` means deterministic rules handled everything
+of the same node, unless the run ends there. Then `verified`, `loaded`, and
+finally `run_finished`. An empty `plan_created.nodes` means deterministic rules handled everything
 and no model was called.
 
 `node_started.maxAttempts` (equal to `attempt_failed.maxAttempts` for that
 node) lets the UI show "attempt 1/3" from the first attempt.
 
+Independent nodes run concurrently, so the events of different nodes may
+interleave; the order above holds per node.
+
+**Early end.** A run can end early: a crash, a cancellation, a provider
+outage it could not route around, or a spend/time cap. Then a node's last
+`attempt_failed` (with `attempt < maxAttempts`) has no following
+`node_started`, a `node_started` may have no `node_finished` or
+`attempt_failed` at all (the node was stopped mid-attempt), and events of
+other nodes that were still running may appear between a node's last event
+and `run_finished`. Clients treat `run_finished` as closing every node that
+is still open.
+
 **Failure path.** If a node's final attempt fails (`attempt_failed` with
 `attempt == maxAttempts`), no further nodes start (nodes already running
 finish, and their events are still emitted) and the run does **not** emit
 `verified` or `loaded`: it ends with `run_finished` with status `quarantined`
-(the input is held back; nothing was written).
+(the input is held back; nothing was written). This takes precedence over
+`failed`: if a node's final attempt fails and another node also hits a
+provider outage, the run is `quarantined`. Nothing loads either way, and the
+quarantine is the more specific signal.
 
 **Exactly one terminal event.** Every run ends with exactly one
 `run_finished`, whatever happens: a worker crash, a model-provider outage
@@ -241,6 +254,8 @@ or a spend/time cap still produces a `run_finished` (status `failed` or
   data's quality. An outage during schema mapping or planning is not a
   failure: that step falls back to the deterministic rules, the run can
   still succeed, and `run_finished.summary` names the step that fell back.
+  When a node's final attempt fails as well, the run is `quarantined`, not
+  `failed` (see the failure path).
 
 `node_finished.tier` is the tier that produced the accepted transform, which
 may be higher than the planned `PlanNode.tier` after escalation.

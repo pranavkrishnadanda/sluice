@@ -71,6 +71,7 @@ ISO_DATES = _module(
     "    return values.str.to_date('%d %b %Y', strict=False).dt.strftime('%Y-%m-%d')"
 )
 NO_TRANSFORM = "import polars as pl\n\nx = 1\n"  # fails precheck: no `def transform`
+DOWN = "<provider outage>"  # a worker queue entry that makes that call fail with HTTP 503
 
 _ROLE_BY_PROMPT = {
     MAPPER_PROMPT: "mapper",
@@ -156,7 +157,10 @@ class Script:
             if match.group(1) in self.down_columns:
                 raise ModelHTTPError(503, "script")
             queue = self.workers[match.group(1)]
-            out = {"code": queue.pop(0) if len(queue) > 1 else queue[0], "explanation": "fix"}
+            code = queue.pop(0) if len(queue) > 1 else queue[0]
+            if code == DOWN:
+                raise ModelHTTPError(503, "script")
+            out = {"code": code, "explanation": "fix"}
         else:
             accept = self.verdicts.pop(0) if self.verdicts else True
             out = {"accept": accept, "reason": "pairs look right" if accept else "100x too large"}
@@ -947,3 +951,18 @@ def test_pipeline_transform_id_is_derived_from_run_node_and_attempt(indian: Case
     assert pipeline.transform_id("other-run", long_id, 2) != expected  # globally unique
     (meta_node,) = result.out.meta["nodes"]
     assert meta_node["transform_id"] == expected
+
+
+def test_pipeline_exhausted_node_quarantine_wins_over_sibling_outage(two_columns: Case) -> None:
+    # Ruling C4c: n1 exhausts its attempts while sibling n2 hits a worker outage on attempt 3.
+    plan = {"nodes": [node("n1", "o_totalprice"), node("n2", "o_orderdate")]}
+    workers = {"o_totalprice": [CRASH], "o_orderdate": [CRASH, CRASH, DOWN]}
+    result = run(two_columns, Script(plan=plan, workers=workers))
+    n1, n2 = result.out.meta["plan_nodes"]
+    assert (n1["attempts"], n1["accepted"]) == (MAX_ATTEMPTS, False)
+    assert result.out.meta["nodes"][1]["outage"] is True
+    assert "worker n2" in result.out.meta["llm_error"]
+    assert result.out.file_quarantined
+    assert not result.events("verified")
+    (finished,) = result.events("run_finished")
+    assert finished.status == "quarantined"  # type: ignore[attr-defined]

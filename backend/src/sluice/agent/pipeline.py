@@ -35,9 +35,12 @@ code, a failed precheck, or a bad verdict) is an ordinary failed attempt. A mapp
 fallback does not make the run ``failed``: the status follows the data (``succeeded`` /
 ``quarantined``) and the summary names the step that fell back. ``LLMUnavailable`` in a worker
 or verifier call keeps a planned node from being accepted, so the run could not complete: no new
-attempt or node starts, the node's last ``attempt_failed`` is followed directly by
-``run_finished`` (``failed``, no ``verified``), and the output is rules pass 1 with
-``meta["llm_error"]``. ``failed`` otherwise means a cap stopped a planned node, the sandbox itself
+attempt or node starts, the node gets no further ``node_started``, and once the nodes in flight
+finish the run ends with ``run_finished`` (``failed``, no ``verified``); the output is rules
+pass 1 with ``meta["llm_error"]``. Precedence (Ruling C4c): when a node exhausts its attempts
+and a sibling hits such an outage, the whole-file quarantine wins (status ``quarantined``:
+nothing loads either way, and the quarantine is the more specific signal). ``failed``
+otherwise means a cap stopped a planned node, the sandbox itself
 was unavailable, or the run crashed.
 
 Crashes: any other ``Exception`` (read error, Docker API error, Polars error, internal bug) ends
