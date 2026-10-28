@@ -213,12 +213,12 @@ function NodeTransforms({ group }: { group: TransformGroup }) {
 
   return (
     <section aria-labelledby={headingId} className="space-y-2.5">
-      <h3 id={headingId} className="text-pretty font-medium text-sm leading-5">
+      <h2 id={headingId} className="text-pretty font-medium text-sm leading-5">
         <span className="mr-1.5 font-mono text-muted text-xs">
           {group.nodeId}
         </span>
         {group.title}
-      </h3>
+      </h2>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <fieldset className="flex flex-wrap gap-1 rounded-[12px] bg-chip p-1">
