@@ -784,3 +784,49 @@ def test_locked_subdir_in_out_counts_as_over_the_limit() -> None:
     assert result.ok is False
     assert result.error is not None and "limit" in result.error
     assert client.container is not None and client.container.kills >= 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        docker.errors.ContextException("broken context"),
+        ValueError("corrupt context meta.json"),
+        OSError("unreadable context store"),
+    ],
+)
+def test_get_docker_client_broken_context_raises_sandbox_error(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Final review minor #12: a broken Docker context takes the sandbox-unavailable path."""
+
+    def broken(**kwargs: Any) -> None:
+        raise docker.errors.DockerException("down")
+
+    def context() -> None:
+        raise error
+
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setattr(runner.docker, "from_env", broken)
+    monkeypatch.setattr(runner.ContextAPI, "get_current_context", staticmethod(context))
+    with pytest.raises(SandboxError, match="context"):
+        runner.get_docker_client()
+
+
+def test_get_docker_client_bad_context_host_raises_sandbox_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Ctx:
+        Host = "not a url"
+
+    def broken(**kwargs: Any) -> None:
+        raise docker.errors.DockerException("down")
+
+    def bad_client(**kwargs: Any) -> None:
+        raise ValueError("bad base_url")
+
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setattr(runner.docker, "from_env", broken)
+    monkeypatch.setattr(runner.docker, "DockerClient", bad_client)
+    monkeypatch.setattr(runner.ContextAPI, "get_current_context", staticmethod(lambda: Ctx()))
+    with pytest.raises(SandboxError, match="context"):
+        runner.get_docker_client()

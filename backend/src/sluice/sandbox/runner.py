@@ -145,8 +145,9 @@ def get_docker_client() -> docker.DockerClient:
     Colima is found).
 
     Raises:
-        SandboxError: no daemon is reachable (the message never includes the host URL, which
-            may carry credentials).
+        SandboxError: no daemon is reachable, or the current Docker context cannot be read or
+            names an unusable host (the message never includes the host URL, which may carry
+            credentials).
     """
     explicit = bool(os.environ.get("DOCKER_HOST"))
     try:
@@ -159,7 +160,14 @@ def get_docker_client() -> docker.DockerClient:
                 "DOCKER_HOST is set but no Docker daemon is reachable there "
                 f"({type(env_error).__name__}); fix or unset DOCKER_HOST"
             ) from None
-        context = ContextAPI.get_current_context()
+        try:
+            context = ContextAPI.get_current_context()
+        except (docker.errors.DockerException, OSError, ValueError) as ctx_error:
+            # A broken context store must not crash the run: it is "no sandbox", not a bug.
+            raise SandboxError(
+                f"Docker daemon not reachable ({type(env_error).__name__}) and the current "
+                f"Docker context cannot be read ({type(ctx_error).__name__})"
+            ) from None
         host = getattr(context, "Host", None)
         if not host:
             raise SandboxError(
@@ -170,7 +178,7 @@ def get_docker_client() -> docker.DockerClient:
             client = docker.DockerClient(base_url=host, timeout=DOCKER_API_TIMEOUT_S)
             client.ping()
             return client
-        except docker.errors.DockerException as ctx_error:
+        except (docker.errors.DockerException, OSError, ValueError) as ctx_error:
             raise SandboxError(
                 "Docker daemon of the current Docker context is not reachable "
                 f"({type(ctx_error).__name__})"
