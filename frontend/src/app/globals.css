@@ -4,9 +4,16 @@
  * Sluice liquid-glass design tokens.
  *
  * Values come from docs/design/ui-mockup-liquid-glass.html (`.light` / `.dark`).
- * Text and status colours were darkened (light) or lightened (dark) from the
- * mockup so every one reaches WCAG AA (>= 4.5:1) against the glass surface
- * composited over the worst-case blob, and against --glass-solid.
+ * Every text token (--text, --text-muted, --accent, --ok, --warn, --error) was
+ * darkened (light) or lightened (dark) from the mockup until it reaches WCAG AA
+ * (>= 4.5:1) on all of these surfaces:
+ *   - --glass-bg over each blob at full strength (no blur averaging) over each
+ *     --bg gradient stop, with the glass saturate(170%) backdrop filter applied
+ *     (modelled in both sRGB and linear light) and without it;
+ *   - the same with --chip-bg layered on top;
+ *   - --glass-solid, alone and with --chip-bg.
+ * The ratios in the comments below are those worst cases. tests/design/
+ * contrast.test.ts recomputes them from this file, so a regression fails CI.
  *
  * Theme selection: `<html data-theme="system|light|dark">`, set before paint by
  * the inline script in layout.tsx. With no attribute (JS disabled) the OS
@@ -48,17 +55,17 @@
   /* Raised element on glass (selected item, user bubble, pill controls). */
   --glass-highlight: rgb(255 255 255 / 0.7);
 
-  --text: #1d1d1f; /* 11.8:1 worst case */
-  --text-muted: #4d4d55; /* 5.9:1 worst case; 5.2:1 on --chip-bg */
-  --accent: #1f4fd1; /* 4.8:1 as text; mockup #3a6dff is 3.1:1 */
+  --text: #1d1d1f; /* 10.1:1 */
+  --text-muted: #4d4d55; /* 5.0:1 */
+  --accent: #1c48be; /* 4.6:1; mockup #3a6dff is 2.6:1 */
   --accent-fill: linear-gradient(160deg, #6aa8ff, #3a6dff);
   --accent-shadow:
     0 2px 10px rgb(58 109 255 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.6);
-  --ok: #136536; /* 5.0:1; mockup #2fb36b is 1.4:1 */
-  --warn: #8a5000; /* 4.6:1; mockup #f0a030 is 1.1:1 */
-  --error: #a81d27; /* 5.1:1 */
+  --ok: #125f33; /* 4.6:1; mockup #2fb36b is 1.6:1 */
+  --warn: #794600; /* 4.7:1; mockup #f0a030 is 1.1:1 */
+  --error: #a11c25; /* 4.6:1 */
   --chip-bg: rgb(0 0 0 / 0.06);
-  --focus-ring: #1f4fd1;
+  --focus-ring: #1c48be;
 }
 
 [data-theme="dark"] {
@@ -81,17 +88,17 @@
     0 8px 30px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.12);
   --glass-highlight: rgb(255 255 255 / 0.12);
 
-  --text: #f2f2f7; /* 9.5:1 worst case */
-  --text-muted: #b4b4c0; /* 5.2:1 worst case; 4.6:1 on --chip-bg */
-  --accent: #8fb0ff; /* 5.0:1 */
+  --text: #f2f2f7; /* 8.0:1 */
+  --text-muted: #babac5; /* 4.6:1 */
+  --accent: #9ebaff; /* 4.6:1 */
   --accent-fill: linear-gradient(160deg, #6aa8ff, #3a6dff);
   --accent-shadow:
     0 2px 10px rgb(58 109 255 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.6);
-  --ok: #4cd68a; /* 5.7:1 */
-  --warn: #ffb84d; /* 6.2:1 */
-  --error: #ff8a8a; /* 4.7:1 */
+  --ok: #4cd68a; /* 4.8:1 */
+  --warn: #ffb84d; /* 5.2:1 */
+  --error: #ffa1a1; /* 4.6:1 */
   --chip-bg: rgb(255 255 255 / 0.1);
-  --focus-ring: #8fb0ff;
+  --focus-ring: #9ebaff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -116,16 +123,16 @@
     --glass-highlight: rgb(255 255 255 / 0.12);
 
     --text: #f2f2f7;
-    --text-muted: #b4b4c0;
-    --accent: #8fb0ff;
+    --text-muted: #babac5;
+    --accent: #9ebaff;
     --accent-fill: linear-gradient(160deg, #6aa8ff, #3a6dff);
     --accent-shadow:
       0 2px 10px rgb(58 109 255 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.6);
     --ok: #4cd68a;
     --warn: #ffb84d;
-    --error: #ff8a8a;
+    --error: #ffa1a1;
     --chip-bg: rgb(255 255 255 / 0.1);
-    --focus-ring: #8fb0ff;
+    --focus-ring: #9ebaff;
   }
 }
 
