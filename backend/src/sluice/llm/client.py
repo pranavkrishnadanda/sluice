@@ -43,14 +43,20 @@ from sluice.llm import prices
 
 Tier = Literal["small", "strong"]
 
-REQUEST_TIMEOUT_S: Final = 60.0
+REQUEST_TIMEOUT_S: Final = 90.0
 """Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
 
-A third of ``caps.MAX_WALL_S_PER_FILE`` (180 s), so a single hung call cannot by itself double
-a file's wall time (the wall cap is checked per attempt). It equals the router's per-deployment
-``timeout`` in ``backend/litellm/config.yaml``: a deployment that hangs for the full router
-timeout surfaces here as ``LLMUnavailable`` (the pipeline's outage path) rather than reaching
-its fallback group, while ordinary errors still fall back well inside the cap."""
+Nested between the proxy's worst case and the per-file wall cap, so a hung deployment still
+reaches its fallback and one hung call cannot double a file's wall time. From
+``backend/litellm/config.yaml`` (per-attempt timeouts: local ``small`` 20 s, hosted 30 s; a
+timeout is not retried, it goes to the fallback group), the worst-case proxy path is:
+
+* small:  20 x (1 + 0 retries) + small-fallback 30 x (1 + 0) = 50 s
+* strong: 30 x (1 + 0 retries) + strong-fallback 30 x (1 + 0) = 60 s
+
+so 60 s < 90 s (this) < 180 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
+overhead and fast-failing 429/5xx retries. ``tests/llm/test_litellm_config.py`` asserts the
+nesting from the config itself."""
 
 CONNECT_TIMEOUT_S: Final = 5.0
 

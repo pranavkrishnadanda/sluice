@@ -398,7 +398,7 @@ def test_request_timeout_is_below_the_per_file_wall_cap() -> None:
     from sluice.agent.caps import MAX_WALL_S_PER_FILE
     from sluice.llm.client import REQUEST_TIMEOUT_S
 
-    assert REQUEST_TIMEOUT_S <= MAX_WALL_S_PER_FILE / 3
+    assert REQUEST_TIMEOUT_S < MAX_WALL_S_PER_FILE
     llm = LLM(BASE_URL, API_KEY)
     assert llm._http.timeout.read == REQUEST_TIMEOUT_S
     run(llm.aclose())

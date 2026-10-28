@@ -26,6 +26,7 @@ model_list:
     litellm_params:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
+      timeout: 30  # per attempt; see "Timeouts" under router_settings
       # Groq free plan (https://console.groq.com/docs/rate-limits, "Free Plan Limits" tab,
       # read 2026-10-28): 30 RPM, 1K RPD, 8K TPM, 200K TPD. Verify in console (/settings/limits).
       rpm: 30
@@ -42,6 +43,7 @@ model_list:
     litellm_params:
       model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY
+      timeout: 30  # per attempt; see "Timeouts" under router_settings
       # Google publishes free-tier limits only in AI Studio, not in its public docs
       # (https://ai.google.dev/gemini-api/docs/rate-limits points to the AI Studio page). These are
       # conservative placeholders. Verify in console (AI Studio > Rate limits) and adjust.
@@ -61,6 +63,7 @@ model_list:
       model: openai/Qwen3.5-4B-MLX-4bit
       api_base: http://host.docker.internal:58000/v1
       api_key: "none"  # local vLLM, no auth
+      timeout: 20  # per attempt; see "Timeouts" under router_settings
       # Optional: when vLLM is not running, the connection error falls back to small-fallback.
       # No rpm/tpm here: the local server has no provider quota.
     model_info:
@@ -76,6 +79,7 @@ model_list:
     litellm_params:
       model: groq/openai/gpt-oss-20b
       api_key: os.environ/GROQ_API_KEY
+      timeout: 30  # per attempt; see "Timeouts" under router_settings
       # Groq free plan (same source as above): 30 RPM, 1K RPD, 8K TPM, 200K TPD.
       # Verify in console.
       rpm: 30
@@ -93,10 +97,21 @@ router_settings:
   optional_pre_call_checks: ["enforce_model_rate_limits"]
   redis_host: redis
   redis_port: 6379
-  timeout: 60
+  # Timeouts (nested so a hung deployment still reaches its fallback). Each deployment sets its
+  # own per-attempt `timeout` in litellm_params (LiteLLM v1.106.5 router._get_timeout: request
+  # kwarg > deployment litellm_params.timeout > this router default): local `small` 20 s,
+  # hosted 30 s. A timeout is not retried on the same group (TimeoutErrorRetries: 0), so it moves
+  # straight to the fallback. Worst case, every attempt hanging:
+  #   small:  20 x (1 + 0) + 30 x (1 + 0) = 50 s
+  #   strong: 30 x (1 + 0) + 30 x (1 + 0) = 60 s
+  # sluice.llm.client.REQUEST_TIMEOUT_S (90 s) must exceed both, and caps.MAX_WALL_S_PER_FILE
+  # (180 s) must exceed the client timeout; tests/llm/test_litellm_config.py asserts this.
+  # (One timeout retry per hosted group would make strong 30x2 + 30x2 = 120 s.)
+  timeout: 30
   num_retries: 2
-  # Retries (retry_policy): 429, 500, 503 and timeouts are retried up to 2 times on the SAME
-  # group (here one deployment), so up to 3 attempts before the fallback. Bad request, auth,
+  # Retries (retry_policy): 429, 500 and 503 are retried up to 2 times on the SAME group (here
+  # one deployment), so up to 3 attempts before the fallback; a timeout is not retried (see
+  # "Timeouts" above). Bad request, auth,
   # not found, content-policy and every other error get 0 retries and go straight to the
   # fallback. The `small` group gets 0 retries for everything (model_group_retry_policy).
   #
@@ -127,7 +142,7 @@ router_settings:
     RateLimitErrorRetries: 2
     InternalServerErrorRetries: 2
     ServiceUnavailableErrorRetries: 2
-    TimeoutErrorRetries: 2
+    TimeoutErrorRetries: 0
     BadRequestErrorRetries: 0
     AuthenticationErrorRetries: 0
     NotFoundErrorRetries: 0
