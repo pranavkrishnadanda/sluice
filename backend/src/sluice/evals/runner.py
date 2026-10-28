@@ -7,7 +7,9 @@ A run writes two files into its output directory:
   field (including ``file_quarantined``), then ``cost_usd`` and ``latency_s``. Booleans stay
   JSON booleans.
 * ``summary.json`` -- the :class:`EvalSummary` plus ``created_at`` (UTC) and ``cases_sha256``
-  (the :func:`~sluice.drift.cases.split_hash` of the cases actually evaluated).
+  (the :func:`~sluice.drift.cases.split_hash` of the cases actually evaluated). A subset run
+  (``limit``: the first N cases by id) also records ``split_sha256``, the hash of the whole split,
+  which is what ``LOCK.json`` pins; the subset is shown as ``subset n=N`` in ``RESULTS.md``.
 
 Aggregation: for each case, each metric is averaged over its trials (``None`` trials skipped;
 booleans as 0/1); :func:`~sluice.evals.stats.bootstrap_ci` (``seed=0``) then runs over the
@@ -39,14 +41,19 @@ from sluice.drift.cases import load_reference, load_split, split_hash
 from sluice.evals.graders import grade
 from sluice.evals.stats import bootstrap_ci, clopper_pearson, pass_hat_k
 from sluice.evals.types import CaseInput, System
+from sluice.systems.agent import AgentSystem
 from sluice.systems.rules_only import RulesOnlySystem
 
-SYSTEMS: dict[str, Callable[[], System]] = {"rules": RulesOnlySystem}
+SYSTEMS: dict[str, Callable[[], System]] = {"rules": RulesOnlySystem, "agent": AgentSystem}
 
 SYSTEM_DESCRIPTIONS: dict[str, str] = {
     "rules": (
         "the rules-only baseline (deterministic profiling and repair rules, no model calls; "
         "it flags what it cannot recover instead of guessing)"
+    ),
+    "agent": (
+        "the agent system (LLM schema mapping, a repair plan, sandboxed transforms checked by a "
+        "fabrication guard and an independent verifier, then the same deterministic rules)"
     ),
 }
 
@@ -116,10 +123,18 @@ class EvalSummary:
     n_file_quarantined: int = 0
     n_file_quarantined_by_difficulty: dict[str, int] = field(default_factory=dict)
     n_file_quarantined_fabrication_defined: int = 0
+    limit: int | None = None
+    """Set for a subset run: only the first ``limit`` cases (by id) of the split were run."""
 
-    def to_json(self, cases_sha256: str | None = None) -> dict[str, Any]:
-        """JSON-ready dict; CIs become ``[mean, lo, hi]`` lists."""
-        return {
+    def to_json(
+        self, cases_sha256: str | None = None, split_sha256: str | None = None
+    ) -> dict[str, Any]:
+        """JSON-ready dict; CIs become ``[mean, lo, hi]`` lists.
+
+        ``limit`` and ``split_sha256`` are written only for a subset run, so a full run's
+        ``summary.json`` keeps its earlier shape.
+        """
+        out: dict[str, Any] = {
             "system": self.system,
             "split": self.split,
             "trials": self.trials,
@@ -140,6 +155,10 @@ class EvalSummary:
             "n_file_quarantined_fabrication_defined": self.n_file_quarantined_fabrication_defined,
             "cases_sha256": cases_sha256,
         }
+        if self.limit is not None:
+            out["limit"] = self.limit
+            out["split_sha256"] = split_sha256
+        return out
 
     @classmethod
     def from_json(cls, raw: Mapping[str, Any]) -> EvalSummary:
@@ -169,11 +188,14 @@ class EvalSummary:
             n_file_quarantined_fabrication_defined=int(
                 raw.get("n_file_quarantined_fabrication_defined", 0)
             ),
+            limit=None if raw.get("limit") is None else int(raw["limit"]),
         )
 
-    def write(self, path: Path, cases_sha256: str | None = None) -> None:
+    def write(
+        self, path: Path, cases_sha256: str | None = None, split_sha256: str | None = None
+    ) -> None:
         """Write ``summary.json`` to ``path``."""
-        text = json.dumps(self.to_json(cases_sha256), indent=2) + "\n"
+        text = json.dumps(self.to_json(cases_sha256, split_sha256), indent=2) + "\n"
         path.write_text(text, encoding="utf-8")
 
 
@@ -207,6 +229,7 @@ def summarize(
     trials: int,
     *,
     created_at: datetime | None = None,
+    limit: int | None = None,
 ) -> EvalSummary:
     """Aggregate ``results.jsonl`` rows into an :class:`EvalSummary` (module docstring).
 
@@ -265,6 +288,7 @@ def summarize(
             for q, c in zip(quarantined, per_case, strict=True)
             if c["fabrication_rate"] is not None
         ),
+        limit=limit,
     )
 
 
@@ -276,6 +300,7 @@ def run_eval(
     out_dir: Path,
     *,
     created_at: datetime | None = None,
+    limit: int | None = None,
 ) -> EvalSummary:
     """Run ``system`` ``trials`` times on every case in ``cases_dir`` and grade each run.
 
@@ -286,18 +311,25 @@ def run_eval(
         cases_dir: The split directory holding ``<split>-NNNN/`` cases.
         out_dir: Where ``results.jsonl`` and ``summary.json`` are written (created if needed).
         created_at: Run timestamp recorded in the summary (default: now, UTC).
+        limit: Run only the first ``limit`` cases by id (a subset run). A limit at or above the
+            split size runs the whole split and is recorded as a full run.
 
     Raises:
-        ValueError: for an unknown system, ``trials < 1`` or an empty ``cases_dir``.
+        ValueError: for an unknown system, ``trials < 1``, ``limit < 1`` or an empty
+            ``cases_dir``.
     """
     factory = SYSTEMS.get(system)
     if factory is None:
         raise ValueError(f"unknown system {system!r}; known: {', '.join(sorted(SYSTEMS))}")
     if trials < 1:
         raise ValueError(f"trials must be >= 1, got {trials}")
-    cases = sorted(load_split(cases_dir), key=lambda c: c.case_id)
-    if not cases:
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    split_cases = sorted(load_split(cases_dir), key=lambda c: c.case_id)
+    if not split_cases:
         raise ValueError(f"no cases in {cases_dir}")
+    subset = limit if limit is not None and limit < len(split_cases) else None
+    cases = split_cases if subset is None else split_cases[:subset]
     created = (created_at or _now()).astimezone(UTC)
 
     sut = factory()
@@ -328,13 +360,20 @@ def run_eval(
                 fh.write(json.dumps(row) + "\n")
                 rows.append(row)
 
-    summary = summarize(rows, system, split, trials, created_at=created)
-    summary.write(out_dir / SUMMARY_FILE, cases_sha256=split_hash(cases))
+    summary = summarize(rows, system, split, trials, created_at=created, limit=subset)
+    summary.write(
+        out_dir / SUMMARY_FILE,
+        cases_sha256=split_hash(cases),
+        split_sha256=None if subset is None else split_hash(split_cases),
+    )
     return summary
 
 
 def latest_summaries(runs_dir: Path) -> list[tuple[EvalSummary, str | None]]:
-    """The newest summary per (system, split) under ``runs_dir``, with its ``cases_sha256``.
+    """The newest summary per (system, split) under ``runs_dir``, with the split hash it ran on.
+
+    The hash is ``cases_sha256`` for a full run and ``split_sha256`` (the whole split the subset
+    was taken from, which is what ``LOCK.json`` pins) for a subset run.
 
     Run directories are named ``<UTC timestamp>-<system>-<split>``, so the lexicographically
     last directory holding a ``summary.json`` wins. Sorted by (system, split).
@@ -345,7 +384,8 @@ def latest_summaries(runs_dir: Path) -> list[tuple[EvalSummary, str | None]]:
     for run in sorted(p for p in runs_dir.iterdir() if (p / SUMMARY_FILE).is_file()):
         raw = json.loads((run / SUMMARY_FILE).read_text(encoding="utf-8"))
         summary = EvalSummary.from_json(raw)
-        latest[(summary.system, summary.split)] = (summary, raw.get("cases_sha256"))
+        sha = raw.get("split_sha256") if summary.limit is not None else raw.get("cases_sha256")
+        latest[(summary.system, summary.split)] = (summary, sha)
     return [latest[k] for k in sorted(latest)]
 
 
@@ -401,9 +441,15 @@ def _cell(metric: str, ci: CI | None, n_defined: int | None, n_row: int | None) 
 
 def eval_command(summary: EvalSummary) -> str:
     """The shell command that reproduces ``summary``'s run, from the repo root."""
-    return (
+    command = (
         f"{_CLI} eval --system {summary.system} --split {summary.split} --trials {summary.trials}"
     )
+    return command if summary.limit is None else f"{command} --limit {summary.limit}"
+
+
+def _split_label(s: EvalSummary) -> str:
+    """``dev``, or ``dev (subset n=30)`` for a subset run."""
+    return s.split if s.limit is None else f"{s.split} (subset n={s.limit})"
 
 
 def _row(cells: Iterable[object]) -> str:
@@ -445,7 +491,9 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         raise ValueError("no summaries to render")
     runs = "; ".join(
         f"{SYSTEM_DESCRIPTIONS.get(s.system, f'the `{s.system}` system')} on the `{s.split}` "
-        f"split ({_plural(s.n_cases, 'case')}, {_plural(s.trials, 'trial')} per case)"
+        f"split ({_plural(s.n_cases, 'case')}"
+        + ("" if s.limit is None else f", a subset: the first {s.limit} cases by id")
+        + f", {_plural(s.trials, 'trial')} per case)"
         for s in summaries
     )
     tail = _CLI.removeprefix("cd backend && ")
@@ -492,7 +540,7 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
             _cell(k, s.metrics.get(k), s.n_defined.get(k), s.n_cases) for _, k in _TABLE_METRICS
         ]
         cells.append(f"{s.n_file_quarantined}/{s.n_cases}")
-        main.append(_row([s.system, s.split, s.n_cases, s.trials, *cells]))
+        main.append(_row([s.system, _split_label(s), s.n_cases, s.trials, *cells]))
     notes = [note for s in summaries for note in _notes(s)] + [
         "Contract pass checks the output against the table contract with flagged cells exempt, "
         "so a system that flags what it cannot recover can pass the contract and still fail "
@@ -510,7 +558,7 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
             cells = [_cell(k, m.get(k), counts.get(k), n_d) for _, k in _TABLE_METRICS]
             q_d = s.n_file_quarantined_by_difficulty.get(d)
             cells.append(_NONE if q_d is None or n_d is None else f"{q_d}/{n_d}")
-            diff.append(_row([s.system, s.split, d, _NONE if n_d is None else n_d, *cells]))
+            diff.append(_row([s.system, _split_label(s), d, _NONE if n_d is None else n_d, *cells]))
 
     pass_hats = [
         f"- `{s.system}` on `{s.split}`: pass^{s.trials} = {s.pass_hat_k * 100:.1f}%"

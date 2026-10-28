@@ -165,6 +165,10 @@ def eval_cmd(
         Path | None,
         typer.Option(help="Exact run directory (default: <runs-dir>/<UTC>-<system>-<split>)."),
     ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option(min=1, help="Run only the first N cases by id (a subset, 'subset n=N')."),
+    ] = None,
 ) -> None:
     """Run a system over a split; write results.jsonl and summary.json to a new run directory."""
     if system not in SYSTEMS:
@@ -178,7 +182,7 @@ def eval_cmd(
         raise typer.Exit(1)
     try:
         summary = run_eval(
-            system, split.value, trials, cases_dir / split.value, out, created_at=now
+            system, split.value, trials, cases_dir / split.value, out, created_at=now, limit=limit
         )
     except ValueError as exc:
         typer.echo(str(exc), err=True)

@@ -123,8 +123,8 @@ class NodeLike(Protocol):
     def issue(self) -> str: ...
 
 
-class TransformCode(BaseModel):
-    """A model-written transform. `code` must pass `precheck_code` (else the model is re-asked)."""
+class TransformDraft(BaseModel):
+    """A model-written transform, not yet prechecked (the caller runs `precheck_code`)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
@@ -138,6 +138,10 @@ class TransformCode(BaseModel):
         max_length=MAX_EXPLANATION_CHARS,
         description="One sentence: what the transform changes.",
     )
+
+
+class TransformCode(TransformDraft):
+    """A model-written transform. `code` must pass `precheck_code` (else the model is re-asked)."""
 
     @field_validator("code")
     @classmethod
@@ -310,12 +314,21 @@ async def write_transform(
     prior_error: str | None,
     tier: Tier,
     llm: LLM,
-) -> tuple[TransformCode, CallRecord]:
-    """Ask the `tier` model for a transform for `node`'s column; the code is prechecked, not run.
+    *,
+    checked: bool = True,
+) -> tuple[TransformDraft, CallRecord]:
+    """Ask the `tier` model for a transform for `node`'s column; the code is never run here.
+
+    With ``checked`` (default) the output is a `TransformCode`: `precheck_code` runs inside schema
+    validation, so a failure is fed back by the client's one repair retry. With
+    ``checked=False`` the output is a `TransformDraft` and the caller runs `precheck_code`
+    itself, which keeps the precise reason (the pipeline's repair loop feeds it back).
 
     Raises:
-        LLMOutputError: the code failed validation (incl. `precheck_code`) after the repair retry.
+        LLMOutputError: the output failed validation (incl. `precheck_code` when ``checked``)
+            after the repair retry.
         LLMUnavailable: no route could serve the call.
     """
     prompt = build_worker_prompt(node, spec, source_name, samples, prior_error)
-    return await llm.run(WORKER_ROLE, tier, WORKER_SYSTEM_PROMPT, prompt, TransformCode)
+    output_type: type[TransformDraft] = TransformCode if checked else TransformDraft
+    return await llm.run(WORKER_ROLE, tier, WORKER_SYSTEM_PROMPT, prompt, output_type)

@@ -582,3 +582,87 @@ def test_render_results_intro_names_the_exact_binomial_method() -> None:
 def test_render_results_labels_the_case_build_environment() -> None:
     md = render_results([_summary()], LOCK)
     assert "- Case-build environment (from `LOCK.json`): duckdb 2.0.0, polars 2.1.0" in md
+
+
+# --- --limit (subset runs, Ruling P3) ---------------------------------------------------------
+
+
+def test_run_eval_limit_takes_first_cases_by_id(small_cases: Path, tmp_path: Path) -> None:
+    s = run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=2)
+    ids = [r["case_id"] for r in _lines(tmp_path / "out" / "results.jsonl")]
+    assert ids == sorted(c.case_id for c in load_split(small_cases))[:2]
+    assert (s.n_cases, s.limit) == (2, 2)
+
+
+def test_run_eval_limit_records_subset_and_full_split_hash(
+    small_cases: Path, tmp_path: Path
+) -> None:
+    run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=2)
+    raw = json.loads((tmp_path / "out" / "summary.json").read_text(encoding="utf-8"))
+    cases = sorted(load_split(small_cases), key=lambda c: c.case_id)
+    assert raw["limit"] == 2
+    assert raw["cases_sha256"] == split_hash(cases[:2])
+    assert raw["split_sha256"] == split_hash(cases)
+    assert load_summary(tmp_path / "out" / "summary.json").limit == 2
+
+
+def test_run_eval_limit_larger_than_split_is_whole_split(small_cases: Path, tmp_path: Path) -> None:
+    s = run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=100)
+    assert s.n_cases == 6
+    assert s.limit is None
+
+
+def test_run_eval_rejects_zero_limit(small_cases: Path, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        run_eval("rules", "dev", 1, small_cases, tmp_path / "out", limit=0)
+
+
+def test_render_results_marks_subset_runs() -> None:
+    md = render_results([_summary(system="agent", limit=2), _summary()], LOCK)
+    assert "| agent | dev (subset n=2) | 2 |" in md
+    assert "| rules | dev | 2 |" in md
+    assert "--system agent --split dev --trials 1 --limit 2" in md
+    assert "first 2 cases by id" in md
+
+
+def test_render_results_without_limit_is_unchanged_by_subset_support() -> None:
+    md = render_results([_summary()], LOCK)
+    assert "subset" not in md and "--limit" not in md
+
+
+def test_systems_registry_has_agent() -> None:
+    from sluice.systems.agent import AgentSystem
+
+    assert SYSTEMS["agent"] is AgentSystem
+
+
+def test_cli_eval_limit_and_results_accept_subset(small_cases: Path, tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    run_dir = runs / "20261028T120000Z-rules-dev"
+    res = CliRunner().invoke(
+        app,
+        ["eval", "--system", "rules", "--split", "dev", "--limit", "3"]
+        + ["--cases-dir", str(small_cases.parent), "--out-dir", str(run_dir)],
+    )
+    assert res.exit_code == 0, res.output
+    assert "3 cases" in res.output
+    lock = tmp_path / "LOCK.json"
+    sha = split_hash(load_split(small_cases))
+    lock.write_text(
+        json.dumps({"environment": LOCK["environment"], "splits": {"dev": {"sha256": sha}}}),
+        encoding="utf-8",
+    )
+    out = tmp_path / "RESULTS.md"
+    args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    res = CliRunner().invoke(app, args)
+    assert res.exit_code == 0, res.output
+    assert "dev (subset n=3)" in out.read_text(encoding="utf-8")
+
+
+def test_cli_eval_rejects_zero_limit(small_cases: Path, tmp_path: Path) -> None:
+    res = CliRunner().invoke(
+        app,
+        ["eval", "--system", "rules", "--split", "dev", "--limit", "0"]
+        + ["--cases-dir", str(small_cases.parent), "--out-dir", str(tmp_path / "r")],
+    )
+    assert res.exit_code != 0
