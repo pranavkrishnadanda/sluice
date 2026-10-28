@@ -967,3 +967,22 @@ def test_pipeline_exhausted_node_quarantine_wins_over_sibling_outage(two_columns
     assert not result.events("verified")
     (finished,) = result.events("run_finished")
     assert finished.status == "quarantined"  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- final review fixes
+
+
+def test_pipeline_worker_sees_the_original_hinted_source_name(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    """I-1: a `_paise` unit hint in the source column name reaches the worker prompt."""
+    hinted = ("rename", {"column": "o_totalprice", "new_name": "o_totalprice_paise"})
+    case = _build(cases_dir, orders_df, "dev-0101", [hinted, INDIAN])
+    mapping = {
+        "mappings": [{"source": "o_totalprice_paise", "target": "o_totalprice", "reason": "x"}]
+    }
+    script = Script(mapping=mapping, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    result = run(case, script)
+    (prompt,) = script.roles("worker")
+    assert 'Source column name: "o_totalprice_paise"' in prompt
+    assert result.out.meta["nodes"][0]["accepted"] is True

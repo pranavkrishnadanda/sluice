@@ -312,7 +312,7 @@ async def _pipeline(run: _Run) -> SystemOutput:
             ]
         )
     )
-    outcomes = await _run_nodes(run, plan, frame, prof1, pass1, candidates)
+    outcomes = await _run_nodes(run, plan, frame, prof1, pass1, candidates, _hints(mapping))
     if run.halted is not None:
         actions = [*map_actions, *pass1.actions, f"file quarantined: {run.halted}"]
         return _quarantine_file(run, actions, plan, outcomes, mapping, run.halted)
@@ -344,8 +344,12 @@ async def _run_nodes(
     prof: Profile,
     pass1: RuleResult,
     candidates: dict[str, list[str]],
+    hints: dict[str, str],
 ) -> list[_NodeOutcome]:
     """Run the plan in dependency waves; returns one outcome per node, in plan order.
+
+    ``hints`` maps a contract column to its original input column name (before the mapping
+    renamed it), which is what the worker is shown: unit hints such as ``_paise`` live there.
 
     A wave is every not-yet-run node whose dependencies have all finished; its nodes run
     concurrently. A node whose dependency was not accepted is skipped (0 attempts). Once a
@@ -380,6 +384,7 @@ async def _run_nodes(
                         outcomes[n.id],
                         frame,
                         source[n.column],
+                        hints.get(n.column, source[n.column]),
                         candidates[n.column],
                         flagged.get(n.column, set()),
                     )
@@ -393,10 +398,15 @@ async def _run_node(
     outcome: _NodeOutcome,
     frame: pl.DataFrame,
     source_name: str,
+    shown_name: str,
     samples: list[str],
     flagged_before: set[int],
 ) -> None:
-    """Attempt one node until it is accepted, runs out of attempts, or a cap/outage stops it."""
+    """Attempt one node until it is accepted, runs out of attempts, or a cap/outage stops it.
+
+    ``source_name`` is the column in ``frame``; ``shown_name`` is the input file's own name for
+    it (with any unit hint), passed to the worker.
+    """
     node = outcome.node
     contract = run.case.contract
     spec = contract.column(node.column)
@@ -418,8 +428,8 @@ async def _run_node(
         run.emit(NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS))
         records: list[CallRecord] = []
         error, rewritten = await _attempt(
-            run, outcome, attempt, tier, spec, source_name, samples, prior_error, values,
-            frame, flagged_before, records,
+            run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
+            values, frame, flagged_before, records,
         )  # fmt: skip
         tokens, cost = _spend(records)
         if error is None:
@@ -464,6 +474,7 @@ async def _attempt(
     tier: Tier,
     spec: ColumnSpec,
     source_name: str,
+    shown_name: str,
     samples: list[str],
     prior_error: str | None,
     values: pl.Series,
@@ -479,7 +490,7 @@ async def _attempt(
     node, llm = outcome.node, run.deps.llm
     try:
         code, record = await write_transform(
-            node, spec, source_name, samples, prior_error, tier, llm, checked=False
+            node, spec, shown_name, samples, prior_error, tier, llm, checked=False
         )
     except LLMOutputError as exc:
         records.append(exc.record)
@@ -634,6 +645,13 @@ def _sources(prof: Profile) -> dict[str, str]:
         for name, col in prof.columns.items()
         if col.matched_contract_column is not None
     }
+
+
+def _hints(mapping: ColumnMapping | None) -> dict[str, str]:
+    """Contract column -> the original input column name the mapping renamed to it."""
+    if mapping is None:
+        return {}
+    return {target: source for source, target in mapping.pairs.items() if target is not None}
 
 
 # --------------------------------------------------------------------------- reporting
