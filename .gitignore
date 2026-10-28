@@ -22,3 +22,6 @@ frontend/AGENTS.md
 
 # services secrets
 backend/.env
+
+# sandbox image build input, generated from backend/uv.lock by `make sandbox-image`
+backend/sandbox/requirements.txt

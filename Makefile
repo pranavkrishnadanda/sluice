@@ -1,4 +1,4 @@
-.PHONY: test test-all test-integration lint fmt cases eval-rules results up down ps
+.PHONY: test test-all test-integration lint fmt cases eval-rules results up down ps sandbox-image
 
 # Default selection (pyproject addopts) excludes integration, live and slow.
 test:
@@ -7,7 +7,7 @@ test:
 test-all:
 	cd backend && uv run python -m pytest -q -m "not integration and not live"
 
-# Needs the stack: `make up` first.
+# Needs the stack (`make up`) and the sandbox image (`make sandbox-image`).
 test-integration:
 	cd backend && uv run python -m pytest -q -m integration
 
@@ -43,3 +43,10 @@ down:
 
 ps:
 	$(COMPOSE) ps
+
+# Sandbox for generated transforms. polars is pinned (with hashes) from backend/uv.lock.
+SANDBOX_IMAGE = sluice-sandbox:dev
+
+sandbox-image:
+	cd backend && PYTHONPATH=src uv run python -m sluice.sandbox.image uv.lock > sandbox/requirements.txt
+	docker build --pull=false -t $(SANDBOX_IMAGE) backend/sandbox
