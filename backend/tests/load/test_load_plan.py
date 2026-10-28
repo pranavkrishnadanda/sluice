@@ -172,3 +172,60 @@ def test_restore_statement_timeout_after_locks() -> None:
 
 def test_advisory_key_differs_per_table() -> None:
     assert advisory_key("sluice.orders", SHA, "v1") != advisory_key("sluice.lineitem", SHA, "v1")
+
+
+# --- final review C-1 / Ruling F1: the run status the loader records -------------------------
+
+
+def _output(*, quarantined: set[tuple[int, ...]] | None = None, whole: bool = False) -> object:
+    import polars as pl
+
+    from sluice.contracts.model import load_contract
+    from sluice.evals.types import SystemOutput
+
+    return SystemOutput(
+        df=pl.DataFrame(schema=load_contract("orders").polars_schema()),
+        flags=set(),
+        quarantined=quarantined or set(),
+        file_quarantined=whole,
+        cost_usd=0.0,
+        latency_s=0.0,
+        meta={},
+    )
+
+
+def test_load_status_defaults_to_quarantined_when_rows_are_quarantined() -> None:
+    from sluice.load.iceberg import load_status
+
+    assert load_status(_output(quarantined={(1,)}), None) == "quarantined"  # type: ignore[arg-type]
+    assert load_status(_output(whole=True), None) == "quarantined"  # type: ignore[arg-type]
+    assert load_status(_output(), None) == "succeeded"  # type: ignore[arg-type]
+
+
+def test_load_status_uses_the_pipeline_status() -> None:
+    from sluice.load.iceberg import load_status
+
+    assert load_status(_output(), "quarantined") == "quarantined"  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("status", ["failed", "rolled_back", "bogus"])
+def test_load_status_refuses_a_status_that_must_not_load(status: str) -> None:
+    from sluice.load.iceberg import LoadError, load_status
+
+    with pytest.raises(LoadError, match="status"):
+        load_status(_output(), status)  # type: ignore[arg-type]
+
+
+def test_load_output_refuses_failed_run_before_any_io() -> None:
+    from sluice.contracts.model import load_contract
+    from sluice.load.iceberg import LoadError, load_output
+
+    with pytest.raises(LoadError, match="status"):
+        load_output(
+            _output(),  # type: ignore[arg-type]
+            load_contract("orders"),
+            run_id="r1",
+            file_sha256=SHA,
+            settings=object(),  # type: ignore[arg-type]  # never used: refused first
+            status="failed",
+        )

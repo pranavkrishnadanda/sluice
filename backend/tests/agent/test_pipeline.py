@@ -807,7 +807,7 @@ def test_pipeline_quarantine_reasons_are_keyed_by_loader_pk_text(
 def test_cli_replay_accepts_pipeline_events(medium: Case) -> None:
     script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
     result = run(medium, script)
-    replayed = cli._replayed(result.out)
+    replayed, final = cli._replayed(result.out)
     assert [e.type for e in replayed] == [  # type: ignore[attr-defined]
         "profiled",
         "rules_applied",
@@ -816,6 +816,7 @@ def test_cli_replay_accepts_pipeline_events(medium: Case) -> None:
         "node_finished",
         "verified",
     ]
+    assert final is not None and final.status == "succeeded"
 
 
 # --------------------------------------------------------------------------- AgentSystem

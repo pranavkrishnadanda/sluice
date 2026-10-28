@@ -46,6 +46,14 @@ Order of work:
 3. Append what is missing, then insert ``runs``/``loads``/``flags``/``plan_nodes``/
    ``transforms`` and commit.
 
+Only a load that gave the main table a snapshot claims the key (Ruling F1). A whole-file
+quarantine writes nothing to Iceberg and records only its ``runs`` row (and lineage); an output
+with no main-table rows (every row quarantined) appends its quarantine rows and records its run
+but no ``loads`` row. Either file can therefore be run again; a retry of the second does not
+duplicate its quarantine rows (step 2). A ``loads`` row with a NULL snapshot (written before
+F1) is ignored by the lookup and deleted when the key is next recorded. ``failed`` runs are
+never loaded (:func:`load_status`).
+
 So a crash anywhere between an Iceberg commit and the Postgres commit is healed by the retry
 without duplicate rows. :func:`rollback` deletes the ``loads`` rows of the snapshots it rolls
 back (and marks their runs ``rolled_back``), so a rolled-back file can be loaded again; since
@@ -57,6 +65,7 @@ Cost: one scan of the table's snapshot ancestry per load (O(snapshots)), one Arr
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -104,6 +113,8 @@ PG_CONNECT_TIMEOUT_S = 5
 STATUS_SUCCEEDED = "succeeded"
 STATUS_QUARANTINED = "quarantined"
 STATUS_ROLLED_BACK = "rolled_back"
+LOADABLE_STATUSES = frozenset({STATUS_SUCCEEDED, STATUS_QUARANTINED})
+"""Run statuses an output may be loaded with; a ``failed`` run is never loaded (Ruling F1)."""
 DEFAULT_FK_REASON = "foreign_key"
 DEFAULT_REASON = "rejected"
 MAX_CODE_CHARS = 100_000
@@ -333,6 +344,22 @@ def pk_text(pk: PK) -> str:
     return json.dumps(list(pk), separators=(",", ":"), ensure_ascii=False, default=str)
 
 
+def load_status(out: SystemOutput, status: str | None) -> str:
+    """The ``runs.status`` of a load: the pipeline's ``status``, else derived from ``out``.
+
+    Derived: ``quarantined`` when the whole file or any row was held back, else ``succeeded``
+    (contract "Statuses").
+
+    Raises:
+        LoadError: ``status`` is not one an output may be loaded with (e.g. ``failed``).
+    """
+    if status is None:
+        return STATUS_QUARANTINED if out.file_quarantined or out.quarantined else STATUS_SUCCEEDED
+    if status not in LOADABLE_STATUSES:
+        raise LoadError(f"refusing to load an output with run status {status!r}")
+    return status
+
+
 def plan_load(
     *,
     recorded: bool,
@@ -518,8 +545,8 @@ class _Record:
     transforms: Sequence[TransformRecord]
 
 
-def _record_load(conn: psycopg.Connection, rec: _Record) -> None:
-    """Insert the lineage rows of one load (inside the caller's transaction)."""
+def _record_run(conn: psycopg.Connection, rec: _Record) -> None:
+    """Insert ``runs`` and the run's ``flags``/``plan_nodes``/``transforms`` (caller's txn)."""
     conn.execute(
         """
         INSERT INTO runs (run_id, file_sha256, table_name, started_at, finished_at, status,
@@ -537,22 +564,6 @@ def _record_load(conn: psycopg.Connection, rec: _Record) -> None:
             rec.finished_at,
             rec.status,
             rec.cost_usd,
-        ),
-    )
-    conn.execute(
-        """
-        INSERT INTO loads (run_id, file_sha256, contract_version, iceberg_table, snapshot_id,
-                           rows_loaded, rows_quarantined)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            rec.run_id,
-            rec.file_sha256,
-            rec.contract.version,
-            rec.iceberg_table,
-            rec.snapshot_id,
-            rec.rows_loaded,
-            rec.rows_quarantined,
         ),
     )
     with conn.cursor() as cur:
@@ -590,9 +601,43 @@ def _record_load(conn: psycopg.Connection, rec: _Record) -> None:
             )
 
 
+def _record_load(conn: psycopg.Connection, rec: _Record) -> None:
+    """Record one load (inside the caller's transaction, under the key's advisory lock).
+
+    The ``loads`` row (the idempotency key) is written only when the main table holds a
+    snapshot for this file; a legacy key row without a snapshot is deleted first.
+    """
+    _record_run(conn, rec)
+    key = (rec.iceberg_table, rec.file_sha256, rec.contract.version)
+    conn.execute(_DELETE_NULL_LOAD, key)
+    if rec.snapshot_id is not None:
+        conn.execute(
+            """
+            INSERT INTO loads (run_id, file_sha256, contract_version, iceberg_table, snapshot_id,
+                               rows_loaded, rows_quarantined)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                rec.run_id,
+                rec.file_sha256,
+                rec.contract.version,
+                rec.iceberg_table,
+                rec.snapshot_id,
+                rec.rows_loaded,
+                rec.rows_quarantined,
+            ),
+        )
+
+
 _SELECT_LOAD = (
     "SELECT snapshot_id, rows_loaded, rows_quarantined FROM loads "
-    "WHERE iceberg_table = %s AND file_sha256 = %s AND contract_version = %s"
+    "WHERE iceberg_table = %s AND file_sha256 = %s AND contract_version = %s "
+    "AND snapshot_id IS NOT NULL"
+)
+# A legacy row (written before Ruling F1) that claimed the key without a main-table snapshot.
+_DELETE_NULL_LOAD = (
+    "DELETE FROM loads WHERE iceberg_table = %s AND file_sha256 = %s AND contract_version = %s "
+    "AND snapshot_id IS NULL"
 )
 
 
@@ -632,15 +677,21 @@ def load_output(
     file_sha256: str,
     settings: Settings,
     namespace: str = NAMESPACE,
+    status: str | None = None,
 ) -> LoadResult:
     """Append ``out`` to ``<namespace>.<table>`` (+ quarantine table) once per file and contract.
 
     Everything is validated before anything is written. See the module docstring for the
-    idempotency protocol.
+    idempotency protocol. ``status`` is the pipeline's final status, recorded in ``runs``
+    (default: derived from ``out``, see :func:`load_status`). A whole-file quarantine
+    (``out.file_quarantined``) writes nothing to Iceberg and claims no idempotency key: only its
+    ``runs`` row and lineage are recorded, so the file can be run again (Ruling F1).
 
     Raises:
-        LoadError: Invalid ids, frame, lineage meta, or an existing table with another schema.
+        LoadError: A status that must not load (``failed``), invalid ids, frame, lineage meta,
+            or an existing table with another schema.
     """
+    run_status = load_status(out, status)
     _validate_ids(run_id, file_sha256)
     _check_ident(namespace, "namespace")
     name = _check_ident(contract.name, "table name")
@@ -652,6 +703,30 @@ def load_output(
     quarantine_id = f"{main_id}{QUARANTINE_SUFFIX}"
     finished_at = datetime.now(UTC)
     started_at = finished_at - timedelta(seconds=max(out.latency_s, 0.0))
+    record = _Record(
+        run_id=run_id,
+        file_sha256=file_sha256,
+        contract=contract,
+        iceberg_table=main_id,
+        snapshot_id=None,
+        status=run_status,
+        started_at=started_at,
+        finished_at=finished_at,
+        cost_usd=out.cost_usd,
+        rows_loaded=main_arrow.num_rows,
+        rows_quarantined=quarantine_arrow.num_rows,
+        flags=flags,
+        nodes=nodes,
+        transforms=transforms,
+    )
+
+    if out.file_quarantined:
+        with _connect(settings) as conn:
+            ensure_lineage_tables(conn)
+            with conn.transaction():
+                restore_statement_timeout(conn)
+                _record_run(conn, dataclasses.replace(record, rows_loaded=0, rows_quarantined=0))
+        return LoadResult(snapshot_id=None, rows_loaded=0, rows_quarantined=0, skipped=False)
 
     with _connect(settings) as conn:
         ensure_lineage_tables(conn)
@@ -694,25 +769,7 @@ def load_output(
                         _ancestry(main), file_sha256, contract.version
                     )
             snapshot_id = str(main_snap) if main_snap is not None else None
-            _record_load(
-                conn,
-                _Record(
-                    run_id=run_id,
-                    file_sha256=file_sha256,
-                    contract=contract,
-                    iceberg_table=main_id,
-                    snapshot_id=snapshot_id,
-                    status=STATUS_QUARANTINED if out.file_quarantined else STATUS_SUCCEEDED,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    cost_usd=out.cost_usd,
-                    rows_loaded=main_arrow.num_rows,
-                    rows_quarantined=quarantine_arrow.num_rows,
-                    flags=flags,
-                    nodes=nodes,
-                    transforms=transforms,
-                ),
-            )
+            _record_load(conn, dataclasses.replace(record, snapshot_id=snapshot_id))
     return LoadResult(
         snapshot_id=snapshot_id,
         rows_loaded=main_arrow.num_rows,

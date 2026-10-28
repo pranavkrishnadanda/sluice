@@ -251,19 +251,34 @@ def resolve_run_fn(note: Callable[[str], Any]) -> RunFn:
     return factory().run
 
 
-def _replayed(out: SystemOutput) -> list[EventModel]:
+class RunFailedError(Exception):
+    """The pipeline finished ``failed``: nothing was loaded and no idempotency key was claimed."""
+
+
+def _replayed(out: SystemOutput) -> tuple[list[EventModel], RunFinished | None]:
+    """The pipeline's events to print (CLI-owned types dropped) and its own ``run_finished``."""
     raw = out.meta.get("events")
     if not raw:
-        return [RulesApplied(actions=[str(a) for a in out.meta.get("actions", [])])]
+        return [RulesApplied(actions=[str(a) for a in out.meta.get("actions", [])])], None
     events: list[EventModel] = []
+    final: RunFinished | None = None
     for item in raw:
         if isinstance(item, EventModel):
             event = item
         else:
             event = PIPELINE_EVENT_ADAPTER.validate_python(item)
-        if event.type not in _CLI_EVENTS:  # type: ignore[attr-defined]
+        if isinstance(event, RunFinished):
+            final = event
+        elif event.type not in _CLI_EVENTS:  # type: ignore[attr-defined]
             events.append(event)
-    return events
+    return events, final
+
+
+def _output_status(out: SystemOutput, final: RunFinished | None) -> str:
+    """The run's status: the pipeline's own, else derived from the output (rules-only system)."""
+    if final is not None:
+        return final.status
+    return "quarantined" if out.file_quarantined or out.quarantined else "succeeded"
 
 
 def _skip_summary(result: LoadResult) -> str:
@@ -287,7 +302,14 @@ def run_file(
     ``run_fn`` defaults to :func:`resolve_run_fn` (agent, else rules). Before the pipeline runs,
     ``loaded_fn`` looks up the idempotency key; a file already loaded into this table is
     reported as skipped without running (or paying for) the pipeline. ``load_fn`` re-checks the
-    key under its locks, so a concurrent duplicate is still caught. On an exception a
+    key under its locks, so a concurrent duplicate is still caught.
+
+    The pipeline's own final ``run_finished`` (in ``meta["events"]``) decides the outcome
+    (Ruling F1): ``failed`` (a cap, an outage, the sandbox, or a crash) loads nothing and
+    claims no key, prints ``run_finished(failed)`` with the pipeline's summary, tokens and
+    cost, and raises :class:`RunFailedError`; any other status is passed to ``load_fn`` and
+    printed as the final status. A whole-file quarantine is passed too: the loader records the
+    run but writes no data and claims no key, so the file can be retried. On an exception a
     ``run_finished`` event with status ``failed`` is printed and the exception re-raised.
     """
     contract: Contract = load_contract(table, contract_version)
@@ -298,7 +320,7 @@ def run_file(
         echo(log.emit(event).to_json())
 
     emit(RunStarted(run_id=run_id, file_name=path.name, table=table, rows=None))  # type: ignore[arg-type]
-    cost = 0.0
+    cost, tokens = 0.0, 0
     try:
         sha = file_sha256(path)
         settings = settings_fn()
@@ -315,17 +337,28 @@ def run_file(
             return prior
         fn = run_fn or resolve_run_fn(note=lambda m: typer.echo(m, err=True))
         out = fn(CaseInput(path, contract, reference_fn(table)))
-        cost = out.cost_usd
-        for event in _replayed(out):
+        cost = max(out.cost_usd, 0.0)
+        tokens = max(int(out.meta.get("tokens", 0)), 0)
+        events, final = _replayed(out)
+        for event in events:
             emit(event)
-        result = load_fn(out, contract, run_id=run_id, file_sha256=sha, settings=settings)
+        status = _output_status(out, final)
+        if status == "failed":
+            summary = final.summary if final is not None else "the run failed"
+        else:
+            result = load_fn(
+                out, contract, run_id=run_id, file_sha256=sha, settings=settings, status=status
+            )
     except Exception as exc:
         emit(
             RunFinished(
-                status="failed", summary=f"{type(exc).__name__}", cost_usd=max(cost, 0.0), tokens=0
+                status="failed", summary=f"{type(exc).__name__}", cost_usd=cost, tokens=tokens
             )
         )
         raise
+    if status == "failed":
+        emit(RunFinished(status="failed", summary=summary, cost_usd=cost, tokens=tokens))
+        raise RunFailedError(summary)
     if not result.skipped and result.snapshot_id is not None:
         emit(
             Loaded(
@@ -336,16 +369,20 @@ def run_file(
         )
     if result.skipped:
         summary = _skip_summary(result)
+    elif out.file_quarantined:
+        summary = "nothing loaded; the file can be retried"
     else:
         summary = f"loaded {result.rows_loaded} row(s), quarantined {result.rows_quarantined}" + (
             " (recovered an earlier commit)" if result.recovered else ""
         )
+    if final is not None and not result.skipped:
+        summary = f"{final.summary}; {summary}"
     emit(
         RunFinished(
-            status="quarantined" if out.file_quarantined else "succeeded",
+            status="succeeded" if result.skipped else status,  # type: ignore[arg-type]
             summary=summary,
-            cost_usd=out.cost_usd,
-            tokens=int(out.meta.get("tokens", 0)),
+            cost_usd=cost,
+            tokens=tokens,
         )
     )
     return result
@@ -365,6 +402,9 @@ def run_cmd(
     """
     try:
         run_file(file, table.value, contract_version=contract_version)
+    except RunFailedError as exc:
+        typer.echo(f"run failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
     except (psycopg.Error, SQLAlchemyError) as exc:
         # Driver messages can echo connection details; print the error type only.
         typer.echo(f"run failed: {type(exc).__name__}", err=True)

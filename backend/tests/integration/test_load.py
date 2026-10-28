@@ -363,3 +363,110 @@ def test_cli_repeat_run_does_not_run_pipeline(
     again = runner.invoke(cli.app, ["run", str(path), "--table", "orders"])
     assert again.exit_code == 0, again.output
     assert "already loaded" in again.stdout
+
+
+# --- final review C-1 / Ruling F1: no key for quarantined-whole files; NULL rows never block --
+
+
+def test_whole_file_quarantine_records_run_but_claims_no_key(
+    clean: pl.DataFrame, orders: Contract, settings: Settings, ns: str, pg: psycopg.Connection
+) -> None:
+    sha = _sha()
+    run_id = secrets.token_hex(16)
+    empty = clean.head(0)
+    result = _load(_out(empty, file_quarantined=True), orders, settings, ns, sha, run_id)
+
+    assert result == LoadResult(snapshot_id=None, rows_loaded=0, rows_quarantined=0, skipped=False)
+    assert _rows(pg, "SELECT status FROM runs WHERE run_id = %s", run_id) == [("quarantined",)]
+    assert _rows(pg, "SELECT 1 FROM loads WHERE run_id = %s", run_id) == []
+    assert iceberg.find_load(orders, sha, settings=settings, namespace=ns) is None
+    # The file can be retried and then loads normally.
+    retry = _load(_out(clean), orders, settings, ns, sha)
+    assert retry.skipped is False and retry.rows_loaded == 50
+
+
+def test_pipeline_status_is_recorded_in_runs(
+    clean: pl.DataFrame, orders: Contract, settings: Settings, ns: str, pg: psycopg.Connection
+) -> None:
+    run_id = secrets.token_hex(16)
+    load_output(
+        _out(clean, quarantined={(999_001,)}),
+        orders,
+        run_id=run_id,
+        file_sha256=_sha(),
+        settings=settings,
+        namespace=ns,
+        status="quarantined",
+    )
+    assert _rows(pg, "SELECT status FROM runs WHERE run_id = %s", run_id) == [("quarantined",)]
+
+
+def test_legacy_null_snapshot_load_row_does_not_block_a_retry(
+    clean: pl.DataFrame, orders: Contract, settings: Settings, ns: str, pg: psycopg.Connection
+) -> None:
+    sha = _sha()
+    _load(_out(clean.head(1)), orders, settings, ns, _sha())  # creates the lineage tables
+    legacy = secrets.token_hex(16)
+    pg.execute(
+        "INSERT INTO runs (run_id, file_sha256, table_name, started_at, finished_at, status, "
+        "cost_usd) VALUES (%s, %s, 'orders', now(), now(), 'quarantined', 0)",
+        (legacy, sha),
+    )
+    pg.execute(
+        "INSERT INTO loads (run_id, file_sha256, contract_version, iceberg_table, snapshot_id, "
+        "rows_loaded, rows_quarantined) VALUES (%s, %s, 'v1', %s, NULL, 0, 0)",
+        (legacy, sha, f"{ns}.orders"),
+    )
+    assert iceberg.find_load(orders, sha, settings=settings, namespace=ns) is None
+
+    retry = _load(_out(clean), orders, settings, ns, sha)
+
+    assert retry.skipped is False and retry.snapshot_id is not None
+    rows = _rows(pg, "SELECT snapshot_id FROM loads WHERE file_sha256 = %s", sha)
+    assert rows == [(retry.snapshot_id,)]
+
+
+def test_all_rows_quarantined_claims_no_key_and_retry_does_not_duplicate(
+    clean: pl.DataFrame, orders: Contract, settings: Settings, ns: str, table_of: Any
+) -> None:
+    sha = _sha()
+    out = _out(clean.head(0), quarantined={(999_001,), (999_002,)})
+    first = _load(out, orders, settings, ns, sha)
+    assert first.snapshot_id is None and first.rows_quarantined == 2
+    assert iceberg.find_load(orders, sha, settings=settings, namespace=ns) is None
+
+    retry = _load(out, orders, settings, ns, sha)
+
+    assert retry.skipped is False
+    assert table_of("orders_quarantine").scan().to_arrow().num_rows == 2
+
+
+def test_cli_failed_run_loads_nothing_and_retry_loads(
+    orders_df: pl.DataFrame, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    from sluice.agent.events import EventLog, RunFinished
+
+    path = tmp_path / f"orders-{secrets.token_hex(4)}.parquet"
+    orders_df.sample(20, seed=secrets.randbelow(2**31)).write_parquet(path)
+    contract = load_contract("orders")
+    schema = contract.polars_schema()
+    df = pl.read_parquet(path).select(list(schema)).cast(schema)  # type: ignore[arg-type]
+    finished = EventLog().emit(
+        RunFinished(status="failed", summary="stopped by the tokens cap", cost_usd=0.1, tokens=9)
+    )
+
+    def failed(_case: object) -> SystemOutput:
+        return _out(df, meta={"events": [finished.to_dict()], "tokens": 9})
+
+    monkeypatch.setattr(cli, "resolve_run_fn", lambda note: failed)
+    first = CliRunner().invoke(cli.app, ["run", str(path), "--table", "orders"])
+    assert first.exit_code == 1
+    assert '"type":"loaded"' not in first.stdout
+    assert '"status":"failed"' in first.stdout
+    sha = cli.file_sha256(path)
+    assert iceberg.find_load(contract, sha, settings=settings) is None
+
+    monkeypatch.undo()
+    second = CliRunner().invoke(cli.app, ["run", str(path), "--table", "orders"])
+    assert second.exit_code == 0, second.output
+    assert '"type":"loaded"' in second.stdout
