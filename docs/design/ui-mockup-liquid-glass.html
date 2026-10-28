@@ -1,0 +1,170 @@
+<h2>Layout A — liquid glass, light and dark</h2>
+<p class="subtitle">Translucent frosted panels with soft highlights over a colourful backdrop, like Apple's glass style. Same layout, two themes. Click the one closer to what you want (both will exist in the app with a toggle).</p>
+
+<style>
+  .lg { position: relative; font-family: -apple-system, "SF Pro Text", "Inter", system-ui, sans-serif; font-size: 12px; height: 500px; border-radius: 22px; overflow: hidden; display: flex; gap: 10px; padding: 10px; }
+  .lg .blob { position: absolute; border-radius: 50%; filter: blur(40px); opacity: .85; }
+  .lg > *:not(.blob) { position: relative; z-index: 1; }
+  .lg .glass { backdrop-filter: blur(28px) saturate(170%); -webkit-backdrop-filter: blur(28px) saturate(170%); border-radius: 18px; position: relative; }
+  .lg .glass::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; padding: 1px;
+    background: linear-gradient(135deg, rgba(255,255,255,.75), rgba(255,255,255,.05) 40%, rgba(255,255,255,.25));
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude; }
+  .lg .side { width: 150px; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .lg .new { border-radius: 12px; padding: 7px 10px; font-weight: 600; }
+  .lg .item { padding: 6px 9px; border-radius: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .85; }
+  .lg .item.on { font-weight: 600; opacity: 1; }
+  .lg .lbl { font-size: 10px; opacity: .55; margin-top: 6px; text-transform: uppercase; letter-spacing: .06em; }
+  .lg .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .lg .thread { flex: 1; overflow: hidden; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+  .lg .user { align-self: flex-end; border-radius: 18px; padding: 8px 12px; max-width: 78%; }
+  .lg .file { display: inline-flex; gap: 6px; border-radius: 10px; padding: 4px 8px; margin-bottom: 4px; font-size: 11px; }
+  .lg .steps { border-radius: 14px; padding: 9px 11px; display: flex; flex-direction: column; gap: 6px; }
+  .lg .step { display: flex; gap: 8px; align-items: center; }
+  .lg .ok { color: #2fb36b; } .lg .warn { color: #f0a030; } .lg .run { color: #5b8cff; }
+  .lg .chip { font-size: 10px; padding: 2px 8px; border-radius: 20px; margin-left: auto; white-space: nowrap; }
+  .lg code { font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace; font-size: 10.5px; }
+  .lg .answer { line-height: 1.5; }
+  .lg .composer { margin: 0 16px 14px; border-radius: 24px; padding: 10px 14px; display: flex; align-items: center; gap: 8px; }
+  .lg .composer span { flex: 1; opacity: .55; }
+  .lg .send { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: #fff;
+    background: linear-gradient(160deg, #6aa8ff, #3a6dff); box-shadow: 0 2px 10px rgba(58,109,255,.45), inset 0 1px 0 rgba(255,255,255,.6); }
+  .lg .panel { width: 250px; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
+  .lg .tabs { display: flex; gap: 3px; padding: 3px; border-radius: 12px; font-size: 11px; }
+  .lg .tabs b { flex: 1; text-align: center; padding: 4px 0; border-radius: 9px; font-weight: 500; }
+  .lg table { border-collapse: collapse; width: 100%; font-size: 10.5px; }
+  .lg td, .lg th { padding: 4px; text-align: left; }
+  .lg .bad { text-decoration: line-through; opacity: .55; }
+  .lg .stat { display: flex; justify-content: space-between; font-size: 11px; padding: 6px 9px; border-radius: 10px; }
+  .lg .toggle { position: absolute; top: 16px; right: 18px; z-index: 2; font-size: 11px; padding: 4px 10px; border-radius: 20px; }
+
+  .light { background: linear-gradient(135deg, #e9eefc, #f6eef8); color: #1d1d1f; }
+  .light .b1 { width: 300px; height: 300px; background: #8fb4ff; top: -60px; left: 120px; }
+  .light .b2 { width: 260px; height: 260px; background: #ffb3d1; bottom: -80px; left: 420px; }
+  .light .b3 { width: 220px; height: 220px; background: #a6f0d8; top: 120px; right: -40px; }
+  .light .glass { background: rgba(255,255,255,.42); box-shadow: 0 8px 30px rgba(40,50,90,.12), inset 0 1px 0 rgba(255,255,255,.8); }
+  .light .new, .light .item.on, .light .tabs b.on { background: rgba(255,255,255,.7); box-shadow: 0 1px 4px rgba(0,0,0,.06), inset 0 1px 0 #fff; }
+  .light .user { background: rgba(255,255,255,.65); box-shadow: inset 0 1px 0 #fff; }
+  .light .file, .light .steps, .light .stat { background: rgba(255,255,255,.5); }
+  .light .chip { background: rgba(0,0,0,.06); }
+  .light .composer { background: rgba(255,255,255,.6); box-shadow: 0 6px 24px rgba(40,50,90,.12), inset 0 1px 0 #fff; }
+  .light .tabs { background: rgba(0,0,0,.05); }
+  .light td, .light th { border-bottom: 1px solid rgba(0,0,0,.06); }
+  .light .toggle { background: rgba(255,255,255,.7); }
+
+  .dark { background: linear-gradient(135deg, #0b0d1a, #140b1c); color: #f2f2f7; }
+  .dark .b1 { width: 320px; height: 320px; background: #2b4bff; top: -80px; left: 100px; opacity: .55; }
+  .dark .b2 { width: 280px; height: 280px; background: #b0249a; bottom: -100px; left: 420px; opacity: .45; }
+  .dark .b3 { width: 220px; height: 220px; background: #0fa88a; top: 140px; right: -40px; opacity: .4; }
+  .dark .glass { background: rgba(30,32,48,.45); box-shadow: 0 8px 30px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.12); }
+  .dark .glass::before { background: linear-gradient(135deg, rgba(255,255,255,.35), rgba(255,255,255,.02) 40%, rgba(255,255,255,.12)); }
+  .dark .new, .dark .item.on, .dark .tabs b.on { background: rgba(255,255,255,.12); box-shadow: inset 0 1px 0 rgba(255,255,255,.15); }
+  .dark .user { background: rgba(255,255,255,.12); box-shadow: inset 0 1px 0 rgba(255,255,255,.15); }
+  .dark .file, .dark .steps, .dark .stat { background: rgba(255,255,255,.06); }
+  .dark .chip { background: rgba(255,255,255,.1); }
+  .dark .composer { background: rgba(40,42,60,.55); box-shadow: 0 6px 24px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.12); }
+  .dark .tabs { background: rgba(255,255,255,.06); }
+  .dark td, .dark th { border-bottom: 1px solid rgba(255,255,255,.08); }
+  .dark .toggle { background: rgba(255,255,255,.12); }
+</style>
+
+<div class="options">
+  <div class="option" data-choice="light" onclick="toggleSelect(this)">
+    <div class="letter">☀</div>
+    <div class="content" style="width:100%">
+      <h3>Light glass</h3>
+      <div class="lg light">
+        <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+        <div class="toggle glass">☀︎ / ☾</div>
+        <div class="side glass">
+          <div class="new">＋ New pipeline run</div>
+          <div class="lbl">Today</div>
+          <div class="item on">orders_2026-10.csv</div>
+          <div class="item">yellow_tripdata_2019-03</div>
+          <div class="item">lineitem_drift_17.json</div>
+          <div class="lbl">Evals</div>
+          <div class="item">Holdout v3 — 81.4%</div>
+          <div class="item">Sandbox escapes — 0/120</div>
+        </div>
+        <div class="main glass">
+          <div class="thread">
+            <div class="user"><div class="file">📄 orders_2026-10.csv · 48,210 rows</div>Load this into the orders table.</div>
+            <div class="steps">
+              <div class="step"><span class="ok">✓</span> Profiled — 3 columns drifted <span class="chip">rules · ₹0</span></div>
+              <div class="step"><span class="ok">✓</span> Fixed date formats + whitespace <span class="chip">rules · ₹0</span></div>
+              <div class="step"><span class="ok">✓</span> Wrote transform for <code>amt</code> <span class="chip">small · vLLM</span></div>
+              <div class="step"><span class="warn">↻</span> Contract check failed — repairing <span class="chip">2/3</span></div>
+              <div class="step"><span class="ok">✓</span> 12/12 checks passed <span class="chip">0.8 s</span></div>
+              <div class="step"><span class="run">●</span> Loading 48,210 rows…</div>
+            </div>
+            <div class="answer">The <code>amt</code> column was renamed and 14 rows were in paise. The first transform missed them, the contract check caught it, and the second attempt passed.</div>
+          </div>
+          <div class="composer"><span>Ask about this run, or drop another file…</span><div class="send">↑</div></div>
+        </div>
+        <div class="panel glass">
+          <div class="tabs"><b class="on">Data</b><b>Code</b><b>Lineage</b><b>Cost</b></div>
+          <table>
+            <tr><th>column</th><th>before</th><th>after</th></tr>
+            <tr><td>o_orderdate</td><td class="bad">03/10/26</td><td>2026-10-03</td></tr>
+            <tr><td>o_totalprice</td><td class="bad">124500 (paise)</td><td>1245.00</td></tr>
+            <tr><td>o_custkey</td><td class="bad">" 1042 "</td><td>1042</td></tr>
+            <tr><td>o_ts</td><td class="bad">UTC</td><td>IST +05:30</td></tr>
+          </table>
+          <div class="stat"><span>Tokens</span><b>3,912</b></div>
+          <div class="stat"><span>Cost</span><b>₹0.00</b></div>
+          <div class="stat"><span>Strong model used</span><b>No</b></div>
+          <div class="stat"><span>Transform</span><b>v2 · 9f3c1a</b></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="dark" onclick="toggleSelect(this)">
+    <div class="letter">☾</div>
+    <div class="content" style="width:100%">
+      <h3>Dark glass</h3>
+      <div class="lg dark">
+        <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+        <div class="toggle glass">☀︎ / ☾</div>
+        <div class="side glass">
+          <div class="new">＋ New pipeline run</div>
+          <div class="lbl">Today</div>
+          <div class="item on">orders_2026-10.csv</div>
+          <div class="item">yellow_tripdata_2019-03</div>
+          <div class="item">lineitem_drift_17.json</div>
+          <div class="lbl">Evals</div>
+          <div class="item">Holdout v3 — 81.4%</div>
+          <div class="item">Sandbox escapes — 0/120</div>
+        </div>
+        <div class="main glass">
+          <div class="thread">
+            <div class="user"><div class="file">📄 orders_2026-10.csv · 48,210 rows</div>Load this into the orders table.</div>
+            <div class="steps">
+              <div class="step"><span class="ok">✓</span> Profiled — 3 columns drifted <span class="chip">rules · ₹0</span></div>
+              <div class="step"><span class="ok">✓</span> Fixed date formats + whitespace <span class="chip">rules · ₹0</span></div>
+              <div class="step"><span class="ok">✓</span> Wrote transform for <code>amt</code> <span class="chip">small · vLLM</span></div>
+              <div class="step"><span class="warn">↻</span> Contract check failed — repairing <span class="chip">2/3</span></div>
+              <div class="step"><span class="ok">✓</span> 12/12 checks passed <span class="chip">0.8 s</span></div>
+              <div class="step"><span class="run">●</span> Loading 48,210 rows…</div>
+            </div>
+            <div class="answer">The <code>amt</code> column was renamed and 14 rows were in paise. The first transform missed them, the contract check caught it, and the second attempt passed.</div>
+          </div>
+          <div class="composer"><span>Ask about this run, or drop another file…</span><div class="send">↑</div></div>
+        </div>
+        <div class="panel glass">
+          <div class="tabs"><b class="on">Data</b><b>Code</b><b>Lineage</b><b>Cost</b></div>
+          <table>
+            <tr><th>column</th><th>before</th><th>after</th></tr>
+            <tr><td>o_orderdate</td><td class="bad">03/10/26</td><td>2026-10-03</td></tr>
+            <tr><td>o_totalprice</td><td class="bad">124500 (paise)</td><td>1245.00</td></tr>
+            <tr><td>o_custkey</td><td class="bad">" 1042 "</td><td>1042</td></tr>
+            <tr><td>o_ts</td><td class="bad">UTC</td><td>IST +05:30</td></tr>
+          </table>
+          <div class="stat"><span>Tokens</span><b>3,912</b></div>
+          <div class="stat"><span>Cost</span><b>₹0.00</b></div>
+          <div class="stat"><span>Strong model used</span><b>No</b></div>
+          <div class="stat"><span>Transform</span><b>v2 · 9f3c1a</b></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
