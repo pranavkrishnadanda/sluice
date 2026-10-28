@@ -38,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from sluice.contracts.model import ColumnSpec, Contract
 from sluice.llm.client import LLM, CallRecord, LLMOutputError
+from sluice.rules.fixers import SENTINEL_TOKENS
 from sluice.rules.profile import match_columns, normalise_name
 
 ROLE: Final = "mapper"
@@ -51,10 +52,13 @@ MAX_SOURCE_COLUMNS: Final = 50
 are reported in `ColumnMapping.truncated`."""
 DTYPE_FIT_BONUS: Final = 0.5
 """Ranking bonus when every sample fits a missing column's non-string dtype or enum."""
+MIN_FIT_SHARE: Final = 0.5
+"""A model mapping onto a non-string or enum column is rejected when fewer than this share of
+the source's informative samples (not destroyed tokens) fit the target's dtype or enum."""
 
 _INT = re.compile(r"[+-]?\d[\d,]*")
 _NUMBER = re.compile(r"[+-]?(\d[\d,]*(\.\d*)?|\.\d+)")
-_DATELIKE = re.compile(r"\d{1,4}[-/.:T ]\d{1,2}")
+_DATELIKE = re.compile(r"\d{1,4}[-/.:T ]\d{1,2}|\d{1,2} [A-Za-z]{3,9}\.? \d{2,4}")
 
 SYSTEM_PROMPT: Final = """\
 You map columns of a messy input table onto the columns of a data contract.
@@ -153,7 +157,9 @@ def validate_mapping(
     """Check `proposal` against the input and contract; return the full `ColumnMapping`.
 
     Rules: each source is an input column, not already matched, listed once; each non-null target
-    is a contract column, not already matched by another input column, and used by one source.
+    is a contract column, not already matched by another input column, and used by one source;
+    and for a non-string or enum target, at least `MIN_FIT_SHARE` of the source's informative
+    samples fit the target's dtype or enum (a dtype gate against semantic mis-mapping).
     An item that breaks a rule is left unmapped, and if two sources claim one target, *both* are.
 
     Raises:
@@ -200,6 +206,10 @@ def validate_mapping(
         elif len(target_sources[tgt]) > 1:
             names = ", ".join(_q(s) for s in target_sources[tgt])
             problems.append(f"target {_q(tgt)} is used by more than one source ({names})")
+        elif (why := _misfit(df[item.source], contract.column(tgt))) is not None:
+            problems.append(
+                f"samples of source {_q(item.source)} do not fit target {_q(tgt)} ({why})"
+            )
         else:
             accepted[item.source] = tgt
 
@@ -229,18 +239,43 @@ def _samples(series: pl.Series) -> list[str]:
     return out
 
 
-def _fits(samples: list[str], spec: ColumnSpec) -> bool:
-    """Every sample plausibly holds `spec` (non-string dtypes and enums only; ranking only)."""
-    if not samples:
-        return False
+def _fits_one(sample: str, spec: ColumnSpec) -> bool | None:
+    """Whether one sample plausibly holds `spec`; `None` for a plain string column (no check).
+
+    Lenient on the drift the rules repair: surrounding whitespace, enum case, digit grouping,
+    and `"05 Mar 1995"`-style dates all fit.
+    """
+    text = sample.strip()
     if spec.enum is not None:
-        return all(s in spec.enum for s in samples)
+        return text.casefold() in {e.casefold() for e in spec.enum}
     pattern = {"int64": _INT, "int32": _INT, "decimal": _NUMBER}.get(spec.dtype)
     if pattern is not None:
-        return all(pattern.fullmatch(s.strip()) for s in samples)
+        return pattern.fullmatch(text) is not None
     if spec.dtype in ("date", "timestamp_utc"):
-        return all(_DATELIKE.search(s) for s in samples)
-    return False
+        return _DATELIKE.search(text) is not None
+    return None
+
+
+def _fits(samples: list[str], spec: ColumnSpec) -> bool:
+    """Every sample plausibly holds `spec` (non-string dtypes and enums only; ranking only)."""
+    return bool(samples) and all(_fits_one(s, spec) for s in samples)
+
+
+def _misfit(series: pl.Series, spec: ColumnSpec) -> str | None:
+    """Why `series` cannot hold `spec` (fewer than `MIN_FIT_SHARE` samples fit), else `None`.
+
+    Only non-string and enum targets are checked; destroyed tokens and nulls are not samples,
+    and a column with no informative sample passes (it carries no value to mis-map).
+    """
+    samples = [s for s in _samples(series) if s.strip() not in SENTINEL_TOKENS]
+    fits = [_fits_one(s, spec) for s in samples]
+    if not fits or fits[0] is None:
+        return None
+    n_fit = sum(bool(f) for f in fits)
+    if n_fit >= MIN_FIT_SHARE * len(fits):
+        return None
+    want = "its enum" if spec.enum is not None else f"dtype {spec.dtype}"
+    return f"{n_fit} of {len(fits)} sample(s) fit {want}"
 
 
 def _rank_sources(

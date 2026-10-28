@@ -398,3 +398,50 @@ def test_apply_mapping_keeps_columns_absent_from_mapping() -> None:
     out = apply_mapping(df, ColumnMapping(pairs={"a": None}))
 
     assert out.columns == ["o_comment"]
+
+
+# ---------------------------------------------------------------- final review minor #1: fit gate
+
+
+def test_validate_mapping_rejects_text_samples_for_a_decimal_target() -> None:
+    df = orders_frame(o_totalprice="amt").with_columns(
+        pl.Series("note", ["blue whale", "quick fox"])
+    )
+
+    with pytest.raises(MappingError, match="do not fit") as info:
+        validate(df, ("note", "o_totalprice"), ("amt", None))
+
+    assert info.value.partial.pairs["note"] is None
+
+
+def test_validate_mapping_rejects_non_enum_samples_for_an_enum_target() -> None:
+    df = orders_frame(o_orderpriority="prio").with_columns(
+        pl.Series("words", ["alpha beta", "gamma"])
+    )
+
+    with pytest.raises(MappingError, match="do not fit"):
+        validate(df, ("words", "o_orderpriority"), ("prio", None))
+
+
+@pytest.mark.parametrize(
+    ("column", "values"),
+    [
+        ("o_totalprice", ["1,24,500.50", "99.00"]),  # Indian digit grouping
+        ("o_totalprice", ["12345050", "N/A"]),  # paise, a destroyed token is not counted
+        ("o_orderdate", ["05 Mar 1995", "1996-04-03"]),  # date_format_mix "%d %b %Y"
+        ("o_ordertime", ["1995-02-01 15:30:00+05:30", "1996-04-03 16:30:00+05:30"]),  # IST
+        ("o_orderpriority", ["1-urgent", " 5-LOW "]),  # case and whitespace noise
+    ],
+)
+def test_validate_mapping_accepts_drifted_samples_that_fit(column: str, values: list[str]) -> None:
+    df = orders_frame(**{column: "src"}).with_columns(pl.Series("src", values))
+
+    mapping = validate(df, ("src", column))
+
+    assert mapping.pairs["src"] == column
+
+
+def test_validate_mapping_string_target_has_no_fit_gate() -> None:
+    df = orders_frame(o_comment="note").with_columns(pl.Series("note", ["1", "2"]))
+
+    assert validate(df, ("note", "o_comment")).pairs["note"] == "o_comment"
