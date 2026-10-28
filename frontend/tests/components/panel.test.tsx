@@ -1,7 +1,15 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, test, vi } from "vitest";
 import { ApiProvider } from "@/components/api/ApiProvider";
+import { DATA_ROW_HEIGHT } from "@/components/panel/DataTab";
 import { SidePanel } from "@/components/panel/SidePanel";
 import { RUN_CLEAN_EVENTS } from "@/lib/api/fixtures/run-clean";
 import { RUN_REPAIRED_EVENTS } from "@/lib/api/fixtures/run-repaired";
@@ -141,7 +149,57 @@ describe("data tab", () => {
     const bodyRows = [...table.querySelectorAll("tbody tr")];
     expect(bodyRows.length).toBeGreaterThan(5);
     expect(bodyRows.every((tr) => tr.hasAttribute("aria-rowindex"))).toBe(true);
-    expect(table.style.marginBottom).not.toBe("0px");
+  });
+
+  test("the table's margins stand in exactly for the off-window rows", async () => {
+    renderPanel("run-repaired", stateOf(RUN_REPAIRED_EVENTS));
+    const region = await screen.findByRole("region", {
+      name: "Before and after values, scrollable",
+    });
+    const table = within(region).getByRole("table");
+    await waitFor(() =>
+      expect(table.querySelectorAll("tbody tr").length).toBeGreaterThan(5),
+    );
+    // Every data row is DATA_ROW_HEIGHT px; aria-rowcount includes the header.
+    const total =
+      (Number(table.getAttribute("aria-rowcount")) - 1) * DATA_ROW_HEIGHT;
+    const px = (v: string) => Number.parseFloat(v);
+
+    const expectExactCover = () => {
+      const rows = [...table.querySelectorAll("tbody tr")];
+      // aria-rowindex is 1-based and the header is row 1.
+      const firstIndex = Number(rows[0]?.getAttribute("aria-rowindex")) - 2;
+      const top = px(table.style.marginTop);
+      const bottom = px(table.style.marginBottom);
+      expect(top).toBe(firstIndex * DATA_ROW_HEIGHT);
+      expect(
+        Math.abs(top + rows.length * DATA_ROW_HEIGHT + bottom - total),
+      ).toBeLessThanOrEqual(1);
+      return firstIndex;
+    };
+
+    expect(expectExactCover()).toBe(0);
+
+    // jsdom has no scrolling: fake the offset, then fire the scroll event
+    // the virtualiser listens for.
+    let scrollTop = 0;
+    Object.defineProperty(region, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+    act(() => {
+      scrollTop = Math.round(total / 2);
+      fireEvent.scroll(region);
+    });
+    await waitFor(() =>
+      expect(
+        Number(table.querySelector("tbody tr")?.getAttribute("aria-rowindex")),
+      ).toBeGreaterThan(1_000),
+    );
+    expect(expectExactCover()).toBeGreaterThan(1_000);
   });
 
   test("flagged cell shows pill", async () => {

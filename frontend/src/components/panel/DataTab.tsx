@@ -16,7 +16,8 @@ interface CellRow {
   changed: boolean;
 }
 
-const ROW_HEIGHT = 36;
+/** Fixed data-row height in px (the virtualiser does not measure rows). */
+export const DATA_ROW_HEIGHT = 36;
 const OVERSCAN = 8;
 /** Column widths; `table-fixed` keeps them stable as rows scroll in and out. */
 const COLUMNS = ["3.5rem", "5.75rem", "auto", "auto"] as const;
@@ -119,7 +120,7 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => DATA_ROW_HEIGHT,
     overscan: OVERSCAN,
     ...(viewportHeight === undefined
       ? {}
@@ -260,7 +261,7 @@ function VirtualRows({
             <tr
               key={item.key}
               aria-rowindex={item.index + 2}
-              style={{ height: ROW_HEIGHT }}
+              style={{ height: DATA_ROW_HEIGHT }}
             >
               <td className={`${CELL} text-muted`} title={row.pk}>
                 {row.pk}

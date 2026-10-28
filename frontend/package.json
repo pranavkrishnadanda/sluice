@@ -10,7 +10,7 @@
     "start": "next start --port 3000",
     "lint": "biome check . && oxlint",
     "format": "biome format --write .",
-    "pretypecheck": "next typegen",
+    "pretypecheck": "[ -d .next/types ] && find .next/types -type f -regex '.* [0-9][0-9]*\\.[^/]*' -delete; next typegen",
     "typecheck": "tsgo --noEmit",
     "test": "vitest run",
     "e2e": "playwright test"
