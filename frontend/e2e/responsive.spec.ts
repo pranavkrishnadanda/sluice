@@ -97,4 +97,46 @@ test.describe("desktop width", () => {
     }));
     expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
   });
+
+  // CI's Linux Chromium lays text out wider than macOS (glyph advances are
+  // rounded, not fractional): the table once ran 9px past its card there.
+  // Re-check the fit under deliberately wider text than any OS ships, so it
+  // doesn't hinge on exact glyph widths: wide fallback fonts, and the real
+  // fonts with 0.06em extra tracking (0.03em already reproduced CI's 673px).
+  const STRESS: ReadonlyArray<{ name: string; css: string; check: string }> = [
+    {
+      name: "wide fallback fonts",
+      css: `font-family: "DejaVu Sans", Verdana, sans-serif !important;`,
+      check: "Verdana",
+    },
+    {
+      name: "extra letter spacing",
+      css: "letter-spacing: 0.06em !important;",
+      check: "",
+    },
+  ];
+  for (const { name, css, check } of STRESS) {
+    test(`the results table still fits with ${name}`, async ({ page }) => {
+      await openEvals(page);
+      const region = '[aria-label="Results by system, scrollable"]';
+      await page.addStyleTag({
+        content: `${region} table, ${region} table * { ${css} }`,
+      });
+      const scroller = page.getByRole("region", {
+        name: "Results by system, scrollable",
+      });
+      const { scrollWidth, clientWidth, family } = await scroller.evaluate(
+        (el) => {
+          const td = el.querySelector("td");
+          return {
+            scrollWidth: el.scrollWidth,
+            clientWidth: el.clientWidth,
+            family: td ? getComputedStyle(td).fontFamily : "",
+          };
+        },
+      );
+      expect(family).toContain(check);
+      expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
+    });
+  }
 });

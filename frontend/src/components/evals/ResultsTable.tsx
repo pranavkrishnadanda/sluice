@@ -15,30 +15,61 @@ function NotMeasured() {
 
 /**
  * Mean over its bracketed interval, on two lines so seven columns fit the
- * card; the text still reads "86.1% [84.2, 87.9]" as one string.
+ * card; the text still reads "86.1% [84.2, 87.9]" as one string. The mean
+ * never breaks; the interval may wrap after its comma when a column is
+ * narrow (or the platform's fonts run wide), instead of overflowing.
  */
 function Interval({ ci, unit }: { ci: CI | null; unit?: CIUnit }) {
   if (!ci) return <NotMeasured />;
   const { mean, interval } = formatCIParts(ci, unit);
   return (
-    <span className="block whitespace-nowrap">
-      <span className="block font-medium text-fg">{mean}</span>{" "}
-      <span className="block text-[0.6875rem] text-muted">{interval}</span>
+    <span className="block">
+      <span className="block whitespace-nowrap font-medium text-fg">
+        {mean}
+      </span>{" "}
+      <span className="block text-[0.6875rem] text-muted">
+        <IntervalText interval={interval} />
+      </span>
     </span>
   );
 }
 
-const COLUMNS: ReadonlyArray<{ label: string; hint: string }> = [
-  { label: "Cell accuracy", hint: "higher is better" },
-  { label: "Fabrication rate", hint: "lower is better" },
-  { label: "Contract pass rate", hint: "higher is better" },
-  { label: "pass^4", hint: "higher is better" },
-  { label: "p95 latency", hint: "lower is better" },
-  { label: "Cost / 1k rows", hint: "lower is better" },
-];
+/**
+ * Metric columns with their share of the table width. The table uses
+ * `table-layout: fixed`, so these shares, not the text, set the columns:
+ * the fit no longer depends on each platform's exact glyph widths (CI's
+ * Linux fonts once pushed the auto layout 9px past the card). Latency and
+ * cost get more room for their longer intervals ("[940 ms, 1.3 s]").
+ */
+/**
+ * "[940 ms, 1.3 s]" that can only break after its comma, never inside a
+ * bound ("245" / "ms]"); the text content is unchanged.
+ */
+function IntervalText({ interval }: { interval: string }) {
+  const [lo, hi] = interval.split(", ");
+  if (hi === undefined) return <>{interval}</>;
+  return (
+    <>
+      <span className="whitespace-nowrap">{`${lo},`}</span>{" "}
+      <span className="whitespace-nowrap">{hi}</span>
+    </>
+  );
+}
 
-const TH = "px-1.5 py-2.5 text-left align-bottom font-medium";
-const TD = "px-1.5 py-2.5 align-top font-mono text-xs tabular-nums";
+const COLUMNS: ReadonlyArray<{ label: string; hint: string; width: string }> = [
+  { label: "Cell accuracy", hint: "higher is better", width: "14%" },
+  { label: "Fabrication rate", hint: "lower is better", width: "14%" },
+  { label: "Contract pass rate", hint: "higher is better", width: "14%" },
+  { label: "pass^4", hint: "higher is better", width: "14%" },
+  { label: "p95 latency", hint: "lower is better", width: "18%" },
+  { label: "Cost / 1k rows", hint: "lower is better", width: "16%" },
+];
+/** System names wrap at their hyphens ("always-" / "strong"). */
+const SYSTEM_WIDTH = "10%";
+
+// `break-words`: last resort if a word still can't fit its fixed column.
+const TH = "px-1.5 py-2.5 text-left align-bottom font-medium break-words";
+const TD = "px-1.5 py-2.5 align-top font-mono text-xs tabular-nums break-words";
 
 function Row({ row }: { row: SystemRow }) {
   return (
@@ -107,10 +138,18 @@ export function ResultsTable({ summary }: ResultsTableProps) {
         // positioned and would otherwise escape this scroller's clipping.
         className="relative -mx-1 overflow-x-auto rounded-xl px-1 focus-visible:outline-offset-0"
       >
-        <table className="w-full min-w-[36rem] border-collapse text-sm">
+        {/* min-w: below ~40rem the card scrolls sideways instead of
+            squeezing seven columns into unreadable slivers. */}
+        <table className="w-full min-w-[40rem] table-fixed border-collapse text-sm">
           <caption className="pb-2 text-left font-medium text-muted text-xs uppercase tracking-[0.08em]">
             {`${summary.split} · n = ${summary.n}`}
           </caption>
+          <colgroup>
+            <col style={{ width: SYSTEM_WIDTH }} />
+            {COLUMNS.map((c) => (
+              <col key={c.label} style={{ width: c.width }} />
+            ))}
+          </colgroup>
           <thead>
             <tr className="text-muted text-xs">
               <th scope="col" className={TH}>
