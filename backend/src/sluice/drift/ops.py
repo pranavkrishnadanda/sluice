@@ -368,7 +368,7 @@ def fk_break(state: DriftState, rng: np.random.Generator, *, column: str, frac: 
         raise DriftError(f"{column!r} is not a foreign key of {state.contract.name!r}")
     name = _require(state, column, lambda d: d.is_integer(), "integer")
     chosen = _pick_pks(rng, _distinct_live_pks(state), frac)
-    broken = (-(rng.choice(FK_BREAK_RANGE, size=len(chosen), replace=False) - 1)).tolist()
+    broken = (-(rng.choice(FK_BREAK_RANGE, size=len(chosen), replace=False) + 1)).tolist()
     new_fk = dict(zip(chosen, broken, strict=True))
     values = state.df[name].to_list()
     rows = 0

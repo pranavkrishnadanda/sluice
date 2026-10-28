@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 
 from sluice.contracts.model import load_contract
-from sluice.drift.ops import OPS, DriftError, format_indian
+from sluice.drift.ops import FK_BREAK_RANGE, OPS, DriftError, format_indian
 from sluice.drift.state import DriftState, ManifestEntry
 
 SEED = 7
@@ -401,3 +401,29 @@ def test_manifest_and_truth_survive_json_roundtrip(lineitem_df: pl.DataFrame) ->
     assert {tuple(pk) for pk in back["quarantined"]} == state.quarantined
     for pk, _ in state.flags:
         assert all(type(v) is int for v in pk)
+
+
+class _EdgeFkRng:
+    """Real generator, except the FK-key draw returns the edge values 0, 1, 2, ..."""
+
+    def __init__(self, seed: int) -> None:
+        self._rng = np.random.default_rng(seed)
+
+    def choice(self, n: int, size: int, replace: bool) -> np.ndarray:
+        if n == FK_BREAK_RANGE:
+            return np.arange(size, dtype=np.int64)
+        return self._rng.choice(n, size=size, replace=replace)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._rng, name)
+
+
+def test_fk_break_keys_strictly_negative_at_edge_draws(lineitem_df: pl.DataFrame) -> None:
+    state = DriftState.start(load_contract("lineitem"), lineitem_df.head(20))
+    OPS["fk_break"](state, _EdgeFkRng(SEED), column="l_orderkey", frac=0.5)
+    moved = state.df.filter(
+        pl.Series([pk in state.quarantined for pk in state.row_pk], dtype=pl.Boolean)
+    )["l_orderkey"].to_list()
+    assert len(moved) == 10
+    assert all(-FK_BREAK_RANGE <= v <= -1 for v in moved)
+    assert sorted(moved, reverse=True)[:2] == [-1, -2]
