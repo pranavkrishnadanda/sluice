@@ -3,3 +3,9 @@
 !.env.example
 .superpowers/
 .DS_Store
+
+# frontend
+frontend/node_modules/
+frontend/.next/
+frontend/test-results/
+frontend/playwright-report/

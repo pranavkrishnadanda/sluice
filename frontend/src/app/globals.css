@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* Placeholder tokens; Task 2 replaces this file with the full liquid-glass design system. */
+:root {
+  --background: #f5f6fa;
+  --foreground: #14161f;
+  --muted: #4a5063;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0b0d14;
+    --foreground: #eceef5;
+    --muted: #a3a9bc;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-inter), system-ui, sans-serif;
+}
