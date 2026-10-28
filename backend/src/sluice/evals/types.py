@@ -6,6 +6,7 @@ foreign-key checks) and returns a :class:`SystemOutput`. Every primary-key tuple
 system's output (for quarantined rows: as it appeared in the input, after cleaning).
 """
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -15,6 +16,15 @@ import polars as pl
 from sluice.contracts.model import Contract
 
 PK = tuple[Any, ...]
+
+
+def pk_text(pk: PK) -> str:
+    """A key tuple as compact JSON text (``(7, 3)`` -> ``[7,3]``); stable and unambiguous.
+
+    The one key text shared by the pipeline (``meta["quarantine_reasons"]``) and the loader
+    (the quarantine table's ``pk`` and the ``flags`` table).
+    """
+    return json.dumps(list(pk), separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 @dataclass(frozen=True, slots=True)

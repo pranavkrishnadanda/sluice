@@ -416,3 +416,17 @@ def test_rules_dedupe_prefers_flagged_row_even_when_second(orders: Contract, ord
     out = _run(pl.concat([true_null, bad, text[1:]]), nullable)
     assert out.flags == {(_pk(orders20, 0, orders), "o_custkey")}
     assert out.df["o_orderkey"].to_list() == orders20["o_orderkey"].to_list()  # order kept
+
+
+def test_contract_sources_maps_contract_columns_to_input_columns() -> None:
+    """Final review minor #4: the one source map used by the planner and the pipeline."""
+    import polars as pl
+
+    from sluice.contracts.model import load_contract
+    from sluice.rules.profile import contract_sources, profile
+
+    df = pl.DataFrame({" O_OrderKey ": ["1"], "junk": ["x"], "o_comment": ["c"]})
+    assert contract_sources(profile(df, load_contract("orders"))) == {
+        "o_orderkey": " O_OrderKey ",
+        "o_comment": "o_comment",
+    }

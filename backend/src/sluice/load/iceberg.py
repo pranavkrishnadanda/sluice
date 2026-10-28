@@ -67,7 +67,6 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import json
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -97,8 +96,9 @@ from pyiceberg.types import (
 from sqlalchemy.exc import IntegrityError
 
 from sluice.agent.events import ModelTier, OpaqueId
+from sluice.agent.worker import MAX_CODE_CHARS
 from sluice.contracts.model import MONEY_PRECISION, MONEY_SCALE, Contract, Dtype
-from sluice.evals.types import PK, SystemOutput
+from sluice.evals.types import SystemOutput, pk_text
 from sluice.settings import Settings
 
 NAMESPACE = "sluice"
@@ -117,7 +117,6 @@ LOADABLE_STATUSES = frozenset({STATUS_SUCCEEDED, STATUS_QUARANTINED})
 """Run statuses an output may be loaded with; a ``failed`` run is never loaded (Ruling F1)."""
 DEFAULT_FK_REASON = "foreign_key"
 DEFAULT_REASON = "rejected"
-MAX_CODE_CHARS = 100_000
 LOCK_TIMEOUT = "10s"
 LOCK_WAIT_STATEMENT_TIMEOUT = "15s"
 STATEMENT_TIMEOUT = "60s"
@@ -337,11 +336,6 @@ def to_arrow(df: pl.DataFrame, contract: Contract) -> pa.Table:
     if keys.is_duplicated().any():
         raise LoadError(f"duplicate primary key in {contract.name} output")
     return df.to_arrow().cast(arrow_schema(contract))
-
-
-def pk_text(pk: PK) -> str:
-    """A key tuple as compact JSON text (``(7, 3)`` -> ``[7,3]``); stable and unambiguous."""
-    return json.dumps(list(pk), separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def load_status(out: SystemOutput, status: str | None) -> str:

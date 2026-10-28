@@ -22,8 +22,8 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from sluice.agent.plan import (
-    MAX_ERROR_CHARS,
     MAX_SAMPLES,
+    PLAN_FEEDBACK_CHARS,
     Plan,
     PlanError,
     PlanNode,
@@ -334,7 +334,7 @@ def test_propose_plan_feedback_is_bounded(orders: Contract) -> None:
     run(propose_plan(CANDS, orders, script.llm()))
 
     feedback = script.prompts[-1].split("rejected:", 1)[1]
-    assert len(feedback) <= MAX_ERROR_CHARS + len("\nReturn a corrected plan.")
+    assert len(feedback) <= PLAN_FEEDBACK_CHARS + len("\nReturn a corrected plan.")
     assert long not in feedback
 
 

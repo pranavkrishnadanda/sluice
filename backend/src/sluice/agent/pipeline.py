@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -105,7 +104,7 @@ from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
 from sluice.agent.worker import clip, guard_output, precheck_code, write_transform
 from sluice.contracts.model import ColumnSpec, Contract
 from sluice.contracts.validate import validate
-from sluice.evals.types import PK, CaseInput, SystemOutput
+from sluice.evals.types import CaseInput, SystemOutput, pk_text
 from sluice.io import read_input
 from sluice.llm.client import LLM, CallRecord, LLMError, LLMOutputError, LLMUnavailable, Tier
 from sluice.rules.fixers import (
@@ -115,7 +114,7 @@ from sluice.rules.fixers import (
     cell_texts,
     kept_raw_rows,
 )
-from sluice.rules.profile import Profile, profile
+from sluice.rules.profile import Profile, contract_sources, profile
 from sluice.sandbox.runner import SandboxError, SandboxResult
 
 __all__ = ["MAX_TOKENS_PER_FILE", "MAX_WALL_S_PER_FILE", "PipelineDeps", "run_pipeline"]
@@ -327,7 +326,7 @@ async def _pipeline(run: _Run) -> SystemOutput:
     final = pass1
     accepted = {o.node.column: o.values for o in outcomes if o.accepted and o.values is not None}
     if accepted:
-        source = _sources(prof1)
+        source = contract_sources(prof1)
         rewritten = frame.with_columns(
             [values.alias(source[column]) for column, values in accepted.items()]
         )
@@ -361,7 +360,7 @@ async def _run_nodes(
     outcomes = {n.id: _NodeOutcome(n, tier=planning.route_tier(n, 1)) for n in plan.nodes}
     pending = list(plan.nodes)
     done: set[str] = set()
-    source = _sources(prof)
+    source = contract_sources(prof)
     flagged = _flagged_rows(frame, run.case.contract, prof, pass1)
     while pending:
         if run.halted is not None:  # a final failure: no new node starts
@@ -653,15 +652,6 @@ def _flagged_rows(
     return out
 
 
-def _sources(prof: Profile) -> dict[str, str]:
-    """Contract column -> the input column the rules matched to it."""
-    return {
-        col.matched_contract_column: name
-        for name, col in prof.columns.items()
-        if col.matched_contract_column is not None
-    }
-
-
 def _hints(mapping: ColumnMapping | None) -> dict[str, str]:
     """Contract column -> the original input column name the mapping renamed to it."""
     if mapping is None:
@@ -698,7 +688,11 @@ def _issues(
     issues: list[Issue] = []
     if mapping is not None:
         issues += [
-            Issue(column=target, kind="rename", detail=f"source column {source!r}"[:200])
+            Issue(
+                column=target,
+                kind="rename",
+                detail=f"source column {source!r}"[:MAX_ISSUE_DETAIL_CHARS],
+            )
             for source, target in mapping.pairs.items()
             if target is not None and source != target
         ]
@@ -721,11 +715,6 @@ def _issues(
     return issues
 
 
-def _pk_text(pk: PK) -> str:
-    """The loader's key text (``sluice.load.iceberg.pk_text``): compact JSON of the key list."""
-    return json.dumps(list(pk), separators=(",", ":"), ensure_ascii=False, default=str)
-
-
 def _quarantine_reasons(result: RuleResult, contract: Contract) -> dict[str, str]:
     """Why each quarantined row was held back. Rows only leave the frame on a foreign-key miss."""
     if not result.quarantined:
@@ -734,7 +723,7 @@ def _quarantine_reasons(result: RuleResult, contract: Contract) -> dict[str, str
         f"{column} not in {table}.{ref}" for column, (table, ref) in contract.foreign_keys.items()
     ]
     reason = "foreign_key: " + ("; or ".join(fks) if fks else "not in the reference keys")
-    return {_pk_text(pk): reason for pk in result.quarantined}
+    return {pk_text(pk): reason for pk in result.quarantined}
 
 
 def _verified(run: _Run, result: RuleResult) -> None:

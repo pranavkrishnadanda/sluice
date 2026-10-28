@@ -27,7 +27,7 @@ from sluice.agent.events import OpaqueId
 from sluice.contracts.model import Contract
 from sluice.llm.client import LLM, CallRecord, LLMOutputError, Tier
 from sluice.rules.fixers import SENTINEL_TOKENS, RuleResult, cell_texts, kept_raw_rows
-from sluice.rules.profile import profile
+from sluice.rules.profile import contract_sources, profile
 
 MAX_SAMPLES: Final = 12
 """Raw samples kept per candidate column (sorted, distinct, first N)."""
@@ -38,8 +38,9 @@ PROMPT_SAMPLE_CHARS: Final = 200
 PLAN_VALIDATION_RETRIES: Final = 1
 """Re-asks after a failed plan (client schema repair failed, or semantic validation failed)."""
 
-MAX_ERROR_CHARS: Final = 300
-"""Error text fed back to the model is cut to this many characters (no raw model output)."""
+PLAN_FEEDBACK_CHARS: Final = 300
+"""Error text fed back to the planner is cut to this many characters (no raw model output).
+Distinct from :data:`sluice.agent.caps.MAX_ERROR_CHARS`, the event/sandbox error cap."""
 
 ROLE: Final = "orchestrator"
 PLAN_TIER: Final[Tier] = "strong"
@@ -110,11 +111,7 @@ def candidate_columns(
     if not rules.flags:
         return {}
     prof = profile(raw, contract)
-    source = {
-        col.matched_contract_column: name
-        for name, col in prof.columns.items()
-        if col.matched_contract_column is not None
-    }
+    source = contract_sources(prof)
     rows = kept_raw_rows(raw, contract, prof)
     flagged_rows: dict[str, list[int]] = {}
     for key, column in rules.flags:
@@ -211,7 +208,7 @@ async def propose_plan(
 
     Empty ``candidates`` returns ``Plan(nodes=[])`` without calling a model. A failed attempt
     (the client's schema repair failed, or :func:`validate_plan` rejected the plan) is
-    re-requested once with a short error text (at most :data:`MAX_ERROR_CHARS`) appended.
+    re-requested once with a short error text (at most :data:`PLAN_FEEDBACK_CHARS`) appended.
 
     Returns:
         The plan and the accounting record of every call made.
@@ -239,7 +236,7 @@ async def propose_plan(
                 return validate_plan(plan, candidates), records
             except PlanError as exc:
                 error = str(exc)
-        error = error[:MAX_ERROR_CHARS]
+        error = error[:PLAN_FEEDBACK_CHARS]
         prompt = f"{base}\n\nYour previous plan was rejected: {error}\nReturn a corrected plan."
     # Raised here, outside every ``except`` block, so no exception context is chained.
     raise LLMOutputError(

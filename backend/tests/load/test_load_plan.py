@@ -229,3 +229,27 @@ def test_load_output_refuses_failed_run_before_any_io() -> None:
             settings=object(),  # type: ignore[arg-type]  # never used: refused first
             status="failed",
         )
+
+
+# --- final review minor #4: one cap and one key text, shared with the agent -----------------
+
+
+def test_transform_record_code_cap_is_the_workers() -> None:
+    from pydantic import ValidationError
+
+    from sluice.agent import worker
+    from sluice.load.iceberg import MAX_CODE_CHARS, TransformRecord
+
+    assert MAX_CODE_CHARS == worker.MAX_CODE_CHARS
+    with pytest.raises(ValidationError):
+        TransformRecord(
+            node_id="n1", attempt=1, code="x" * (worker.MAX_CODE_CHARS + 1), model="m", passed=False
+        )
+
+
+def test_pk_text_is_shared_by_pipeline_and_loader() -> None:
+    from sluice.evals import types
+    from sluice.load import iceberg
+
+    assert iceberg.pk_text is types.pk_text
+    assert types.pk_text((7, "a")) == '[7,"a"]'

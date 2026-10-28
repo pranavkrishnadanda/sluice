@@ -94,6 +94,15 @@ def _sample(series: pl.Series) -> list[str]:
     return [str(v) for v in values.to_list()]
 
 
+def contract_sources(prof: Profile) -> dict[str, str]:
+    """Contract column -> the input column the profile matched to it (unmatched ones absent)."""
+    return {
+        col.matched_contract_column: name
+        for name, col in prof.columns.items()
+        if col.matched_contract_column is not None
+    }
+
+
 def profile(df: pl.DataFrame, contract: Contract) -> Profile:
     """Profile ``df`` and match its columns to ``contract`` (see module docstring)."""
     matches = match_columns(list(df.columns), contract)
