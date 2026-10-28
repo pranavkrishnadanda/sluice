@@ -336,6 +336,7 @@ def test_cli_eval_and_results(small_cases: Path, tmp_path: Path) -> None:
     )
     out = tmp_path / "RESULTS.md"
     args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 0, res.output
     assert sha in out.read_text(encoding="utf-8")
@@ -371,6 +372,7 @@ def test_cli_results_refuses_cases_not_matching_lock(tmp_path: Path) -> None:
     lock.write_text(json.dumps(LOCK), encoding="utf-8")
     out = tmp_path / "RESULTS.md"
     args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 1
     assert not out.exists()
@@ -380,6 +382,7 @@ def test_cli_results_without_runs_fails(tmp_path: Path) -> None:
     lock = tmp_path / "LOCK.json"
     lock.write_text(json.dumps(LOCK), encoding="utf-8")
     args = ["results", "--runs-dir", str(tmp_path / "none"), "--lock", str(lock)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     args += ["--out", str(tmp_path / "RESULTS.md")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 1
@@ -654,6 +657,7 @@ def test_cli_eval_limit_and_results_accept_subset(small_cases: Path, tmp_path: P
     )
     out = tmp_path / "RESULTS.md"
     args = ["results", "--runs-dir", str(runs), "--lock", str(lock), "--out", str(out)]
+    args += ["--published-dir", str(tmp_path / "no-published")]
     res = CliRunner().invoke(app, args)
     assert res.exit_code == 0, res.output
     assert "dev (subset n=3)" in out.read_text(encoding="utf-8")
@@ -666,3 +670,64 @@ def test_cli_eval_rejects_zero_limit(small_cases: Path, tmp_path: Path) -> None:
         + ["--cases-dir", str(small_cases.parent), "--out-dir", str(tmp_path / "r")],
     )
     assert res.exit_code != 0
+
+
+# --- final review I-4 / Ruling F4: (system, split, limit) keys and published summaries -------
+
+
+def _put(root: Path, name: str, s: EvalSummary, sha: str = "abc123") -> None:
+    (root / name).mkdir(parents=True)
+    if s.limit is None:
+        s.write(root / name / "summary.json", cases_sha256=sha)
+    else:
+        s.write(root / name / "summary.json", cases_sha256="subset-hash", split_sha256=sha)
+
+
+def test_latest_summaries_keeps_full_and_subset_runs_apart(tmp_path: Path) -> None:
+    _put(tmp_path, "20261027T000000Z-rules-dev", _summary(n_cases=300))
+    _put(tmp_path, "20261028T000000Z-rules-dev", _summary(n_cases=30, limit=30))
+    got = latest_summaries(tmp_path)
+    assert [(s.system, s.limit, s.n_cases) for s, _ in got] == [
+        ("rules", None, 300),
+        ("rules", 30, 30),
+    ]
+    assert all(sha == "abc123" for _, sha in got)
+
+
+def test_latest_summaries_published_wins_for_agent_and_subset_rows(tmp_path: Path) -> None:
+    runs, published = tmp_path / "runs", tmp_path / "published"
+    _put(runs, "20261028T000000Z-rules-dev", _summary(n_cases=300))
+    _put(runs, "20261028T000001Z-agent-dev", _summary("agent", n_cases=7, limit=30))
+    _put(runs, "20261028T000002Z-rules-dev", _summary(n_cases=8, limit=30))
+    _put(published, "20261001T000000Z-rules-dev", _summary(n_cases=299))
+    _put(published, "20261001T000001Z-agent-dev", _summary("agent", n_cases=30, limit=30))
+    _put(published, "20261001T000002Z-rules-dev", _summary(n_cases=30, limit=30))
+    got = latest_summaries(runs, published)
+    assert [(s.system, s.limit, s.n_cases) for s, _ in got] == [
+        ("agent", 30, 30),  # published
+        ("rules", None, 300),  # fresh: the full rules row is always reproduced
+        ("rules", 30, 30),  # published: an explicit subset row
+    ]
+
+
+def test_latest_summaries_published_fills_a_missing_rules_row(tmp_path: Path) -> None:
+    published = tmp_path / "published"
+    _put(published, "20261001T000000Z-rules-dev", _summary(n_cases=299))
+    (published / "README.md").write_text("not a run\n", encoding="utf-8")
+    got = latest_summaries(tmp_path / "runs", published)
+    assert [(s.system, s.n_cases) for s, _ in got] == [("rules", 299)]
+
+
+def test_cli_results_renders_fresh_rules_and_published_agent_rows(tmp_path: Path) -> None:
+    runs, published = tmp_path / "runs", tmp_path / "published"
+    _put(runs, "20261028T000000Z-rules-dev", _summary())
+    _put(published, "20261001T000000Z-agent-dev", _summary("agent", limit=2))
+    lock = tmp_path / "LOCK.json"
+    lock.write_text(json.dumps(LOCK), encoding="utf-8")
+    out = tmp_path / "RESULTS.md"
+    args = ["results", "--runs-dir", str(runs), "--published-dir", str(published)]
+    res = CliRunner().invoke(app, [*args, "--lock", str(lock), "--out", str(out)])
+    assert res.exit_code == 0, res.output
+    md = out.read_text(encoding="utf-8")
+    assert "| rules | dev | 2 |" in md
+    assert "| agent | dev (subset n=2) | 2 |" in md

@@ -40,6 +40,7 @@ app = typer.Typer(no_args_is_help=True, help="Sluice: a self-planning agentic da
 CASES_DIR = Path(__file__).resolve().parents[2] / "cases"
 EVALS_DIR = Path(__file__).resolve().parents[3] / "evals"
 RUNS_DIR = EVALS_DIR / "runs"
+PUBLISHED_DIR = EVALS_DIR / "published"
 RESULTS_MD = EVALS_DIR / "RESULTS.md"
 LOCK_FILE = "LOCK.json"
 DEFAULT_SEED = 2026
@@ -195,17 +196,23 @@ def eval_cmd(
 @app.command()
 def results(
     runs_dir: Annotated[Path, typer.Option(help="Directory of eval runs.")] = RUNS_DIR,
+    published_dir: Annotated[
+        Path, typer.Option(help="Committed published runs (evals/published/).")
+    ] = PUBLISHED_DIR,
     lock: Annotated[Path, typer.Option(help="The cases LOCK.json.")] = CASES_DIR / LOCK_FILE,
     out: Annotated[Path, typer.Option(help="Markdown file to write.")] = RESULTS_MD,
 ) -> None:
-    """Render RESULTS.md from the latest summary per (system, split).
+    """Render RESULTS.md from the latest summary per (system, split, limit).
 
-    Exits 1 when there are no runs, LOCK.json is missing, or a run's cases do not match the
-    split hash in LOCK.json (numbers on unlocked cases are never published).
+    Rows come from ``--runs-dir`` and ``--published-dir``; a published summary wins for its
+    key except the full-split rules row, which is reproduced fresh (see
+    ``sluice.evals.runner.latest_summaries``). Exits 1 when there are no runs, LOCK.json is
+    missing, or a run's cases do not match the split hash in LOCK.json (numbers on unlocked
+    cases are never published).
     """
-    found = latest_summaries(runs_dir)
+    found = latest_summaries(runs_dir, published_dir)
     if not found:
-        typer.echo(f"no eval runs with a summary under {runs_dir}", err=True)
+        typer.echo(f"no eval runs with a summary under {runs_dir} or {published_dir}", err=True)
         raise typer.Exit(1)
     if not lock.is_file():
         typer.echo(f"missing {lock}", err=True)

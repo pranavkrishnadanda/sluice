@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from sluice.contracts.model import Contract, load_contract
 from sluice.drift.cases import load_reference, load_split, split_hash
@@ -369,24 +369,55 @@ def run_eval(
     return summary
 
 
-def latest_summaries(runs_dir: Path) -> list[tuple[EvalSummary, str | None]]:
-    """The newest summary per (system, split) under ``runs_dir``, with the split hash it ran on.
+SummaryKey = tuple[str, str, int | None]
+"""(system, split, limit): a full-split run and a ``--limit`` subset are different rows."""
 
-    The hash is ``cases_sha256`` for a full run and ``split_sha256`` (the whole split the subset
-    was taken from, which is what ``LOCK.json`` pins) for a subset run.
+_FRESH_SYSTEM: Final = "rules"
+"""The one system CI re-runs from scratch (``make eval-rules``) on the full split."""
 
-    Run directories are named ``<UTC timestamp>-<system>-<split>``, so the lexicographically
-    last directory holding a ``summary.json`` wins. Sorted by (system, split).
-    """
-    if not runs_dir.is_dir():
-        return []
-    latest: dict[tuple[str, str], tuple[EvalSummary, str | None]] = {}
+
+def _newest(runs_dir: Path | None) -> dict[SummaryKey, tuple[EvalSummary, str | None]]:
+    """The newest summary per (system, split, limit) in ``runs_dir``, with its split hash."""
+    if runs_dir is None or not runs_dir.is_dir():
+        return {}
+    latest: dict[SummaryKey, tuple[EvalSummary, str | None]] = {}
     for run in sorted(p for p in runs_dir.iterdir() if (p / SUMMARY_FILE).is_file()):
         raw = json.loads((run / SUMMARY_FILE).read_text(encoding="utf-8"))
         summary = EvalSummary.from_json(raw)
         sha = raw.get("split_sha256") if summary.limit is not None else raw.get("cases_sha256")
-        latest[(summary.system, summary.split)] = (summary, sha)
-    return [latest[k] for k in sorted(latest)]
+        latest[(summary.system, summary.split, summary.limit)] = (summary, sha)
+    return latest
+
+
+def _published_wins(key: SummaryKey) -> bool:
+    """A published row replaces a fresh one unless it is the full-split rules row."""
+    system, _, limit = key
+    return system != _FRESH_SYSTEM or limit is not None
+
+
+def latest_summaries(
+    runs_dir: Path, published_dir: Path | None = None
+) -> list[tuple[EvalSummary, str | None]]:
+    """The newest summary per (system, split, limit), with the split hash it ran on.
+
+    The hash is ``cases_sha256`` for a full run and ``split_sha256`` (the whole split the subset
+    was taken from, which is what ``LOCK.json`` pins) for a subset run.
+
+    Run directories are named ``<UTC timestamp>-<system>-<split>``, so within one directory the
+    lexicographically last run holding a ``summary.json`` wins. ``published_dir``
+    (``evals/published/``, committed) holds run directories that cannot be re-run in CI (agent
+    runs need model keys). Its summary replaces the fresh one for the same key, except for the
+    full-split ``rules`` row, which is always taken from ``runs_dir`` when present (CI
+    reproduces it from scratch); a key found in only one directory comes from there (Ruling
+    F4). Sorted by (system, split, limit), the full split before subsets.
+    """
+    fresh, published = _newest(runs_dir), _newest(published_dir)
+    merged = dict(fresh)
+    for key, found in published.items():
+        if key not in merged or _published_wins(key):
+            merged[key] = found
+    order = sorted(merged, key=lambda k: (k[0], k[1], k[2] is not None, k[2] or 0))
+    return [merged[k] for k in order]
 
 
 def format_ci(ci: CI | None) -> str:
