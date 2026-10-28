@@ -391,3 +391,14 @@ def test_proxy_request_with_cache_disabled_carries_litellm_no_cache() -> None:
 def test_proxy_request_uses_the_cache_by_default() -> None:
     assert "cache" not in _sent_body(cache=None)
     assert "cache" not in _sent_body(cache=True)
+
+
+def test_request_timeout_is_below_the_per_file_wall_cap() -> None:
+    """Final review minor #10: one hung call cannot by itself double a file's wall time."""
+    from sluice.agent.caps import MAX_WALL_S_PER_FILE
+    from sluice.llm.client import REQUEST_TIMEOUT_S
+
+    assert REQUEST_TIMEOUT_S <= MAX_WALL_S_PER_FILE / 3
+    llm = LLM(BASE_URL, API_KEY)
+    assert llm._http.timeout.read == REQUEST_TIMEOUT_S
+    run(llm.aclose())

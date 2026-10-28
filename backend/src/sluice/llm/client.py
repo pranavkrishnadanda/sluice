@@ -43,8 +43,14 @@ from sluice.llm import prices
 
 Tier = Literal["small", "strong"]
 
-REQUEST_TIMEOUT_S: Final = 180.0
-"""Client-side cap on one proxy request, covering LiteLLM's own retries and fallbacks."""
+REQUEST_TIMEOUT_S: Final = 60.0
+"""Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
+
+A third of ``caps.MAX_WALL_S_PER_FILE`` (180 s), so a single hung call cannot by itself double
+a file's wall time (the wall cap is checked per attempt). It equals the router's per-deployment
+``timeout`` in ``backend/litellm/config.yaml``: a deployment that hangs for the full router
+timeout surfaces here as ``LLMUnavailable`` (the pipeline's outage path) rather than reaching
+its fallback group, while ordinary errors still fall back well inside the cap."""
 
 CONNECT_TIMEOUT_S: Final = 5.0
 
