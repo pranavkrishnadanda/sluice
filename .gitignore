@@ -3,9 +3,19 @@
 !.env.example
 .superpowers/
 .DS_Store
+
+# backend
 backend/cases/*/
 evals/runs/
 .venv/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+
+# frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.next-e2e/
+frontend/test-results/
+frontend/playwright-report/
+frontend/AGENTS.md

@@ -1,0 +1,48 @@
+{
+  "name": "sluice-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "lint": "biome check . && oxlint",
+    "format": "biome format --write .",
+    "pretypecheck": "[ -d .next/types ] && find .next/types -type f -regex '.* [0-9][0-9]*\\.[^/]*' -delete; next typegen",
+    "typecheck": "tsgo --noEmit",
+    "test": "vitest run",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "@radix-ui/react-tabs": "1.2.1",
+    "@tanstack/react-virtual": "3.14.23",
+    "echarts": "6.1.0",
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "shiki": "4.5.0"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@biomejs/biome": "2.6.3",
+    "@playwright/test": "1.64.1",
+    "@tailwindcss/turbopack": "4.3.3",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.8",
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
+    "@vitejs/plugin-react": "6.1.2",
+    "jsdom": "30.1.3",
+    "oxlint": "1.90.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  },
+  "trustedDependencies": []
+}

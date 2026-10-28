@@ -1,0 +1,392 @@
+@import "tailwindcss";
+
+/*
+ * Sluice liquid-glass design tokens.
+ *
+ * Values come from docs/design/ui-mockup-liquid-glass.html (`.light` / `.dark`).
+ * Every text token (--text, --text-muted, --accent, --ok, --warn, --error) was
+ * darkened (light) or lightened (dark) from the mockup until it reaches WCAG AA
+ * (>= 4.5:1) on all of these surfaces:
+ *   - --glass-bg over each blob at full strength (no blur averaging) over each
+ *     --bg gradient stop, with the glass saturate(170%) backdrop filter applied
+ *     (modelled in both sRGB and linear light) and without it;
+ *   - the same with --chip-bg layered on top;
+ *   - --glass-solid, alone and with --chip-bg.
+ * The ratios in the comments below are those worst cases. tests/design/
+ * contrast.test.ts recomputes them from this file, so a regression fails CI.
+ *
+ * Theme selection: `<html data-theme="system|light|dark">`, set before paint by
+ * the inline script in layout.tsx. With no attribute (JS disabled) the OS
+ * preference is honoured, the same as "system".
+ */
+
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(
+        :root:not([data-theme="light"]),
+        :root:not([data-theme="light"]) *
+      ) {
+      @slot;
+    }
+  }
+}
+
+:root {
+  color-scheme: light;
+
+  --bg: linear-gradient(135deg, #e9eefc, #f6eef8);
+  --blob-1: rgb(143 180 255 / 0.85); /* #8fb4ff */
+  --blob-2: rgb(255 179 209 / 0.85); /* #ffb3d1 */
+  --blob-3: rgb(166 240 216 / 0.85); /* #a6f0d8 */
+
+  --glass-bg: rgb(255 255 255 / 0.42);
+  --glass-solid: #f2f4fb;
+  --glass-border: linear-gradient(
+    135deg,
+    rgb(255 255 255 / 0.75),
+    rgb(255 255 255 / 0.05) 40%,
+    rgb(255 255 255 / 0.25)
+  );
+  --glass-shadow:
+    0 8px 30px rgb(40 50 90 / 0.12), inset 0 1px 0 rgb(255 255 255 / 0.8);
+  /* Raised element on glass (selected item, user bubble, pill controls). */
+  --glass-highlight: rgb(255 255 255 / 0.7);
+
+  --text: #1d1d1f; /* 10.1:1 */
+  --text-muted: #4d4d55; /* 5.0:1 */
+  --accent: #1c48be; /* 4.6:1; mockup #3a6dff is 2.6:1 */
+  /* Send button: a white icon reaches 3.2:1 at the light end (mockup #6aa8ff is 2.4:1). */
+  --accent-fill: linear-gradient(160deg, #4f8dff, #3a6dff);
+  --accent-shadow:
+    0 2px 10px rgb(58 109 255 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.6);
+  --ok: #125f33; /* 4.6:1; mockup #2fb36b is 1.6:1 */
+  --warn: #794600; /* 4.7:1; mockup #f0a030 is 1.1:1 */
+  --error: #a11c25; /* 4.6:1 */
+  --chip-bg: rgb(0 0 0 / 0.06);
+  --focus-ring: #1c48be;
+  /* Code diff: line tints on the --glass-solid code well, plus +/- markers. */
+  --diff-add: #0f5a30; /* 6.4:1 on its tint */
+  --diff-del: #9a1a23; /* 6.3:1 on its tint */
+  --diff-add-bg: rgb(18 140 70 / 0.14);
+  --diff-del-bg: rgb(200 40 50 / 0.11);
+  /*
+   * Evals chart series (non-text, >= 3:1 on every glass/solid surface; see
+   * tests/design/contrast.test.ts). Baselines share one hue and are labelled
+   * directly; each router line takes the next router slot.
+   */
+  --chart-baseline: #007658;
+  --chart-router-1: #2a63d6;
+  --chart-router-2: #ad4514;
+  --chart-grid: rgb(29 29 31 / 0.1);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: linear-gradient(135deg, #0b0d1a, #140b1c);
+  --blob-1: rgb(43 75 255 / 0.55); /* #2b4bff */
+  --blob-2: rgb(176 36 154 / 0.45); /* #b0249a */
+  --blob-3: rgb(15 168 138 / 0.4); /* #0fa88a */
+
+  --glass-bg: rgb(30 32 48 / 0.45);
+  --glass-solid: #1c1e2c;
+  --glass-border: linear-gradient(
+    135deg,
+    rgb(255 255 255 / 0.35),
+    rgb(255 255 255 / 0.02) 40%,
+    rgb(255 255 255 / 0.12)
+  );
+  --glass-shadow:
+    0 8px 30px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.12);
+  --glass-highlight: rgb(255 255 255 / 0.12);
+
+  --text: #f2f2f7; /* 8.0:1 */
+  --text-muted: #babac5; /* 4.6:1 */
+  --accent: #9ebaff; /* 4.6:1 */
+  --accent-fill: linear-gradient(160deg, #4f8dff, #3a6dff);
+  --accent-shadow:
+    0 2px 10px rgb(58 109 255 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.6);
+  --ok: #4cd68a; /* 4.8:1 */
+  --warn: #ffb84d; /* 5.2:1 */
+  --error: #ffa1a1; /* 4.6:1 */
+  --chip-bg: rgb(255 255 255 / 0.1);
+  --focus-ring: #9ebaff;
+  --diff-add: #6ee3a0; /* 7.8:1 on its tint */
+  --diff-del: #ffb0b0; /* 7.8:1 on its tint */
+  --diff-add-bg: rgb(76 214 138 / 0.14);
+  --diff-del-bg: rgb(255 120 120 / 0.13);
+  --chart-baseline: #22b38f;
+  --chart-router-1: #73a0f5;
+  --chart-router-2: #ee8645;
+  --chart-grid: rgb(242 242 247 / 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+
+    --bg: linear-gradient(135deg, #0b0d1a, #140b1c);
+    --blob-1: rgb(43 75 255 / 0.55);
+    --blob-2: rgb(176 36 154 / 0.45);
+    --blob-3: rgb(15 168 138 / 0.4);
+
+    --glass-bg: rgb(30 32 48 / 0.45);
+    --glass-solid: #1c1e2c;
+    --glass-border: linear-gradient(
+      135deg,
+      rgb(255 255 255 / 0.35),
+      rgb(255 255 255 / 0.02) 40%,
+      rgb(255 255 255 / 0.12)
+    );
+    --glass-shadow:
+      0 8px 30px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.12);
+    --glass-highlight: rgb(255 255 255 / 0.12);
+
+    --text: #f2f2f7;
+    --text-muted: #babac5;
+    --accent: #9ebaff;
+    --accent-fill: linear-gradient(160deg, #4f8dff, #3a6dff);
+    --accent-shadow:
+      0 2px 10px rgb(58 109 255 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.6);
+    --ok: #4cd68a;
+    --warn: #ffb84d;
+    --error: #ffa1a1;
+    --chip-bg: rgb(255 255 255 / 0.1);
+    --focus-ring: #9ebaff;
+    --diff-add: #6ee3a0;
+    --diff-del: #ffb0b0;
+    --diff-add-bg: rgb(76 214 138 / 0.14);
+    --diff-del-bg: rgb(255 120 120 / 0.13);
+    --chart-baseline: #22b38f;
+    --chart-router-1: #73a0f5;
+    --chart-router-2: #ee8645;
+    --chart-grid: rgb(242 242 247 / 0.12);
+  }
+}
+
+@theme inline {
+  --color-fg: var(--text);
+  --color-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-error: var(--error);
+  --color-chip: var(--chip-bg);
+  --color-raised: var(--glass-highlight);
+  --color-glass-solid: var(--glass-solid);
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+  --radius-glass: 18px;
+}
+
+@layer base {
+  /*
+   * The gradient lives on <html> (painted on the canvas, beneath everything)
+   * and again on .backdrop. <body> stays transparent: a body background would
+   * paint above the z-index:-1 blob layer and hide it.
+   */
+  html {
+    background: var(--bg) fixed;
+    background-color: var(--glass-solid);
+  }
+
+  body {
+    min-height: 100dvh;
+    color: var(--text);
+    font-family: var(--font-inter), system-ui, sans-serif;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* Fixed colour blobs that the glass refracts. */
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    overflow: hidden;
+    pointer-events: none;
+    background: var(--bg);
+  }
+
+  .blob {
+    position: absolute;
+    border-radius: 9999px;
+    filter: blur(72px);
+  }
+
+  .blob-1 {
+    width: 46vmax;
+    height: 46vmax;
+    top: -14vmax;
+    left: 8vw;
+    background: var(--blob-1);
+  }
+
+  .blob-2 {
+    width: 40vmax;
+    height: 40vmax;
+    bottom: -16vmax;
+    left: 38vw;
+    background: var(--blob-2);
+  }
+
+  .blob-3 {
+    width: 34vmax;
+    height: 34vmax;
+    top: 22vh;
+    right: -10vmax;
+    background: var(--blob-3);
+  }
+
+  .glass {
+    position: relative;
+    border-radius: var(--radius-glass);
+    background: var(--glass-bg);
+    -webkit-backdrop-filter: blur(28px) saturate(170%);
+    backdrop-filter: blur(28px) saturate(170%);
+    box-shadow: var(--glass-shadow);
+    transition:
+      background-color 200ms ease,
+      box-shadow 200ms ease;
+  }
+
+  /* 1px gradient highlight border, masked to the ring only. */
+  .glass::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: var(--glass-border);
+    pointer-events: none;
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#000 0 0) content-box exclude,
+      linear-gradient(#000 0 0);
+  }
+
+  .glass-pill {
+    border-radius: 9999px;
+  }
+
+  .theme-toggle {
+    display: inline-grid;
+    place-items: center;
+    width: 2.75rem;
+    height: 2.75rem;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .theme-toggle:hover {
+    background: var(--glass-highlight);
+  }
+
+  /* Primary round action (composer send): white icon on the accent gradient. */
+  .accent-fill {
+    color: #fff;
+    background: var(--accent-fill);
+    box-shadow: var(--accent-shadow);
+  }
+
+  /*
+   * Plan DAG nodes: an opaque fill tinted 16% toward the status colour, with
+   * a stroke in that colour. tests/design/contrast.test.ts (PLAN_TINT_PCT)
+   * checks --text and --text-muted on every tint.
+   */
+  .plan-node rect {
+    fill: var(--glass-solid);
+    stroke: var(--text-muted);
+    stroke-dasharray: 4 3;
+  }
+
+  .plan-node[data-status="running"] rect {
+    fill: color-mix(in srgb, var(--accent) 16%, var(--glass-solid));
+    stroke: var(--accent);
+    stroke-dasharray: none;
+    animation: node-pulse 1.4s ease-in-out infinite;
+  }
+
+  .plan-node[data-status="retrying"] rect {
+    fill: color-mix(in srgb, var(--warn) 16%, var(--glass-solid));
+    stroke: var(--warn);
+    stroke-dasharray: none;
+  }
+
+  .plan-node[data-status="done"] rect {
+    fill: color-mix(in srgb, var(--ok) 16%, var(--glass-solid));
+    stroke: var(--ok);
+    stroke-dasharray: none;
+  }
+
+  .plan-node[data-status="failed"] rect {
+    fill: color-mix(in srgb, var(--error) 16%, var(--glass-solid));
+    stroke: var(--error);
+    stroke-dasharray: none;
+  }
+
+  /* New thread content fades in with a 4px rise; off under reduced motion. */
+  .rise-in {
+    animation: rise-in 180ms ease-out both;
+  }
+}
+
+@keyframes node-pulse {
+  50% {
+    stroke-opacity: 0.45;
+  }
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* No backdrop-filter support: a translucent panel would be unreadable. */
+@supports not (
+    (backdrop-filter: blur(1px)) or
+    (-webkit-backdrop-filter: blur(1px))
+  ) {
+  .glass {
+    background: var(--glass-solid);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass {
+    background: var(--glass-solid);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+html[data-reduce-transparency] .glass {
+  background: var(--glass-solid);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    /* biome-ignore-start lint/complexity/noImportantStyles: a user motion preference must beat every component and utility transition. */
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+    /* biome-ignore-end lint/complexity/noImportantStyles: end of reduced-motion overrides. */
+  }
+}

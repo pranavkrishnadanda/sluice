@@ -1,0 +1,220 @@
+import { AxeBuilder } from "@axe-core/playwright";
+import { expect, type Page, test } from "@playwright/test";
+import {
+  emulateReducedTransparency,
+  openEvals,
+  openFinishedRun,
+} from "./helpers";
+
+const TAGS = [
+  "wcag2a",
+  "wcag2aa",
+  "wcag21a",
+  "wcag21aa",
+  "wcag22aa",
+  "best-practice",
+];
+
+/**
+ * Rules that fail at any impact. Everything else fails only when serious or
+ * critical. `heading-order` (moderate, best-practice) guards the panel's
+ * heading levels under the run's h1.
+ */
+const ALWAYS_BLOCKING = new Set(["heading-order"]);
+
+interface Scan {
+  /** Blocking violations, summarised for a readable diff. */
+  blocking: { id: string; impact: string; help: string; targets: string[] }[];
+  /** Text nodes whose contrast axe actually measured (and passed). */
+  contrastChecked: number;
+  /** Text nodes axe could not measure, with axe's reason. */
+  contrastIncomplete: string[];
+}
+
+async function scan(page: Page): Promise<Scan> {
+  const { violations, passes, incomplete } = await new AxeBuilder({ page })
+    .withTags(TAGS)
+    .analyze();
+  return {
+    blocking: violations
+      .filter(
+        (v) =>
+          v.impact === "serious" ||
+          v.impact === "critical" ||
+          ALWAYS_BLOCKING.has(v.id),
+      )
+      .map((v) => ({
+        id: v.id,
+        impact: v.impact ?? "",
+        help: v.help,
+        targets: v.nodes.map((n) => n.target.join(" ")),
+      })),
+    contrastChecked:
+      passes.find((p) => p.id === "color-contrast")?.nodes.length ?? 0,
+    contrastIncomplete:
+      incomplete
+        .find((p) => p.id === "color-contrast")
+        ?.nodes.map(
+          (n) =>
+            `${n.target.join(" ")}: ${n.any.map((c) => c.message).join("; ")}`,
+        ) ?? [],
+  };
+}
+
+/*
+ * Two renderings per theme:
+ *
+ * - "translucent": the glass as shipped. axe cannot resolve a background
+ *   behind backdrop-filtered glass with a gradient ::before ring, so it
+ *   reports text contrast as "incomplete" rather than checking it; this pass
+ *   covers every other rule. The translucent colours themselves are guarded
+ *   worst-case by tests/design/contrast.test.ts.
+ * - "opaque": reduced transparency (the app's own solid-glass fallback) with
+ *   the decorative ring hidden, so axe measures real rendered contrast for
+ *   every text node on glass.
+ */
+const MODES = ["translucent", "opaque"] as const;
+type Mode = (typeof MODES)[number];
+
+async function beforeLoad(page: Page, mode: Mode) {
+  if (mode === "opaque") await emulateReducedTransparency(page);
+}
+
+async function afterLoad(page: Page, mode: Mode) {
+  if (mode !== "opaque") return;
+  await page.addStyleTag({
+    content: ".glass::before { display: none !important; }",
+  });
+}
+
+/**
+ * Most text axe still cannot measure with opaque glass, per view: the brand
+ * link on the bare backdrop gradient (every view), the diff's "−" marker
+ * glyph (Code), and the SVG plan-node text plus its overlapped caption
+ * (Plan; the sr-only "Plan steps" list is its text alternative). A regression
+ * that hides real text from the contrast check pushes a view over its limit.
+ */
+const INCOMPLETE_LIMIT: Record<string, number> = {
+  "Data tab": 1,
+  "Code tab, diff": 2,
+  "Plan tab": 8,
+  Evals: 1,
+};
+
+function expectClean(result: Scan, mode: Mode, label: string) {
+  expect(result.blocking, label).toEqual([]);
+  if (mode !== "opaque") return;
+  // Guard against a vacuous pass: the opaque rendering must really be measured.
+  expect(result.contrastChecked, `${label}: contrast checked`).toBeGreaterThan(
+    20,
+  );
+  expect(
+    result.contrastIncomplete.length,
+    `${label}: contrast not measurable\n${result.contrastIncomplete.join("\n")}`,
+  ).toBeLessThanOrEqual(INCOMPLETE_LIMIT[label] ?? 0);
+}
+
+for (const colorScheme of ["light", "dark"] as const) {
+  test.describe(`${colorScheme} theme`, () => {
+    test.use({ colorScheme });
+
+    for (const mode of MODES) {
+      test(`${mode} glass: run thread and every details tab pass axe`, async ({
+        page,
+      }) => {
+        await beforeLoad(page, mode);
+        await openFinishedRun(page, "run-repaired");
+        await afterLoad(page, mode);
+        // System mode follows the emulated colour scheme.
+        await expect(page.locator("html")).toHaveAttribute(
+          "data-theme",
+          "system",
+        );
+        expectClean(await scan(page), mode, "Data tab");
+
+        const details = page.getByRole("complementary", { name: "Details" });
+        await details.getByRole("tab", { name: "Code" }).click();
+        await details
+          .getByRole("switch", { name: "Diff vs previous attempt" })
+          .click();
+        await expect(
+          details.getByRole("figure", { name: /^Changes from attempt/ }),
+        ).toBeVisible();
+        expectClean(await scan(page), mode, "Code tab, diff");
+
+        await details.getByRole("tab", { name: "Plan" }).click();
+        await expect(
+          details.getByRole("list", { name: "Plan steps" }),
+        ).toBeAttached();
+        expectClean(await scan(page), mode, "Plan tab");
+      });
+
+      test(`${mode} glass: evals page passes axe`, async ({ page }) => {
+        await beforeLoad(page, mode);
+        await openEvals(page);
+        await afterLoad(page, mode);
+        expectClean(await scan(page), mode, "Evals");
+      });
+    }
+
+    test("full-page screenshot of the repaired run", async ({ page }) => {
+      await openFinishedRun(page, "run-repaired");
+      // CI artifact only: test-results/ is git-ignored.
+      await page.screenshot({
+        path: `test-results/screenshots/run-repaired-${colorScheme}.png`,
+        fullPage: true,
+        animations: "disabled",
+      });
+    });
+  });
+}
+
+test("keyboard-only Tab order reaches the theme toggle, composer and tabs", async ({
+  page,
+}) => {
+  await openFinishedRun(page, "run-repaired");
+  await page.locator("body").focus();
+
+  // Role and name of each focus stop, in Tab order.
+  const visited: string[] = [];
+  for (let i = 0; i < 60; i++) {
+    await page.keyboard.press("Tab");
+    const stop = await page.evaluate(() => {
+      const el = document.activeElement;
+      if (!el || el === document.body) return "";
+      const role = el.getAttribute("role") ?? el.tagName.toLowerCase();
+      const name =
+        el.getAttribute("aria-label") ?? el.textContent?.trim() ?? "";
+      return `${role}:${name}`;
+    });
+    visited.push(stop);
+    if (stop === "tab:Data") break;
+  }
+  const order = visited.join("\n");
+
+  const themeToggle = visited.findIndex((s) => s.startsWith("button:Theme: "));
+  const attach = visited.indexOf("input:Attach a file");
+  const start = visited.indexOf("button:Start run");
+  const tabs = visited.indexOf("tab:Data");
+
+  // Reached, and in reading order: header, main column, then the side panel.
+  expect(themeToggle, order).toBeGreaterThan(-1);
+  expect(attach, order).toBeGreaterThan(themeToggle);
+  expect(start, order).toBeGreaterThan(attach);
+  expect(tabs, order).toBeGreaterThan(start);
+
+  // Within the tab list, arrow keys move focus and Enter selects.
+  const code = page.getByRole("tab", { name: "Code" });
+  await page.keyboard.press("ArrowRight");
+  await expect(code).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(code).toHaveAttribute("aria-selected", "true");
+
+  // The theme toggle works from the keyboard too (system → light).
+  await page.getByRole("button", { name: /^Theme: / }).focus();
+  await page.keyboard.press("Enter");
+  await expect(
+    page.getByRole("button", { name: "Theme: light" }),
+  ).toBeFocused();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+});
