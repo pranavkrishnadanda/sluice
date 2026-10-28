@@ -506,3 +506,40 @@ def test_empty_output_can_pass_the_contract_when_no_rows_are_expected(
     t = _truth(orders)
     g = grade(_case(tmp_path, t.clear()), _out(t.clear()), {})
     assert g.contract_pass is True
+
+
+THREE_WRONG = (3 * N_COLS - 3) / (3 * N_COLS)
+
+
+@pytest.mark.parametrize(
+    ("column", "values"),
+    [
+        ("o_totalprice", [{"a": 1}, {"a": 2}, {"a": 3}]),
+        ("o_orderdate", [{"a": 1}, {"a": 2}, {"a": 3}]),
+        ("o_custkey", [{"a": 10}, {"a": 20}, {"a": 30}]),
+        ("o_comment", [["a"], ["b"], ["c"]]),
+        ("o_custkey", [[10], [20], [30]]),
+    ],
+    ids=["struct-decimal", "struct-date", "struct-int64", "list-string", "list-int64"],
+)
+def test_nested_output_is_incorrect_without_raising(
+    tmp_path: Path, orders: Contract, column: str, values: list[Any]
+) -> None:
+    t = _truth(orders)
+    out_df = t.with_columns(pl.Series(column, values))
+    g = grade(_case(tmp_path, t), _out(out_df), {})
+    assert g.cell_accuracy == pytest.approx(THREE_WRONG)
+
+
+def test_array_output_is_incorrect_without_raising(tmp_path: Path, orders: Contract) -> None:
+    t = _truth(orders)
+    arr = pl.Series("o_custkey", [[10], [20], [30]], dtype=pl.Array(pl.Int64, 1))
+    g = grade(_case(tmp_path, t), _out(t.with_columns(arr)), {})
+    assert g.cell_accuracy == pytest.approx(THREE_WRONG)
+
+
+def test_nested_output_on_flag_truth_is_fabrication(tmp_path: Path, orders: Contract) -> None:
+    truth = _destroyed(orders)
+    out_df = truth.with_columns(pl.Series("o_custkey", [{"a": 10}, {"a": 0}, {"a": 30}]))
+    g = grade(_case(tmp_path, truth, FLAG_2), _out(out_df, FLAG_2), {})
+    assert g.fabrication_rate == 1.0

@@ -23,12 +23,13 @@ Value comparison: each output column is cast to its contract dtype and compared 
 truth (``Decimal(15, 2)`` money exactly, dates exactly, strings exactly, timestamps truncated
 to the second on both sides). A non-null output cell whose cast fails or is lossy
 (``"100.104"`` or ``100.104`` into ``Decimal(15, 2)``, ``2.7`` into an integer, a datetime with
-a time part into a date), or whose column cannot be cast at all, is a non-null value equal to
-nothing: incorrect, and a fabrication where truth is ``FLAG``. String output into a date or
-timestamp column is parsed per cell as ISO-8601 (``YYYY-MM-DD``; ``YYYY-MM-DD[T ]HH:MM:SS``
-with optional fraction and ``Z``/``+HH:MM`` offset, naive read as UTC). String output into an
-integer must be canonical: ``"010"`` and ``"10.0"`` are lossy (deliberately strict). A
-contract column missing from the output makes its cells ``MISSING``.
+a time part into a date), or whose column cannot be cast at all (including any nested
+``Struct``/``List``/``Array`` column), is a non-null value equal to nothing: incorrect, and a
+fabrication where truth is ``FLAG``. String output into a date or timestamp column is parsed
+per cell as ISO-8601 (``YYYY-MM-DD``; ``YYYY-MM-DD[T ]HH:MM:SS`` with optional fraction and
+``Z``/``+HH:MM`` offset, naive read as UTC). String output into an integer must be canonical:
+``"010"`` and ``"10.0"`` are lossy (deliberately strict). A contract column missing from the
+output makes its cells ``MISSING``.
 
 Output rows are keyed by the PK columns cast to the contract dtypes (a lossy PK cast gives a
 null key that matches no expected row); if any PK column is missing no output row is
@@ -150,8 +151,12 @@ def _cast(series: pl.Series, dtype: pl.DataType) -> pl.Series:
     A non-null input cell that comes back null is therefore "uncastable": it never equals truth
     (and is a fabrication where truth is ``FLAG``); in a PK column it matches no expected row.
     Strings into a date or timestamp are parsed as ISO-8601 per cell (see :func:`_parse_iso`),
-    so one unparseable cell never nulls the rest of its column.
+    so one unparseable cell never nulls the rest of its column. A nested source (``Struct``,
+    ``List``, ``Array``) is uncastable up front: Polars would either raise mid-comparison or
+    unwrap a single-field struct into a scalar that then scores as correct.
     """
+    if series.dtype.is_nested():  # Struct/List/Array never holds a scalar contract value
+        return pl.Series(series.name, [None] * series.len(), dtype=dtype)
     if series.dtype == pl.String and (dtype == pl.Date or isinstance(dtype, pl.Datetime)):
         return _parse_iso(series, dtype).alias(series.name)
     try:
