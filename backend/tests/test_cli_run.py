@@ -46,12 +46,18 @@ def input_file(tmp_path: Path) -> Path:
     return path
 
 
-def _run(recorder: _Recorder, path: Path, table: str = "orders") -> LoadResult:
+def _run(
+    recorder: _Recorder,
+    path: Path,
+    table: str = "orders",
+    loaded: LoadResult | None = None,
+) -> LoadResult:
     return cli.run_file(
         path,
         table,
         run_fn=recorder.run_fn,
         load_fn=recorder.load_fn,
+        loaded_fn=lambda *_a, **_k: loaded,
         settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
         reference_fn=lambda _t: {},
         echo=recorder.lines.append,
@@ -158,3 +164,70 @@ def test_run_command_rejects_unknown_table(input_file: Path) -> None:
 def test_run_command_missing_file_exits_nonzero(tmp_path: Path) -> None:
     result = CliRunner().invoke(cli.app, ["run", str(tmp_path / "nope.csv"), "--table", "orders"])
     assert result.exit_code != 0
+
+
+# --- fix round 1: pre-check skips the pipeline; clean DB error lines ------------------------
+
+
+def test_run_file_already_loaded_skips_pipeline_and_load(input_file: Path) -> None:
+    rec = _Recorder()
+
+    def must_not_run(case: CaseInput) -> SystemOutput:
+        pytest.fail("the pipeline must not run for an already-loaded file")
+
+    rec.run_fn = must_not_run  # type: ignore[method-assign]
+    prior = LoadResult(snapshot_id="77", rows_loaded=3, rows_quarantined=0, skipped=True)
+    result = _run(rec, input_file, loaded=prior)
+    events = [json.loads(line) for line in rec.lines]
+    assert result.skipped is True
+    assert rec.loads == []
+    assert [e["type"] for e in events] == ["run_started", "run_finished"]
+    assert "already loaded" in events[-1]["summary"]
+    assert events[-1]["costUsd"] == 0.0
+
+
+def test_run_file_precheck_receives_table_key(input_file: Path) -> None:
+    rec = _Recorder()
+    seen: list[tuple[Any, ...]] = []
+
+    def loaded_fn(contract: Contract, sha: str, **kw: Any) -> None:
+        seen.append((contract.name, sha, kw.get("settings")))
+
+    cli.run_file(
+        input_file,
+        "orders",
+        run_fn=rec.run_fn,
+        load_fn=rec.load_fn,
+        loaded_fn=loaded_fn,
+        settings_fn=lambda: "S",  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+        echo=rec.lines.append,
+    )
+    assert seen == [("orders", hashlib.sha256(input_file.read_bytes()).hexdigest(), "S")]
+    assert len(rec.loads) == 1
+
+
+@pytest.mark.parametrize("make_exc", ["psycopg", "sqlalchemy"])
+def test_run_command_db_error_prints_clean_line_without_details(
+    input_file: Path, monkeypatch: pytest.MonkeyPatch, make_exc: str
+) -> None:
+    import psycopg
+    import sqlalchemy.exc
+
+    secret = "postgresql://sluice:hunter2@localhost:55432/sluice"
+    if make_exc == "psycopg":
+        exc: Exception = psycopg.OperationalError(f"connection failed: {secret}")
+        name = "OperationalError"
+    else:
+        exc = sqlalchemy.exc.OperationalError(secret, {}, Exception(secret))
+        name = "OperationalError"
+
+    def boom(*_a: object, **_k: object) -> LoadResult:
+        raise exc
+
+    monkeypatch.setattr(cli, "run_file", boom)
+    result = CliRunner().invoke(cli.app, ["run", str(input_file), "--table", "orders"])
+    assert result.exit_code == 1
+    assert f"run failed: {name}" in result.output
+    assert "hunter2" not in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)

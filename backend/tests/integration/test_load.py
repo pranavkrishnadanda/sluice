@@ -300,3 +300,66 @@ def test_cli_run_loads_orders_file_idempotently(
     assert second.exit_code == 0, second.output
     assert "already loaded" in second.stdout
     assert '"type":"loaded"' not in second.stdout
+
+
+# --- fix round 1 (Ruling L1): the key is (iceberg_table, file_sha256, contract_version) ------
+
+
+@pytest.fixture
+def lineitem_clean(lineitem_df: pl.DataFrame) -> tuple[Contract, pl.DataFrame]:
+    contract = load_contract("lineitem")
+    schema = contract.polars_schema()
+    return contract, lineitem_df.head(30).select(list(schema)).cast(schema)  # type: ignore[arg-type]
+
+
+def test_same_file_into_another_table_is_not_skipped(
+    clean: pl.DataFrame,
+    orders: Contract,
+    lineitem_clean: tuple[Contract, pl.DataFrame],
+    settings: Settings,
+    ns: str,
+    table_of: Any,
+) -> None:
+    sha = _sha()
+    li_contract, li_df = lineitem_clean
+    first = _load(_out(clean), orders, settings, ns, sha)
+
+    second = _load(_out(li_df), li_contract, settings, ns, sha)
+
+    assert first.skipped is False
+    assert second.skipped is False
+    assert table_of("lineitem").scan().to_arrow().num_rows == 30
+    assert _load(_out(li_df), li_contract, settings, ns, sha).skipped is True
+    assert _load(_out(clean), orders, settings, ns, sha).skipped is True
+
+
+def test_find_load_reports_recorded_key_per_table(
+    clean: pl.DataFrame, orders: Contract, settings: Settings, ns: str
+) -> None:
+    sha = _sha()
+    assert iceberg.find_load(orders, sha, settings=settings, namespace=ns) is None
+    loaded = _load(_out(clean), orders, settings, ns, sha)
+
+    found = iceberg.find_load(orders, sha, settings=settings, namespace=ns)
+
+    assert found is not None and found.skipped is True
+    assert found.snapshot_id == loaded.snapshot_id
+    other = iceberg.find_load(load_contract("lineitem"), sha, settings=settings, namespace=ns)
+    assert other is None
+
+
+def test_cli_repeat_run_does_not_run_pipeline(
+    orders_df: pl.DataFrame, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / f"orders-{secrets.token_hex(4)}.parquet"
+    orders_df.sample(25, seed=secrets.randbelow(2**31)).write_parquet(path)
+    runner = CliRunner()
+    assert runner.invoke(cli.app, ["run", str(path), "--table", "orders"]).exit_code == 0
+
+    def must_not_run(_note: object) -> object:
+        pytest.fail("pipeline resolved for an already-loaded file")
+
+    monkeypatch.setattr(cli, "resolve_run_fn", must_not_run)
+    again = runner.invoke(cli.app, ["run", str(path), "--table", "orders"])
+    assert again.exit_code == 0, again.output
+    assert "already loaded" in again.stdout

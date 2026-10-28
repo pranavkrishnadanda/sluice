@@ -11,7 +11,9 @@ from typing import Annotated, Any
 
 import duckdb
 import polars as pl
+import psycopg
 import typer
+from sqlalchemy.exc import SQLAlchemyError
 
 from sluice.agent.events import (
     PIPELINE_EVENT_ADAPTER,
@@ -26,7 +28,7 @@ from sluice.contracts.model import Contract, load_contract
 from sluice.drift.cases import build_split, load_reference, load_split, split_hash, unexpected_files
 from sluice.evals.runner import SYSTEMS, format_ci, latest_summaries, render_results, run_eval
 from sluice.evals.types import CaseInput, SystemOutput
-from sluice.load.iceberg import LoadError, LoadResult, load_output
+from sluice.load.iceberg import LoadError, LoadResult, find_load, load_output
 from sluice.settings import Settings, get_settings
 
 app = typer.Typer(no_args_is_help=True, help="Sluice: a self-planning agentic data pipeline.")
@@ -44,6 +46,7 @@ _CLI_EVENTS = frozenset({"run_started", "loaded", "run_finished"})
 
 RunFn = Callable[[CaseInput], SystemOutput]
 LoadFn = Callable[..., LoadResult]
+LoadedFn = Callable[..., LoadResult | None]
 
 
 class SplitName(StrEnum):
@@ -255,6 +258,10 @@ def _replayed(out: SystemOutput) -> list[EventModel]:
     return events
 
 
+def _skip_summary(result: LoadResult) -> str:
+    return f"file already loaded (snapshot {result.snapshot_id}); nothing written"
+
+
 def run_file(
     path: Path,
     table: str,
@@ -262,13 +269,17 @@ def run_file(
     contract_version: str = "v1",
     run_fn: RunFn | None = None,
     load_fn: LoadFn = load_output,
+    loaded_fn: LoadedFn = find_load,
     settings_fn: Callable[[], Settings] = get_settings,
     reference_fn: Callable[[str], dict[str, set[Any]]] = load_reference,
     echo: Callable[[str], Any] = typer.echo,
 ) -> LoadResult:
     """Run the pipeline over ``path``, print its events as JSON lines, and load the output.
 
-    ``run_fn`` defaults to :func:`resolve_run_fn` (agent, else rules). On an exception a
+    ``run_fn`` defaults to :func:`resolve_run_fn` (agent, else rules). Before the pipeline runs,
+    ``loaded_fn`` looks up the idempotency key; a file already loaded into this table is
+    reported as skipped without running (or paying for) the pipeline. ``load_fn`` re-checks the
+    key under its locks, so a concurrent duplicate is still caught. On an exception a
     ``run_finished`` event with status ``failed`` is printed and the exception re-raised.
     """
     contract: Contract = load_contract(table, contract_version)
@@ -282,12 +293,24 @@ def run_file(
     cost = 0.0
     try:
         sha = file_sha256(path)
+        settings = settings_fn()
+        prior = loaded_fn(contract, sha, settings=settings)
+        if prior is not None:
+            emit(
+                RunFinished(
+                    status="succeeded",
+                    summary=_skip_summary(prior),
+                    cost_usd=0.0,
+                    tokens=0,
+                )
+            )
+            return prior
         fn = run_fn or resolve_run_fn(note=lambda m: typer.echo(m, err=True))
         out = fn(CaseInput(path, contract, reference_fn(table)))
         cost = out.cost_usd
         for event in _replayed(out):
             emit(event)
-        result = load_fn(out, contract, run_id=run_id, file_sha256=sha, settings=settings_fn())
+        result = load_fn(out, contract, run_id=run_id, file_sha256=sha, settings=settings)
     except Exception as exc:
         emit(
             RunFinished(
@@ -304,7 +327,7 @@ def run_file(
             )
         )
     if result.skipped:
-        summary = f"file already loaded (snapshot {result.snapshot_id}); nothing written"
+        summary = _skip_summary(result)
     else:
         summary = f"loaded {result.rows_loaded} row(s), quarantined {result.rows_quarantined}" + (
             " (recovered an earlier commit)" if result.recovered else ""
@@ -334,6 +357,10 @@ def run_cmd(
     """
     try:
         run_file(file, table.value, contract_version=contract_version)
+    except (psycopg.Error, SQLAlchemyError) as exc:
+        # Driver messages can echo connection details; print the error type only.
+        typer.echo(f"run failed: {type(exc).__name__}", err=True)
+        raise typer.Exit(1) from exc
     except (LoadError, ValueError, OSError) as exc:
         typer.echo(f"run failed: {type(exc).__name__}: {exc}", err=True)
         raise typer.Exit(1) from exc

@@ -21,11 +21,22 @@ is coerced through floats, and the final Arrow cast is a safe (overflow-checked)
 
 Idempotency
 -----------
-The key is ``(file_sha256, contract.version)``, unique in ``loads``. A load runs inside one
-Postgres transaction holding two advisory locks (the target table, then the key), so concurrent
-loads of a table are serialised and two loads of one file cannot race. Every Iceberg append
-carries the snapshot summary properties ``sluice.file_sha256`` / ``sluice.contract_version`` /
-``sluice.run_id``. Order of work:
+The key is ``(iceberg_table, file_sha256, contract.version)``, unique in ``loads`` (Ruling L1:
+the same bytes loaded into another table are a different load). A load runs inside one Postgres
+transaction holding two advisory locks (the target table, then the key), so concurrent loads of
+a table are serialised and two loads of one file cannot race. Every Iceberg append carries the
+snapshot summary properties ``sluice.file_sha256`` / ``sluice.contract_version`` /
+``sluice.run_id``; summaries are per table, so the snapshot check below is keyed by table too.
+:func:`find_load` is a lock-free read of the same key, used by ``sluice run`` to skip the
+pipeline for a repeat file; the in-transaction check stays authoritative (race safety).
+
+Timeouts: every lineage transaction sets, transaction-locally, ``lock_timeout = 10s`` and
+``statement_timeout = 15s`` while it waits for the DDL/advisory locks, then raises
+``statement_timeout`` to 60s for the remaining statements. A load stuck behind another loader
+fails with a ``psycopg`` lock/cancel error instead of hanging. (Iceberg's own writes to S3 run
+between statements, so they are bounded by the S3 timeouts, not by ``statement_timeout``.)
+
+Order of work:
 
 1. ``loads`` already has the key -> return ``skipped=True``; nothing is written.
 2. Otherwise look for an append with this key among the *ancestors of the current snapshot* of
@@ -74,6 +85,7 @@ from pyiceberg.types import (
     StringType,
     TimestamptzType,
 )
+from sqlalchemy.exc import IntegrityError
 
 from sluice.agent.events import ModelTier, OpaqueId
 from sluice.contracts.model import MONEY_PRECISION, MONEY_SCALE, Contract, Dtype
@@ -95,6 +107,10 @@ STATUS_ROLLED_BACK = "rolled_back"
 DEFAULT_FK_REASON = "foreign_key"
 DEFAULT_REASON = "rejected"
 MAX_CODE_CHARS = 100_000
+LOCK_TIMEOUT = "10s"
+LOCK_WAIT_STATEMENT_TIMEOUT = "15s"
+STATEMENT_TIMEOUT = "60s"
+_SET_CONFIG = "SELECT set_config(%s, %s, true)"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -165,8 +181,20 @@ CREATE TABLE IF NOT EXISTS loads (
     rows_loaded       integer NOT NULL CHECK (rows_loaded >= 0),
     rows_quarantined  integer NOT NULL CHECK (rows_quarantined >= 0),
     loaded_at         timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT loads_idempotency_key UNIQUE (file_sha256, contract_version)
+    CONSTRAINT loads_table_idempotency_key UNIQUE (iceberg_table, file_sha256, contract_version)
 );
+-- Migrate a pre-L1 table keyed by (file_sha256, contract_version) only. Guarded so the usual
+-- path takes no ALTER TABLE lock.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'loads_idempotency_key') THEN
+        ALTER TABLE loads DROP CONSTRAINT loads_idempotency_key;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'loads_table_idempotency_key') THEN
+        ALTER TABLE loads ADD CONSTRAINT loads_table_idempotency_key
+            UNIQUE (iceberg_table, file_sha256, contract_version);
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS flags (
     run_id       text NOT NULL REFERENCES runs (run_id),
     pk           text NOT NULL,
@@ -378,11 +406,37 @@ def _connect(settings: Settings) -> psycopg.Connection:
     return psycopg.connect(settings.postgres_dsn, connect_timeout=PG_CONNECT_TIMEOUT_S)
 
 
+def set_lock_timeouts(conn: psycopg.Connection) -> None:
+    """Bound the current transaction's lock waits (transaction-local ``set_config``)."""
+    conn.execute(_SET_CONFIG, ("lock_timeout", LOCK_TIMEOUT))
+    conn.execute(_SET_CONFIG, ("statement_timeout", LOCK_WAIT_STATEMENT_TIMEOUT))
+
+
+def restore_statement_timeout(conn: psycopg.Connection) -> None:
+    """After the locks are held: the statement timeout for the rest of the transaction."""
+    conn.execute(_SET_CONFIG, ("statement_timeout", STATEMENT_TIMEOUT))
+
+
 def ensure_lineage_tables(conn: psycopg.Connection) -> None:
     """Create the lineage tables if missing (serialised, so concurrent first loads are safe)."""
     with conn.transaction():
+        set_lock_timeouts(conn)
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (advisory_key("sluice.lineage.ddl"),))
+        restore_statement_timeout(conn)
         conn.execute(_LINEAGE_DDL)
+
+
+def ensure_namespace(cat: SqlCatalog, namespace: str) -> None:
+    """Create ``namespace`` if missing, tolerating a concurrent creator.
+
+    The SQL catalog checks then inserts, so two first loads of different tables can both pass
+    the check; the loser gets an ``IntegrityError``, which is fine if the namespace now exists.
+    """
+    try:
+        cat.create_namespace_if_not_exists(namespace)
+    except IntegrityError:
+        if not cat.namespace_exists(namespace):
+            raise
 
 
 def _check_ident(name: str, what: str) -> str:
@@ -536,6 +590,40 @@ def _record_load(conn: psycopg.Connection, rec: _Record) -> None:
             )
 
 
+_SELECT_LOAD = (
+    "SELECT snapshot_id, rows_loaded, rows_quarantined FROM loads "
+    "WHERE iceberg_table = %s AND file_sha256 = %s AND contract_version = %s"
+)
+
+
+def _recorded(
+    conn: psycopg.Connection, iceberg_table: str, file_sha256: str, contract_version: str
+) -> LoadResult | None:
+    row = conn.execute(_SELECT_LOAD, (iceberg_table, file_sha256, contract_version)).fetchone()
+    if row is None:
+        return None
+    return LoadResult(snapshot_id=row[0], rows_loaded=row[1], rows_quarantined=row[2], skipped=True)
+
+
+def find_load(
+    contract: Contract, file_sha256: str, *, settings: Settings, namespace: str = NAMESPACE
+) -> LoadResult | None:
+    """The recorded load of this file into ``<namespace>.<contract.name>``, or ``None``.
+
+    A lock-free read (``skipped=True`` when found) for callers that want to avoid re-running the
+    pipeline; :func:`load_output` re-checks under its locks. Never creates anything.
+    """
+    if not _SHA256.fullmatch(file_sha256):
+        raise LoadError("file_sha256 must be 64 lowercase hex characters")
+    ident = f"{_check_ident(namespace, 'namespace')}.{_check_ident(contract.name, 'table name')}"
+    with _connect(settings) as conn, conn.transaction():
+        conn.execute(_SET_CONFIG, ("statement_timeout", LOCK_WAIT_STATEMENT_TIMEOUT))
+        exists = conn.execute("SELECT to_regclass('public.loads') IS NOT NULL").fetchone()
+        if not exists or not exists[0]:
+            return None
+        return _recorded(conn, ident, file_sha256, contract.version)
+
+
 def load_output(
     out: SystemOutput,
     contract: Contract,
@@ -568,21 +656,18 @@ def load_output(
     with _connect(settings) as conn:
         ensure_lineage_tables(conn)
         with conn.transaction():
+            set_lock_timeouts(conn)
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (advisory_key("table", main_id),))
             conn.execute(
-                "SELECT pg_advisory_xact_lock(%s)", (advisory_key(file_sha256, contract.version),)
+                "SELECT pg_advisory_xact_lock(%s)",
+                (advisory_key(main_id, file_sha256, contract.version),),
             )
-            row = conn.execute(
-                "SELECT snapshot_id, rows_loaded, rows_quarantined FROM loads "
-                "WHERE file_sha256 = %s AND contract_version = %s",
-                (file_sha256, contract.version),
-            ).fetchone()
-            if row is not None:
-                return LoadResult(
-                    snapshot_id=row[0], rows_loaded=row[1], rows_quarantined=row[2], skipped=True
-                )
+            restore_statement_timeout(conn)
+            prior = _recorded(conn, main_id, file_sha256, contract.version)
+            if prior is not None:
+                return prior
             with catalog(settings) as cat:
-                cat.create_namespace_if_not_exists(namespace)
+                ensure_namespace(cat, namespace)
                 main = _ensure_table(cat, main_id, iceberg_schema(contract))
                 quarantine = _ensure_table(cat, quarantine_id, quarantine_schema())
                 main_snap = committed_snapshot_id(_ancestry(main), file_sha256, contract.version)
@@ -640,11 +725,15 @@ def load_output(
 def rollback(
     table: str, snapshot_id: str, *, settings: Settings, namespace: str = NAMESPACE
 ) -> list[str]:
-    """Roll ``<namespace>.<table>`` back to ``snapshot_id`` (an ancestor of the current state).
+    """Make ``snapshot_id`` the current snapshot of ``<namespace>.<table>``.
 
-    The ``loads`` rows whose snapshot is no longer in the table's history are deleted (so those
-    files can be loaded again) and their ``runs`` are marked ``rolled_back``. Safe to retry: a
-    rollback to the current snapshot is a no-op on the Iceberg side and re-runs the cleanup.
+    ``snapshot_id`` must be the current snapshot or one of its ancestors. Afterwards, the
+    ``loads`` rows of this table whose snapshot is not an ancestor of the new current snapshot
+    are deleted (those files can then be loaded again) and their ``runs`` are marked
+    ``rolled_back``. The rolled-back snapshots stay in the table metadata until expired. Only
+    the named table is rolled back: the quarantine table is untouched, and a reload does not
+    duplicate its rows because those appends are still in its ancestry. Safe to retry: when
+    ``snapshot_id`` is already current, the Iceberg step is skipped and the cleanup runs again.
 
     Returns:
         The run ids whose loads were rolled back.
@@ -660,7 +749,9 @@ def rollback(
     with _connect(settings) as conn:
         ensure_lineage_tables(conn)
         with conn.transaction():
+            set_lock_timeouts(conn)
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (advisory_key("table", ident),))
+            restore_statement_timeout(conn)
             with catalog(settings) as cat:
                 try:
                     tbl = cat.load_table(ident)

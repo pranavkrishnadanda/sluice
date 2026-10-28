@@ -91,3 +91,84 @@ def test_advisory_key_is_deterministic_signed_bigint() -> None:
 @pytest.mark.parametrize(("sha", "version"), [(OTHER, "v1"), (SHA, "v2")])
 def test_advisory_key_differs_per_idempotency_key(sha: str, version: str) -> None:
     assert advisory_key(sha, version) != advisory_key(SHA, "v1")
+
+
+# --- fix round 1: namespace race, lock timeouts -------------------------------------------
+
+
+class _FakeCatalog:
+    def __init__(self, exc: Exception | None, exists: bool) -> None:
+        self.exc = exc
+        self.exists = exists
+        self.created: list[str] = []
+
+    def create_namespace_if_not_exists(self, namespace: str) -> None:
+        self.created.append(namespace)
+        if self.exc is not None:
+            raise self.exc
+
+    def namespace_exists(self, namespace: str) -> bool:
+        return self.exists
+
+
+def _integrity_error() -> Exception:
+    from sqlalchemy.exc import IntegrityError
+
+    return IntegrityError("INSERT ...", {}, Exception("duplicate key"))
+
+
+def test_ensure_namespace_creates_when_missing() -> None:
+    from sluice.load.iceberg import ensure_namespace
+
+    cat = _FakeCatalog(None, exists=False)
+    ensure_namespace(cat, "sluice")  # type: ignore[arg-type]
+    assert cat.created == ["sluice"]
+
+
+def test_ensure_namespace_tolerates_concurrent_create() -> None:
+    from sluice.load.iceberg import ensure_namespace
+
+    ensure_namespace(_FakeCatalog(_integrity_error(), exists=True), "sluice")  # type: ignore[arg-type]
+
+
+def test_ensure_namespace_reraises_when_namespace_still_missing() -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from sluice.load.iceberg import ensure_namespace
+
+    with pytest.raises(IntegrityError):
+        ensure_namespace(_FakeCatalog(_integrity_error(), exists=False), "sluice")  # type: ignore[arg-type]
+
+
+class _FakeConn:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def execute(self, sql: str, params: tuple[object, ...] = ()) -> None:
+        self.calls.append((sql, params))
+
+
+def test_set_lock_timeouts_sets_transaction_local_lock_and_statement_timeouts() -> None:
+    from sluice.load.iceberg import LOCK_TIMEOUT, LOCK_WAIT_STATEMENT_TIMEOUT, set_lock_timeouts
+
+    conn = _FakeConn()
+    set_lock_timeouts(conn)  # type: ignore[arg-type]
+    params = [p for _, p in conn.calls]
+    assert ("lock_timeout", LOCK_TIMEOUT) in params
+    assert ("statement_timeout", LOCK_WAIT_STATEMENT_TIMEOUT) in params
+    assert all("set_config(%s, %s, true)" in sql for sql, _ in conn.calls)
+    assert LOCK_TIMEOUT == "10s"
+
+
+def test_restore_statement_timeout_after_locks() -> None:
+    from sluice.load.iceberg import STATEMENT_TIMEOUT, restore_statement_timeout
+
+    conn = _FakeConn()
+    restore_statement_timeout(conn)  # type: ignore[arg-type]
+    assert conn.calls == [
+        ("SELECT set_config(%s, %s, true)", ("statement_timeout", STATEMENT_TIMEOUT))
+    ]
+
+
+def test_advisory_key_differs_per_table() -> None:
+    assert advisory_key("sluice.orders", SHA, "v1") != advisory_key("sluice.lineitem", SHA, "v1")
