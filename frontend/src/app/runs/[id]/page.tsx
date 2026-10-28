@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { RunSidePanel } from "@/components/panel/SidePanel";
 import { AppShell } from "@/components/shell/AppShell";
 import { NewRunComposer } from "@/components/thread/NewRunComposer";
 import { RunThread } from "@/components/thread/RunThread";
@@ -23,7 +24,7 @@ export default async function RunPage({ params }: PageProps<"/runs/[id]">) {
   const { id } = await params;
   return (
     <RunStreamProvider runId={id}>
-      <AppShell>
+      <AppShell sidePanel={<RunSidePanel runId={id} />}>
         <RunThread runId={id} />
         <div className="sticky bottom-0 mt-auto pt-8">
           <NewRunComposer placeholder="Drop another file to start a new run" />

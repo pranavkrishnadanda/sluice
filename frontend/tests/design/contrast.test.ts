@@ -227,3 +227,55 @@ describe("send button icon (WCAG 1.4.11 non-text, 3:1)", () => {
     });
   }
 });
+
+/** `color-mix(in srgb, <c> <pct>%, <base>)` with an opaque base. */
+function mix(c: Rgb, base: Rgb, pct: number): Rgb {
+  const p = pct / 100;
+  return c.map((v, i) => v * p + (base[i] ?? 0) * (1 - p)) as unknown as Rgb;
+}
+
+/*
+ * The code view (and its diff) sits on the opaque --glass-solid well, so
+ * diff colours are checked on the line tints layered over that solid.
+ */
+describe("code diff lines (WCAG AA, 4.5:1)", () => {
+  for (const [theme, t] of Object.entries(THEMES)) {
+    const solid = parseColor(t.get("--glass-solid") ?? "").rgb;
+    for (const [tint, marker] of [
+      ["--diff-add-bg", "--diff-add"],
+      ["--diff-del-bg", "--diff-del"],
+    ] as const) {
+      for (const fg of ["--text", marker]) {
+        it(`${theme} ${fg} on ${tint}`, () => {
+          const bg = over(parseColor(t.get(tint) ?? ""), solid);
+          const ratio = contrast(parseColor(t.get(fg) ?? "").rgb, bg);
+          expect(Number(ratio.toFixed(2))).toBeGreaterThanOrEqual(4.5);
+        });
+      }
+    }
+  }
+});
+
+/** Keep in step with `.plan-node` fills in globals.css. */
+const PLAN_TINT_PCT = 16;
+
+describe("plan node fills (WCAG AA, 4.5:1)", () => {
+  for (const [theme, t] of Object.entries(THEMES)) {
+    const solid = parseColor(t.get("--glass-solid") ?? "").rgb;
+    const fills: Array<[string, Rgb]> = [
+      ["pending (solid)", solid],
+      ...["--accent", "--warn", "--ok", "--error"].map((k): [string, Rgb] => [
+        k,
+        mix(parseColor(t.get(k) ?? "").rgb, solid, PLAN_TINT_PCT),
+      ]),
+    ];
+    for (const [name, fill] of fills) {
+      for (const fg of ["--text", "--text-muted"]) {
+        it(`${theme} ${fg} on ${name} node`, () => {
+          const ratio = contrast(parseColor(t.get(fg) ?? "").rgb, fill);
+          expect(Number(ratio.toFixed(2))).toBeGreaterThanOrEqual(4.5);
+        });
+      }
+    }
+  }
+});

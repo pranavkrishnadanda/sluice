@@ -67,6 +67,11 @@
   --error: #a11c25; /* 4.6:1 */
   --chip-bg: rgb(0 0 0 / 0.06);
   --focus-ring: #1c48be;
+  /* Code diff: line tints on the --glass-solid code well, plus +/- markers. */
+  --diff-add: #0f5a30; /* 6.4:1 on its tint */
+  --diff-del: #9a1a23; /* 6.3:1 on its tint */
+  --diff-add-bg: rgb(18 140 70 / 0.14);
+  --diff-del-bg: rgb(200 40 50 / 0.11);
 }
 
 [data-theme="dark"] {
@@ -100,6 +105,10 @@
   --error: #ffa1a1; /* 4.6:1 */
   --chip-bg: rgb(255 255 255 / 0.1);
   --focus-ring: #9ebaff;
+  --diff-add: #6ee3a0; /* 7.8:1 on its tint */
+  --diff-del: #ffb0b0; /* 7.8:1 on its tint */
+  --diff-add-bg: rgb(76 214 138 / 0.14);
+  --diff-del-bg: rgb(255 120 120 / 0.13);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -134,6 +143,10 @@
     --error: #ffa1a1;
     --chip-bg: rgb(255 255 255 / 0.1);
     --focus-ring: #9ebaff;
+    --diff-add: #6ee3a0;
+    --diff-del: #ffb0b0;
+    --diff-add-bg: rgb(76 214 138 / 0.14);
+    --diff-del-bg: rgb(255 120 120 / 0.13);
   }
 }
 
@@ -270,9 +283,51 @@
     box-shadow: var(--accent-shadow);
   }
 
+  /*
+   * Plan DAG nodes: an opaque fill tinted 16% toward the status colour, with
+   * a stroke in that colour. tests/design/contrast.test.ts (PLAN_TINT_PCT)
+   * checks --text and --text-muted on every tint.
+   */
+  .plan-node rect {
+    fill: var(--glass-solid);
+    stroke: var(--text-muted);
+    stroke-dasharray: 4 3;
+  }
+
+  .plan-node[data-status="running"] rect {
+    fill: color-mix(in srgb, var(--accent) 16%, var(--glass-solid));
+    stroke: var(--accent);
+    stroke-dasharray: none;
+    animation: node-pulse 1.4s ease-in-out infinite;
+  }
+
+  .plan-node[data-status="retrying"] rect {
+    fill: color-mix(in srgb, var(--warn) 16%, var(--glass-solid));
+    stroke: var(--warn);
+    stroke-dasharray: none;
+  }
+
+  .plan-node[data-status="done"] rect {
+    fill: color-mix(in srgb, var(--ok) 16%, var(--glass-solid));
+    stroke: var(--ok);
+    stroke-dasharray: none;
+  }
+
+  .plan-node[data-status="failed"] rect {
+    fill: color-mix(in srgb, var(--error) 16%, var(--glass-solid));
+    stroke: var(--error);
+    stroke-dasharray: none;
+  }
+
   /* New thread content fades in with a 4px rise; off under reduced motion. */
   .rise-in {
     animation: rise-in 180ms ease-out both;
+  }
+}
+
+@keyframes node-pulse {
+  50% {
+    stroke-opacity: 0.45;
   }
 }
 
