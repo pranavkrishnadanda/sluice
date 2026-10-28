@@ -136,10 +136,13 @@ function DataPanel({
   state,
   pages,
   viewportHeight,
+  sample,
 }: {
   state: RunViewState | null;
   pages: PreviewPages;
   viewportHeight?: number;
+  /** The demo mock replays a fixture for this run (see `isSampleReplay`). */
+  sample: boolean;
 }) {
   if (state && !state.loaded) {
     return (
@@ -174,6 +177,7 @@ function DataPanel({
           moreError={pages.moreError}
           onLoadMore={pages.loadMore}
           viewportHeight={viewportHeight}
+          sample={sample}
         />
       );
   }
@@ -208,6 +212,7 @@ export function SidePanel({
   dataViewportHeight,
 }: SidePanelProps) {
   const api = useApi();
+  const sample = api.isSampleReplay?.(runId) ?? false;
   const [tab, setTab] = useState<Tab>("data");
   const [opened, setOpened] = useState<ReadonlySet<Tab>>(
     () => new Set(["data"]),
@@ -272,6 +277,7 @@ export function SidePanel({
           state={state}
           pages={pages}
           viewportHeight={dataViewportHeight}
+          sample={sample}
         />
       </Tabs.Content>
 

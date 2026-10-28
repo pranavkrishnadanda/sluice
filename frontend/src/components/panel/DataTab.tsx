@@ -110,6 +110,25 @@ export interface DataTabProps {
   onLoadMore?: () => void;
   /** Fixed viewport height in px; tests only (jsdom has no layout). */
   viewportHeight?: number;
+  /**
+   * The rows come from a demo fixture replayed for this run, not from the
+   * user's file; the caption says so.
+   */
+  sample?: boolean;
+}
+
+/** "1,000 of 48,210 rows loaded", or with `sample`, "Sample run · … sample rows". */
+function rowsCaption(
+  loaded: number,
+  total: number,
+  partial: boolean,
+  sample: boolean,
+): string {
+  const rows = sample ? "sample rows" : "rows";
+  const count = partial
+    ? `${formatCount(loaded)} of ${formatCount(total)} ${rows}${sample ? "" : " loaded"}`
+    : `${formatCount(total)} ${rows}`;
+  return sample ? `Sample run · ${count}` : count;
 }
 
 /**
@@ -130,6 +149,7 @@ export function DataTab({
   moreError = null,
   onLoadMore,
   viewportHeight,
+  sample = false,
 }: DataTabProps) {
   const [changedOnly, setChangedOnly] = useState(true);
   const scrollRef = useRef<HTMLElement>(null);
@@ -207,9 +227,7 @@ export function DataTab({
             </>
           )}
           {" · "}
-          {partial
-            ? `${formatCount(preview.rows.length)} of ${formatCount(preview.totalRows)} rows loaded`
-            : `${formatCount(preview.totalRows)} rows`}
+          {rowsCaption(preview.rows.length, preview.totalRows, partial, sample)}
         </p>
         <button
           type="button"

@@ -253,6 +253,54 @@ describe("demo honesty", () => {
     expect(screen.queryByText(/mine\.csv · 48,210 rows/)).toBeNull();
   });
 
+  test("the Data tab of a sample-replay run labels its rows as sample data", async () => {
+    const client = new MockApiClient({ delayMs: 0 });
+    const run = await client.createRun(
+      new File(["a,b\n"], "mine.csv", { type: "text/csv" }),
+      "orders",
+    );
+    // Replay the stream so the mock marks the run loaded (preview available).
+    const events: RunEvent[] = [];
+    await client.streamEvents(
+      run.id,
+      (e) => events.push(e),
+      new AbortController().signal,
+    );
+    const state = events.reduce<RunViewState>(
+      reduceRunEvents,
+      INITIAL_RUN_VIEW_STATE,
+    );
+    render(
+      <ApiProvider client={client}>
+        <SidePanel runId={run.id} state={state} dataViewportHeight={480} />
+      </ApiProvider>,
+    );
+    expect(
+      await screen.findByText(/Sample run · .*1,000 of 48,210 sample rows/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/48,210 rows loaded/)).toBeNull();
+  });
+
+  test("a fixture run's Data tab has no sample label", async () => {
+    const client = new MockApiClient({ delayMs: 0 });
+    render(
+      <ApiProvider client={client}>
+        <SidePanel
+          runId="run-repaired"
+          state={RUN_REPAIRED_EVENTS.reduce<RunViewState>(
+            reduceRunEvents,
+            INITIAL_RUN_VIEW_STATE,
+          )}
+          dataViewportHeight={480}
+        />
+      </ApiProvider>,
+    );
+    expect(
+      await screen.findByText(/1,000 of 48,210 rows loaded/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Sample run/)).toBeNull();
+  });
+
   test("a live run without a row count yet says it is counting", async () => {
     const client = liveClient({
       streamEvents: (_id, onEvent) => {
