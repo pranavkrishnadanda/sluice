@@ -1,5 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
+import { Backdrop } from "@/components/glass/Backdrop";
+import { ThemeProvider } from "@/components/theme/ThemeProvider";
+import { themeInitScript } from "@/components/theme/theme-script";
 import "./globals.css";
 
 const sans = Inter({
@@ -29,11 +32,23 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
+    // The head script sets data-theme / data-reduce-transparency before
+    // hydration, so those attributes legitimately differ from the server HTML.
     <html
       lang="en"
       className={`${sans.variable} ${mono.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
-      <body className="flex min-h-full flex-col">{children}</body>
+      <head>
+        <script
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: static, build-time constant; must run before first paint to avoid a theme flash.
+          dangerouslySetInnerHTML={{ __html: themeInitScript }}
+        />
+      </head>
+      <body className="flex min-h-full flex-col">
+        <Backdrop />
+        <ThemeProvider>{children}</ThemeProvider>
+      </body>
     </html>
   );
 }
