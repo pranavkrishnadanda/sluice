@@ -15,7 +15,8 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` (unchecked draft)
    -> ``precheck_code``
    -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> keep only the rewritten
-   cells pass 1 flagged (Ruling F2: parsed cells keep their raw text) -> an effect check (the
+   cells pass 1 flagged, in every raw copy of a row (Ruling F2: parsed cells keep their raw
+   text; duplicates stay identical, so dedupe is unchanged) -> an effect check (the
    rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``. Each
    attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
@@ -114,7 +115,7 @@ from sluice.rules.fixers import (
     UnkeyableInputError,
     apply_rules,
     cell_texts,
-    kept_raw_rows,
+    flagged_raw_rows,
 )
 from sluice.rules.profile import Profile, contract_sources, profile
 from sluice.sandbox.runner import SandboxError, SandboxResult
@@ -315,7 +316,7 @@ async def _pipeline(run: _Run) -> SystemOutput:
             ]
         )
     )
-    outcomes = await _run_nodes(run, plan, frame, prof1, pass1, candidates, _hints(mapping))
+    outcomes = await _run_nodes(run, plan, frame, prof1, candidates, _hints(mapping))
     if run.halted is not None:
         actions = [*map_actions, *pass1.actions, f"file quarantined: {run.halted}"]
         return _quarantine_file(run, actions, plan, outcomes, mapping, run.halted)
@@ -345,7 +346,6 @@ async def _run_nodes(
     plan: planning.Plan,
     frame: pl.DataFrame,
     prof: Profile,
-    pass1: RuleResult,
     candidates: dict[str, list[str]],
     hints: dict[str, str],
 ) -> list[_NodeOutcome]:
@@ -365,7 +365,7 @@ async def _run_nodes(
     pending = list(plan.nodes)
     done: set[str] = set()
     source = contract_sources(prof)
-    flagged = _flagged_rows(frame, run.case.contract, prof, pass1)
+    flagged = flagged_raw_rows(frame, run.case.contract, prof)
     while pending:
         if run.halted is not None:  # a final failure: no new node starts
             for n in pending:
@@ -557,6 +557,10 @@ async def _attempt(
 def only_flagged(raw: pl.Series, out: pl.Series, flagged: set[int]) -> pl.Series:
     """``out`` in the ``flagged`` rows, ``raw`` everywhere else (Ruling F2), named as ``out``.
 
+    ``flagged`` comes from :func:`sluice.rules.fixers.flagged_raw_rows`: every raw row whose own
+    cell the rules flag, duplicates included, so all copies of a duplicate row get the same
+    rewrite and stay exact duplicates for the rules' dedupe.
+
     A rewrite may only change the cells rules pass 1 flagged for its column: a cell the rules
     parsed keeps its raw text, so a transform cannot alter a value the rules already read
     (whatever the verifier sees). Every whole-column repair the drift ops need (paise, IST)
@@ -586,14 +590,16 @@ def _effect(
     """What a rewrite does to the rules' parse of its column (one extra rules pass).
 
     Rejects a rewrite that recovers no flagged cell, or that makes the rules flag a cell they
-    parsed before. Builds the verifier's evidence: raw -> rewritten pairs (flagged rows first,
+    parsed before. Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a
+    duplicate copy is never mistaken for a newly broken cell. Builds the verifier's evidence:
+    raw -> rewritten pairs (flagged rows first,
     then other changed rows, at most ``MAX_VERIFY_PAIRS``) and before/after statistics.
     """
     contract = case.contract
     rewritten = frame.with_columns(out)
     prof = profile(rewritten, contract)
     after = apply_rules(rewritten, contract, prof, case.reference)
-    flagged_after = _flagged_rows(rewritten, contract, prof, after).get(spec.name, set())
+    flagged_after = flagged_raw_rows(rewritten, contract, prof).get(spec.name, set())
     recovered = len(flagged_before - flagged_after)
     broken = sorted(flagged_after - flagged_before)
     stats: dict[str, float | int | None] = {
@@ -642,18 +648,6 @@ def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | Non
         ):
             stats[f"{name}_{label}"] = None if value is None else float(value)  # type: ignore[arg-type]
     return stats
-
-
-def _flagged_rows(
-    frame: pl.DataFrame, contract: Contract, prof: Profile, result: RuleResult
-) -> dict[str, set[int]]:
-    """Contract column -> raw ``frame`` row indices of its flagged cells (kept rows only)."""
-    rows = kept_raw_rows(frame, contract, prof)
-    out: dict[str, set[int]] = {}
-    for key, column in result.flags:
-        if key in rows:
-            out.setdefault(column, set()).add(rows[key])
-    return out
 
 
 def _hints(mapping: ColumnMapping | None) -> dict[str, str]:

@@ -402,6 +402,27 @@ def kept_raw_rows(df: pl.DataFrame, contract: Contract, prof: Profile) -> dict[P
     }
 
 
+def flagged_raw_rows(df: pl.DataFrame, contract: Contract, prof: Profile) -> dict[str, set[int]]:
+    """Matched contract column -> indices of the raw ``df`` rows whose own cell rules 3-9 flag.
+
+    Per raw row, before the unkeyed-row drop and dedupe (rules 9-10): every copy of a duplicate
+    row is listed when its cell is, so a rewrite applied to these rows keeps duplicates
+    identical. Uses the same per-cell repair as :func:`apply_rules`. Contract columns with no
+    matching input column are absent.
+
+    Complexity: O(rows x columns), one cell-repair pass.
+    """
+    frame = _repair_frame(_select_matched(df, prof, []), contract, [])
+    out: dict[str, set[int]] = {}
+    for spec in contract.columns:
+        if spec.name in prof.missing:
+            continue
+        rows = frame[_flag_col(spec.name)].arg_true().to_list()
+        if rows:
+            out[spec.name] = set(rows)
+    return out
+
+
 def _require_keys(contract: Contract, prof: Profile) -> None:
     if missing_pk := [k for k in contract.primary_key if k in prof.missing]:
         raise UnkeyableInputError(f"primary-key column(s) not found in input: {missing_pk}")

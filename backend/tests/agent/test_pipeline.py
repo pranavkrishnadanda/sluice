@@ -1058,3 +1058,48 @@ def test_cli_agent_system_keeps_the_response_cache(monkeypatch: pytest.MonkeyPat
     system = fn.__self__  # type: ignore[attr-defined]
     assert isinstance(system, AgentSystem)
     assert asyncio.run(_built_llm(system)).cache is True
+
+
+DUPLICATES = ("duplicate_rows", {"frac": 0.2})
+
+
+def test_pipeline_rewrite_reaches_every_duplicate_copy(
+    cases_dir: Path, tmp_path: Path, orders_df: pl.DataFrame
+) -> None:
+    """N-1: with duplicate rows, every raw copy of a flagged cell gets the same rewrite."""
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    duplicated = _build(cases_dir, orders_df, "dev-0103", [INDIAN, DUPLICATES])
+    result = run(duplicated, script)
+
+    assert [e.type for e in result.events() if e.type in ("attempt_failed", "node_finished")] == [  # type: ignore[attr-defined]
+        "node_finished"
+    ]
+    assert result.out.file_quarantined is False
+    plain = _build(tmp_path, orders_df, "dev-0103", [INDIAN])
+    expected = run(plain, Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]}))
+    assert result.out.df.sort("o_orderkey").equals(expected.out.df.sort("o_orderkey"))
+    assert result.out.flags == expected.out.flags
+
+
+def test_pipeline_parsed_cells_of_duplicate_rows_stay_unchanged(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    """N-1 keeps F2: a transform that would alter parsed cells in duplicated rows cannot."""
+    case = _build(cases_dir, orders_df, "dev-0104", [DATES, DUPLICATES])
+    script = Script(
+        plan={"nodes": [node("n1", "o_orderdate")]}, workers={"o_orderdate": [TAMPER_DATES]}
+    )
+    result = run(case, script)
+    base = rules_only(case)
+    flagged = {pk for pk, column in base.flags if column == "o_orderdate"}
+    assert result.out.file_quarantined is False
+    assert result.out.meta["nodes"][0]["accepted"] is True
+    key = "o_orderkey"
+    agent = dict(
+        zip(result.out.df[key].to_list(), result.out.df["o_orderdate"].to_list(), strict=True)
+    )
+    rules = dict(zip(base.df[key].to_list(), base.df["o_orderdate"].to_list(), strict=True))
+    unflagged = [k for k in rules if (k,) not in flagged]
+    assert unflagged
+    assert all(agent[k] == rules[k] for k in unflagged)
+    assert all(agent[k] is not None for (k,) in flagged)

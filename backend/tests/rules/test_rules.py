@@ -430,3 +430,20 @@ def test_contract_sources_maps_contract_columns_to_input_columns() -> None:
         "o_orderkey": " O_OrderKey ",
         "o_comment": "o_comment",
     }
+
+
+def test_flagged_raw_rows_lists_every_duplicate_copy() -> None:
+    """N-1: per raw row, before dedupe, so both copies of a duplicate row are listed."""
+    import polars as pl
+
+    from sluice.contracts.model import load_contract
+    from sluice.rules.fixers import flagged_raw_rows
+    from sluice.rules.profile import profile
+
+    contract = load_contract("orders")
+    df = pl.DataFrame(
+        {"o_orderkey": ["1", "2", "1"], "o_totalprice": ["1,234.50", "99.00", "1,234.50"]}
+    )
+    flagged = flagged_raw_rows(df, contract, profile(df, contract))
+    assert flagged["o_totalprice"] == {0, 2}
+    assert "o_custkey" not in flagged  # missing from the input: not a raw-row flag
