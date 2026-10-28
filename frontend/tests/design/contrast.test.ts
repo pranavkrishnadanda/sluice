@@ -205,3 +205,25 @@ describe("design token contrast (WCAG AA, 4.5:1)", () => {
     }
   });
 });
+
+/** sRGB samples along a two-stop gradient (stops plus quarter points). */
+function gradientSamples(value: string): Rgb[] {
+  const [a, b] = gradientStops(value);
+  if (!a || !b) throw new Error(`need two stops in ${value}`);
+  return [0, 0.25, 0.5, 0.75, 1].map(
+    (t) => a.map((c, i) => c + ((b[i] ?? 0) - c) * t) as unknown as Rgb,
+  );
+}
+
+describe("send button icon (WCAG 1.4.11 non-text, 3:1)", () => {
+  for (const [theme, t] of Object.entries(THEMES)) {
+    it(`${theme} white icon >= 3 across --accent-fill`, () => {
+      const worst = Math.min(
+        ...gradientSamples(t.get("--accent-fill") ?? "").map((c) =>
+          contrast([255, 255, 255], c),
+        ),
+      );
+      expect(Number(worst.toFixed(2))).toBeGreaterThanOrEqual(3);
+    });
+  }
+});

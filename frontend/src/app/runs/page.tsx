@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { AppShell } from "@/components/shell/AppShell";
+import { NewRunComposer } from "@/components/thread/NewRunComposer";
 
 export const metadata: Metadata = {
   title: "New run",
@@ -30,7 +31,13 @@ export default function RunsPage() {
           It plans the cleanup, shows every step as it runs, and only loads what
           passes the contract. Or open a recent run from the sidebar.
         </p>
-        <ol className="mt-8 grid gap-2 sm:grid-cols-2">
+        <div className="mt-8">
+          <NewRunComposer />
+        </div>
+        <h2 className="mt-10 mb-3 font-medium text-muted text-xs uppercase tracking-[0.08em]">
+          What happens next
+        </h2>
+        <ol className="grid gap-2 sm:grid-cols-2">
           {STAGES.map(([title, detail], i) => (
             <li
               key={title}

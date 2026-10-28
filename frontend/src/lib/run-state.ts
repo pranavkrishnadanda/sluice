@@ -38,7 +38,11 @@ export interface RunViewState {
   table: TableName | null;
   rows: number | null;
   status: RunStatus;
+  /** `true` once `profiled` has arrived (it may report zero issues). */
+  profiled: boolean;
   issues: Issue[];
+  /** `true` once `rules_applied` has arrived (it may report zero actions). */
+  rulesApplied: boolean;
   ruleActions: string[];
   /** `true` once `plan_created` has arrived. */
   planned: boolean;
@@ -70,7 +74,9 @@ export const INITIAL_RUN_VIEW_STATE: RunViewState = {
   table: null,
   rows: null,
   status: "queued",
+  profiled: false,
   issues: [],
+  rulesApplied: false,
   ruleActions: [],
   planned: false,
   nodes: [],
@@ -172,9 +178,9 @@ function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
         startedAt: e.at,
       };
     case "profiled":
-      return { issues: [...e.issues] };
+      return { profiled: true, issues: [...e.issues] };
     case "rules_applied":
-      return { ruleActions: [...e.actions] };
+      return { rulesApplied: true, ruleActions: [...e.actions] };
     case "plan_created":
       return {
         planned: true,

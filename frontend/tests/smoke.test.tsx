@@ -11,6 +11,7 @@ const { redirect } = vi.hoisted(() => ({
 vi.mock("next/navigation", () => ({
   redirect,
   usePathname: () => "/runs",
+  useRouter: () => ({ push: vi.fn<(href: string) => void>() }),
 }));
 
 describe("routes", () => {

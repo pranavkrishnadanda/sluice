@@ -258,4 +258,20 @@ describe("reduceRunEvents", () => {
   test("starts queued and becomes running on run_started", () => {
     expect(reduceAll([started])?.status).toBe("running");
   });
+
+  test("flags profiling and rules even when they find nothing", () => {
+    const s0 = reduceAll([started]);
+    expect(s0).toMatchObject({ profiled: false, rulesApplied: false });
+    const s = reduceAll([
+      started,
+      { seq: 2, at: AT, type: "profiled", issues: [] },
+      { seq: 3, at: AT, type: "rules_applied", actions: [] },
+    ]);
+    expect(s).toMatchObject({
+      profiled: true,
+      rulesApplied: true,
+      issues: [],
+      ruleActions: [],
+    });
+  });
 });
