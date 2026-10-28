@@ -1,0 +1,100 @@
+# LiteLLM proxy config (ghcr.io/berriai/litellm:v1.106.5), mounted by compose.yaml.
+# Clients ask for a *tier* ("strong" / "small"). Each tier is a model group with one deployment;
+# on failure the router falls back to the "<tier>-fallback" group.
+#
+# Model choice (read 2026-10-28):
+#   https://console.groq.com/docs/models: production models are openai/gpt-oss-120b and
+#     openai/gpt-oss-20b ($0.15/$0.60 and $0.075/$0.30 per 1M tokens). llama-3.3-70b-versatile and
+#     llama-3.1-8b-instant are now "Enterprise / Contact Sales" and missing from the free-plan
+#     table. qwen/qwen3-32b is gone, and its successor qwen/qwen3.8-27b is preview-only.
+#   https://ai.google.dev/gemini-api/docs/models and /pricing (updated 2026-10-27):
+#     gemini-3.8-flash is the current stable Flash model. It is free on the free tier and costs
+#     $0.75/$3.75 per 1M tokens on the paid tier until 2026-12-31.
+#   Local worker: spec §7.4 default Qwen3.5-4B-MLX-4bit on vllm-metal. Start it with
+#     `--served-model-name Qwen3.5-4B-MLX-4bit --enable-auto-tool-choice --tool-call-parser hermes`
+#     on port 58000, since Pydantic AI returns typed output through a required tool call.
+#
+# Rate limits are per deployment, enforced by the router before each call. Usage is counted in
+# Redis (router_settings.redis_*) so every proxy worker and restart shares one budget. This
+# replaces the spec's hand-written token bucket (Ruling P1). LiteLLM knows only per-minute limits.
+# Daily caps (RPD/TPD) are listed for reference and surface as provider 429s, which trigger the
+# fallback.
+
+model_list:
+  # strong: orchestrator / verifier ------------------------------------------------------------
+  - model_name: strong
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      # Groq free plan (https://console.groq.com/docs/rate-limits, "Free Plan Limits" tab,
+      # read 2026-10-28): 30 RPM, 1K RPD, 8K TPM, 200K TPD. Verify in console (/settings/limits).
+      rpm: 30
+      tpm: 8000
+
+  - model_name: strong-fallback
+    litellm_params:
+      model: gemini/gemini-3.8-flash
+      api_key: os.environ/GEMINI_API_KEY
+      # Google publishes free-tier limits only in AI Studio, not in its public docs
+      # (https://ai.google.dev/gemini-api/docs/rate-limits points to the AI Studio page). These are
+      # conservative placeholders. Verify in console (AI Studio > Rate limits) and adjust.
+      rpm: 10
+      tpm: 250000
+
+  # small: workers ------------------------------------------------------------------------------
+  - model_name: small
+    litellm_params:
+      model: openai/Qwen3.5-4B-MLX-4bit
+      api_base: http://host.docker.internal:58000/v1
+      api_key: "none"  # local vLLM, no auth
+      # Optional: when vLLM is not running, the connection error falls back to small-fallback.
+      # No rpm/tpm here: the local server has no provider quota.
+
+  - model_name: small-fallback
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      # Groq free plan (same source as above): 30 RPM, 1K RPD, 8K TPM, 200K TPD.
+      # Verify in console.
+      rpm: 30
+      tpm: 8000
+
+router_settings:
+  routing_strategy: usage-based-routing-v2
+  optional_pre_call_checks: ["enforce_model_rate_limits"]
+  redis_host: redis
+  redis_port: 6379
+  timeout: 60
+  num_retries: 2
+  # Retry only on 429, 5xx and timeouts. Bad request, auth, not found and content-policy errors
+  # go straight to the fallback. LiteLLM maps "connection refused" (vLLM not running) to
+  # InternalServerError, so it is retried twice (~6 s, seen 2026-10-28) and then falls back. After
+  # that the deployment goes into cooldown, and later calls skip it.
+  retry_policy:
+    RateLimitErrorRetries: 2
+    InternalServerErrorRetries: 2
+    ServiceUnavailableErrorRetries: 2
+    TimeoutErrorRetries: 2
+    BadRequestErrorRetries: 0
+    AuthenticationErrorRetries: 0
+    NotFoundErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
+    DefaultRetries: 0
+  fallbacks:
+    - strong: ["strong-fallback"]
+    - small: ["small-fallback"]
+
+litellm_settings:
+  drop_params: true
+  # Redis response cache keyed on model + messages + params, so eval reruns cost nothing.
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    ttl: 2592000  # 30 days
+    namespace: sluice.llm
+    supported_call_types: ["acompletion", "completion"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

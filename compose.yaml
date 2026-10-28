@@ -77,11 +77,18 @@ services:
     mem_limit: 512m
     restart: unless-stopped
 
-  # LLM proxy. In profile `llm` until Task 2 adds backend/litellm/config.yaml.
+  # LLM proxy: model groups `strong` / `small`, fallbacks, retries, rate limits and a Redis
+  # response cache, all in backend/litellm/config.yaml. Provider keys are optional: without them
+  # the proxy still boots and calls fail over to rules-only output in the pipeline.
   litellm:
-    profiles: ["llm"]
     image: ghcr.io/berriai/litellm:v1.106.5
-    command: ["--port", "4000"]
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./backend/litellm/config.yaml:/app/config.yaml:ro
+    # The `small` group calls a local vLLM on the host (port 58000). Docker Desktop defines this
+    # name already; Colima needs the mapping.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       redis:
         condition: service_healthy
