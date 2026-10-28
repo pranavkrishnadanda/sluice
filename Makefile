@@ -1,10 +1,15 @@
-.PHONY: test test-all lint fmt cases eval-rules results
+.PHONY: test test-all test-integration lint fmt cases eval-rules results up down ps
 
+# Default selection (pyproject addopts) excludes integration, live and slow.
 test:
-	cd backend && uv run python -m pytest -q -m "not slow"
+	cd backend && uv run python -m pytest -q
 
 test-all:
-	cd backend && uv run python -m pytest -q
+	cd backend && uv run python -m pytest -q -m "not integration and not live"
+
+# Needs the stack: `make up` first.
+test-integration:
+	cd backend && uv run python -m pytest -q -m integration
 
 lint:
 	cd backend && uv run ruff check . && uv run ruff format --check .
@@ -26,3 +31,15 @@ eval-rules:
 
 results:
 	$(SLUICE) results
+
+# Services (compose.yaml). Secrets come from backend/.env (copy backend/.env.example).
+COMPOSE = docker compose --env-file backend/.env
+
+up:
+	$(COMPOSE) up -d --wait
+
+down:
+	$(COMPOSE) down
+
+ps:
+	$(COMPOSE) ps

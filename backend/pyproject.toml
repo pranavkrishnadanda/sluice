@@ -8,12 +8,18 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "docker>=7.2.0",
     "duckdb>=2.0.0",
     "numpy>=2.5.4",
     "pandera[polars]>=0.35.0",
     "polars>=2.1.0",
+    "psycopg[binary]>=3.3.6",
     "pyarrow>=26.0.0",
+    "pydantic-ai>=2.63.0",
+    "pydantic-settings>=2.16.2",
+    "pyiceberg[pyarrow,sql-postgres]>=0.12.0",
     "pyyaml>=6.0.3",
+    "redis>=8.1.0",
     "scipy>=1.18.1",
     "typer>=0.27.3",
 ]
@@ -28,6 +34,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
+    "respx>=0.23.1",
     "ruff>=0.17.3",
 ]
 
@@ -40,4 +47,10 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["slow: long-running tests, excluded from `make test`"]
+markers = [
+    "slow: long-running tests, excluded from `make test`",
+    "integration: needs the Compose stack (`make up`); run with `make test-integration`",
+    "live: calls real LLM providers through LiteLLM; never run by default",
+]
+# Default selection; a `-m` on the command line replaces it.
+addopts = ["-m", "not integration and not live and not slow"]

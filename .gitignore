@@ -19,3 +19,6 @@ frontend/.next-e2e/
 frontend/test-results/
 frontend/playwright-report/
 frontend/AGENTS.md
+
+# services secrets
+backend/.env
