@@ -37,7 +37,7 @@ function flatten(preview: DataPreview): CellRow[] {
 }
 
 type ObserveRect = VirtualizerOptions<
-  HTMLDivElement,
+  HTMLElement,
   Element
 >["observeElementRect"];
 
@@ -95,7 +95,7 @@ export interface DataTabProps {
  */
 export function DataTab({ preview, viewportHeight }: DataTabProps) {
   const [changedOnly, setChangedOnly] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLElement>(null);
   const captionId = useId();
 
   const all = useMemo(() => flatten(preview), [preview]);
@@ -180,8 +180,11 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
         // Native table, virtualised with spacer rows above and below the
         // visible window: no display overrides, so the implicit table
         // semantics hold in every browser and no explicit roles are needed.
-        <div
+        // A named <section> is a region landmark: keyboard focus lands on
+        // "Before and after values, scrollable" rather than a bare <div>.
+        <section
           ref={scrollRef}
+          aria-label="Before and after values, scrollable"
           /* oxlint-disable jsx-a11y/no-noninteractive-tabindex */
           // biome-ignore lint/a11y/noNoninteractiveTabindex: a scrollable region must be keyboard-focusable (WCAG 2.1.1).
           tabIndex={0}
@@ -194,7 +197,7 @@ export function DataTab({ preview, viewportHeight }: DataTabProps) {
             totalSize={virtualizer.getTotalSize()}
             captionId={captionId}
           />
-        </div>
+        </section>
       )}
     </div>
   );
@@ -221,7 +224,10 @@ function VirtualRows({
   const top = items[0]?.start ?? 0;
   const bottom = Math.max(0, totalSize - (items.at(-1)?.end ?? 0));
   return (
+    // The off-window rows are stood in for by the table's own top/bottom
+    // margin, not spacer rows, so assistive tech never meets empty rows.
     <table
+      style={{ marginTop: top, marginBottom: bottom }}
       aria-label="Before and after values"
       aria-describedby={captionId}
       aria-rowcount={rows.length + 1}
@@ -247,17 +253,6 @@ function VirtualRows({
         </tr>
       </thead>
       <tbody>
-        {/* Spacer rows stand in for the rows above/below the window; real
-            rows carry aria-rowindex, so the count stays correct. */}
-        {top > 0 && (
-          <tr>
-            <td
-              aria-hidden="true"
-              colSpan={4}
-              style={{ height: top, padding: 0 }}
-            />
-          </tr>
-        )}
         {items.map((item) => {
           const row = rows[item.index];
           if (!row) return null;
@@ -282,15 +277,6 @@ function VirtualRows({
             </tr>
           );
         })}
-        {bottom > 0 && (
-          <tr>
-            <td
-              aria-hidden="true"
-              colSpan={4}
-              style={{ height: bottom, padding: 0 }}
-            />
-          </tr>
-        )}
       </tbody>
     </table>
   );

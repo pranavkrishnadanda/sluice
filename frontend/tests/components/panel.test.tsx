@@ -120,6 +120,30 @@ describe("data tab", () => {
     expect(within(table).getAllByText("5")[0]?.tagName).not.toBe("DEL");
   });
 
+  test("the focusable scroll box is a named region with no empty spacer rows", async () => {
+    const user = userEvent.setup();
+    renderPanel("run-repaired", stateOf(RUN_REPAIRED_EVENTS));
+    const region = await screen.findByRole("region", {
+      name: "Before and after values, scrollable",
+    });
+    const table = within(region).getByRole("table", {
+      name: /before and after/i,
+    });
+    await waitFor(() =>
+      expect(within(table).getAllByRole("row").length).toBeGreaterThan(5),
+    );
+    // Reachable by keyboard.
+    screen.getByRole("switch", { name: "Changed only" }).focus();
+    await user.tab();
+    expect(region).toHaveFocus();
+    // Off-window rows are margin, not empty spacer rows: every body row is
+    // a real, indexed row.
+    const bodyRows = [...table.querySelectorAll("tbody tr")];
+    expect(bodyRows.length).toBeGreaterThan(5);
+    expect(bodyRows.every((tr) => tr.hasAttribute("aria-rowindex"))).toBe(true);
+    expect(table.style.marginBottom).not.toBe("0px");
+  });
+
   test("flagged cell shows pill", async () => {
     renderPanel(
       "x",
