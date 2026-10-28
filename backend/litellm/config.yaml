@@ -49,6 +49,17 @@ model_list:
       api_key: "none"  # local vLLM, no auth
       # Optional: when vLLM is not running, the connection error falls back to small-fallback.
       # No rpm/tpm here: the local server has no provider quota.
+    model_info:
+      # A dead local server cools down on its FIRST failure (0 allowed fails), for 60 s.
+      # LiteLLM reports "connection refused" as InternalServerError. An explicit per-exception
+      # policy is needed: without one, the router skips cooldown for errors whose text mentions
+      # APIConnectionError (cooldown_handlers._is_cooldown_required) and exempts single-deployment
+      # groups. allowed_fails_policy is read from model_info only.
+      allowed_fails_policy:
+        InternalServerErrorAllowedFails: 0
+        ServiceUnavailableErrorAllowedFails: 0
+        TimeoutErrorAllowedFails: 0
+      cooldown_time: 60
 
   - model_name: small-fallback
     litellm_params:
@@ -66,10 +77,22 @@ router_settings:
   redis_port: 6379
   timeout: 60
   num_retries: 2
+  # Cooldown (LiteLLM v1.106.5 router_utils/cooldown_handlers.py): a deployment cools down once
+  # its failures in the cooldown window exceed allowed_fails. The counter lives in Redis and its
+  # TTL is cooldown_time. allowed_fails differs from LiteLLM's default of 3, so this router-wide
+  # count applies even to single-deployment groups. A cooled-down deployment is not retried:
+  # Router.should_retry_this_error raises when no deployment is healthy, and the request goes to
+  # the group's fallback. Result:
+  #   - hosted deployments: a 429/5xx/timeout is retried once. The second failure inside 60 s
+  #     cools the deployment and the call moves to the fallback.
+  #   - `small` (local vLLM, see its model_info and model_group_retry_policy): no retries, and
+  #     cooldown on the first failure. The call falls back immediately, and later calls skip it
+  #     for 60 s.
+  allowed_fails: 1
+  cooldown_time: 60
   # Retry only on 429, 5xx and timeouts. Bad request, auth, not found and content-policy errors
-  # go straight to the fallback. LiteLLM maps "connection refused" (vLLM not running) to
-  # InternalServerError, so it is retried twice (~6 s, seen 2026-10-28) and then falls back. After
-  # that the deployment goes into cooldown, and later calls skip it.
+  # go straight to the fallback. num_retries retries the SAME group (here one deployment) until
+  # it is cooled down, as described above.
   retry_policy:
     RateLimitErrorRetries: 2
     InternalServerErrorRetries: 2
@@ -80,6 +103,16 @@ router_settings:
     NotFoundErrorRetries: 0
     ContentPolicyViolationErrorRetries: 0
     DefaultRetries: 0
+  # The local worker gets no retries. A refused connection (vLLM not running) is not worth
+  # retrying, and the hosted fallback is right there. Without this, call 1 waited ~4 s in retry
+  # backoff before the retry found the deployment cooled down (measured 2026-10-28).
+  model_group_retry_policy:
+    small:
+      DefaultRetries: 0
+      RateLimitErrorRetries: 0
+      InternalServerErrorRetries: 0
+      ServiceUnavailableErrorRetries: 0
+      TimeoutErrorRetries: 0
   fallbacks:
     - strong: ["strong-fallback"]
     - small: ["small-fallback"]

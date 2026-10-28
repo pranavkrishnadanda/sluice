@@ -8,10 +8,14 @@ from typing import Annotated
 
 import duckdb
 import polars as pl
+import pydantic_ai
 import typer
 
 from sluice.drift.cases import build_split, load_split, split_hash, unexpected_files
 from sluice.evals.runner import SYSTEMS, format_ci, latest_summaries, render_results, run_eval
+
+# The CLI owns its terminal output (eval tables, JSON): no Pydantic AI first-run banner.
+pydantic_ai.BANNER_ENABLED = False
 
 app = typer.Typer(no_args_is_help=True, help="Sluice: a self-planning agentic data pipeline.")
 

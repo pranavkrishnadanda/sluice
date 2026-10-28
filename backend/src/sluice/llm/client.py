@@ -25,7 +25,6 @@ from contextvars import ContextVar
 from typing import Final, Literal, Self
 
 import httpx2
-import pydantic_ai
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import (
@@ -41,9 +40,6 @@ from pydantic_ai.providers.litellm import LiteLLMProvider
 from pydantic_ai.settings import ModelSettings
 
 from sluice.llm import prices
-
-# The CLI owns its terminal output: no first-run banner from Pydantic AI.
-pydantic_ai.BANNER_ENABLED = False
 
 Tier = Literal["small", "strong"]
 
@@ -118,6 +114,11 @@ class LLM:
             `TestModel` in tests).
         http_client: The `httpx2` client to send proxy requests with (tests inject a transport).
             A client passed in stays the caller's to close; one created here is closed by `aclose`.
+
+    Event-loop lifetime: the HTTP client pools connections bound to the event loop that first
+    uses them. Create, use and close (`aclose` / `async with`) an instance inside ONE event loop,
+    e.g. inside the coroutine passed to `asyncio.run`. Never share an instance across
+    `asyncio.run` calls.
     """
 
     def __init__(
@@ -177,28 +178,33 @@ class LLM:
         headers: list[httpx2.Headers] = []
         token = _response_headers.set(headers)
         start = time.perf_counter()
+        failure: LLMError | None = None
         try:
             with capture_run_messages() as messages:
+                # Failures are built inside the handlers but raised after them: an exception
+                # raised in an `except` block keeps the original as `__context__` (even with
+                # `from None`), and a provider error body may echo a key.
                 try:
                     result = await agent.run(prompt)
                 except UnexpectedModelBehavior as exc:
-                    record = self._record(role, tier, messages, headers, start)
-                    raise LLMOutputError(
+                    failure = LLMOutputError(
                         f"{role}/{tier}: output failed validation after "
                         f"{OUTPUT_REPAIR_RETRIES} repair retry ({type(exc).__name__})",
-                        record=record,
-                    ) from None
+                        record=self._record(role, tier, messages, headers, start),
+                    )
                 except ModelAPIError as exc:
                     status = exc.status_code if isinstance(exc, ModelHTTPError) else None
-                    raise LLMUnavailable(
+                    failure = LLMUnavailable(
                         f"{role}/{tier}: LLM proxy unavailable ({type(exc).__name__}"
                         + (f", HTTP {status})" if status is not None else ")"),
                         status_code=status,
-                    ) from None
+                    )
                 except (AgentRunError, TimeoutError, httpx2.HTTPError) as exc:
-                    raise LLMUnavailable(
+                    failure = LLMUnavailable(
                         f"{role}/{tier}: LLM call failed ({type(exc).__name__})"
-                    ) from None
+                    )
+            if failure is not None:
+                raise failure
             record = self._record(role, tier, messages, headers, start)
             return result.output, record
         finally:

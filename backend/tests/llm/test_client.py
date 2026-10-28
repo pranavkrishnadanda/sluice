@@ -6,6 +6,7 @@ No network: Pydantic AI `FunctionModel` for model behaviour, and a respx router 
 
 import asyncio
 import json
+import traceback
 from typing import Any
 
 import httpx
@@ -107,6 +108,15 @@ def scripted(*outputs: dict[str, Any], in_tok: int = 50, out_tok: int = 10) -> F
         )
 
     return FunctionModel(respond, model_name="scripted")
+
+
+def assert_no_key_reachable(err: BaseException) -> None:
+    """Neither the message nor anything chained to it (cause, context, traceback) holds the key."""
+    assert err.__cause__ is None
+    assert err.__context__ is None
+    assert API_KEY not in str(err)
+    assert API_KEY not in repr(err)
+    assert API_KEY not in "".join(traceback.format_exception(err))
 
 
 def run(coro):  # noqa: ANN001, ANN201 - tiny sync shim, keeps tests free of an async plugin
@@ -300,14 +310,35 @@ def test_api_key_never_appears_in_errors_or_records() -> None:
 
     err = caught.value
     assert err.status_code == 401
-    assert API_KEY not in str(err)
-    assert API_KEY not in repr(err)
-    assert err.__cause__ is None and err.__suppress_context__
+    assert_no_key_reachable(err)
     assert API_KEY not in repr(llm)
 
     ok = LLM(BASE_URL, API_KEY, model_override=scripted(OK))
     _, record = run(ok.run("mapper", "strong", "s", "p", Answer))
     assert API_KEY not in record.model_dump_json()
+
+
+def test_connection_error_keeps_no_exception_chain() -> None:
+    router = respx.Router(assert_all_called=False)
+    router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=httpx.ConnectError(f"refused, auth was {API_KEY}")
+    )
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(proxy_llm(router).run("planner", "strong", "s", "p", Answer))
+
+    assert_no_key_reachable(caught.value)
+
+
+def test_output_error_keeps_no_exception_chain() -> None:
+    # The invalid output echoes the key; pydantic's validation error would carry it as input.
+    bad = {"column": API_KEY, "confidence": 2.0}
+    llm = LLM(BASE_URL, API_KEY, model_override=scripted(bad, bad, bad))
+
+    with pytest.raises(LLMOutputError) as caught:
+        run(llm.run("planner", "strong", "s", "p", Answer))
+
+    assert_no_key_reachable(caught.value)
 
 
 def test_concurrent_calls_attribute_headers_to_their_own_record() -> None:
