@@ -1,3 +1,4 @@
+import { ApiError, parseErrorBody } from "./errors";
 import type {
   ApiClient,
   DataPreview,
@@ -8,18 +9,7 @@ import type {
   Transform,
 } from "./types";
 
-/** A non-2xx response from the Sluice API. */
-export class ApiError extends Error {
-  readonly status: number;
-  readonly url: string;
-
-  constructor(status: number, url: string, message: string) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-    this.url = url;
-  }
-}
+export { ApiError } from "./errors";
 
 export interface HttpApiClientOptions {
   /** Base delay before an SSE reconnect; doubles per consecutive failure. */
@@ -204,13 +194,14 @@ export class HttpApiClient implements ApiClient {
   }
 
   async #error(res: Response, url: string): Promise<ApiError> {
-    let detail = res.statusText;
+    let text = "";
     try {
-      const text = await res.text();
-      if (text) detail = text;
+      text = await res.text();
     } catch {
       // Body unreadable: keep the status text.
     }
-    return new ApiError(res.status, url, `${res.status} ${detail}`.trim());
+    const body = parseErrorBody(text);
+    const message = `${res.status} ${body.detail ?? (text || res.statusText)}`;
+    return new ApiError(res.status, url, message.trim(), body);
   }
 }

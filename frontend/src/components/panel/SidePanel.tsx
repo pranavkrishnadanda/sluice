@@ -3,7 +3,9 @@
 import * as Tabs from "@radix-ui/react-tabs";
 import { type ReactNode, useMemo, useState } from "react";
 import { useApi } from "@/components/api/ApiProvider";
+import { DemoBadge } from "@/components/shell/DemoBadge";
 import { useRunStream } from "@/components/thread/run-stream";
+import { errorDetail } from "@/lib/api/errors";
 import type { Transform } from "@/lib/api/types";
 import type { RunViewState } from "@/lib/run-state";
 import { CodeTab } from "./CodeTab";
@@ -49,7 +51,16 @@ const transformsKey = (state: RunViewState | null) =>
         .join(",")
     : "static";
 
-function Unavailable({ what, retry }: { what: string; retry: () => void }) {
+function Unavailable({
+  what,
+  error,
+  retry,
+}: {
+  what: string;
+  error: unknown;
+  retry: () => void;
+}) {
+  const detail = errorDetail(error);
   return (
     <div
       role="alert"
@@ -57,7 +68,9 @@ function Unavailable({ what, retry }: { what: string; retry: () => void }) {
     >
       <p className="text-sm">
         <span className="font-medium text-error">Couldn’t load {what}.</span>{" "}
-        <span className="text-muted">Check the connection and try again.</span>
+        <span className="text-muted">
+          {detail ?? "Check the connection and try again."}
+        </span>
       </p>
       <button
         type="button"
@@ -90,7 +103,13 @@ function Loaded<T>({
         </output>
       );
     case "error":
-      return <Unavailable what={what} retry={resource.retry} />;
+      return (
+        <Unavailable
+          what={what}
+          error={resource.error}
+          retry={resource.retry}
+        />
+      );
     case "ready":
       return children(resource.data);
   }
@@ -159,20 +178,26 @@ export function SidePanel({
       onValueChange={onTab}
       className="flex h-full min-h-0 flex-col gap-4"
     >
-      <Tabs.List
-        aria-label="Run details"
-        className="grid shrink-0 grid-cols-3 gap-1 rounded-[12px] bg-chip p-1"
+      <div
+        data-testid="side-panel-tabs"
+        className="flex shrink-0 items-center gap-2"
       >
-        {TABS.map((t) => (
-          <Tabs.Trigger
-            key={t.value}
-            value={t.value}
-            className="h-9 rounded-[9px] font-medium text-muted text-sm transition-colors duration-150 hover:text-fg data-[state=active]:bg-raised data-[state=active]:text-fg data-[state=active]:shadow-[0_1px_4px_rgb(0_0_0/0.06),inset_0_1px_0_rgb(255_255_255/0.5)]"
-          >
-            {t.label}
-          </Tabs.Trigger>
-        ))}
-      </Tabs.List>
+        <Tabs.List
+          aria-label="Run details"
+          className="grid min-w-0 flex-1 grid-cols-3 gap-1 rounded-[12px] bg-chip p-1"
+        >
+          {TABS.map((t) => (
+            <Tabs.Trigger
+              key={t.value}
+              value={t.value}
+              className="h-9 rounded-[9px] font-medium text-muted text-sm transition-colors duration-150 hover:text-fg data-[state=active]:bg-raised data-[state=active]:text-fg data-[state=active]:shadow-[0_1px_4px_rgb(0_0_0/0.06),inset_0_1px_0_rgb(255_255_255/0.5)]"
+            >
+              {t.label}
+            </Tabs.Trigger>
+          ))}
+        </Tabs.List>
+        <DemoBadge variant="compact" />
+      </div>
 
       <Tabs.Content
         value="data"

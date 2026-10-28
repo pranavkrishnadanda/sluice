@@ -157,6 +157,15 @@ describe("RunThread", () => {
     expect(steps().getByText("Loaded 59,963 rows")).toBeInTheDocument();
   });
 
+  test("a rejection after steps have streamed is a lost connection", async () => {
+    const stream = controlledClient();
+    renderThread(stream.client);
+    stream.emitThrough(3);
+    await stream.fail();
+    expect(await screen.findByText("Connection lost")).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't load this run")).toBeNull();
+  });
+
   test("stream drop shows Connection lost and Retry resumes", async () => {
     const stream = controlledClient();
     renderThread(stream.client);
@@ -282,12 +291,10 @@ describe("RunThread", () => {
     expect(screen.queryByText(/issues found/)).not.toBeInTheDocument();
   });
 
-  test("a stream that rejects offers Retry", async () => {
+  test("an unknown run (404) says so and offers Retry", async () => {
     const client = new MockApiClient({ delayMs: 0 });
     renderThread(client, "run-missing");
-    expect(
-      await screen.findByText("Couldn't load this run"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Run not found")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
   });
 });

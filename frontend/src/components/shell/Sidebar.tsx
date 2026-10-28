@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useMemo } from "react";
+import { errorDetail } from "@/lib/api/errors";
 import type { RunStatus, RunSummary } from "@/lib/api/types";
 import { groupRunsByDay } from "./group-runs";
 import { ChartIcon, PlusIcon } from "./icons";
@@ -83,7 +84,10 @@ function RunList({ pathname }: { pathname: string }) {
   if (state.status === "error") {
     return (
       <div className="mt-4 space-y-2 px-2.5 text-sm">
-        <p className="text-muted">Couldn&apos;t load runs.</p>
+        <p className="text-muted">
+          Couldn&apos;t load runs.
+          {errorDetail(state.error) && <> {errorDetail(state.error)}</>}
+        </p>
         <button
           type="button"
           onClick={retry}

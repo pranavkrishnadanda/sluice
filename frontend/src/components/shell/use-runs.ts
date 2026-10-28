@@ -8,7 +8,7 @@ export type RunsState =
   | { status: "loading" }
   /** `fetchedAt` (epoch ms) is the "now" the list is grouped against. */
   | { status: "ready"; runs: RunSummary[]; fetchedAt: number }
-  | { status: "error" };
+  | { status: "error"; error: unknown };
 
 type Ready = Extract<RunsState, { status: "ready" }>;
 
@@ -28,9 +28,10 @@ function fetchRuns(api: ApiClient): Promise<Ready> {
 }
 
 /** A failed refetch keeps a list we already have. */
-function failed(prev: RunsState): RunsState {
-  return prev.status === "ready" ? prev : { status: "error" };
-}
+const failed =
+  (error: unknown) =>
+  (prev: RunsState): RunsState =>
+    prev.status === "ready" ? prev : { status: "error", error };
 
 /**
  * The run list for the sidebar: stale-while-revalidate from the last list
@@ -49,8 +50,8 @@ export function useRuns(): { state: RunsState; retry: () => void } {
       (ready) => {
         if (live) setState(ready);
       },
-      () => {
-        if (live) setState(failed);
+      (error: unknown) => {
+        if (live) setState(failed(error));
       },
     );
     return () => {
@@ -60,7 +61,7 @@ export function useRuns(): { state: RunsState; retry: () => void } {
 
   const retry = useCallback(() => {
     setState({ status: "loading" });
-    fetchRuns(api).then(setState, () => setState(failed));
+    fetchRuns(api).then(setState, (error: unknown) => setState(failed(error)));
   }, [api]);
 
   return { state, retry };

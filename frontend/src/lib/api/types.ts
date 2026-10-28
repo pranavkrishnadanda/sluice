@@ -31,7 +31,8 @@ export interface RunSummary {
   id: string;
   fileName: string;
   table: TableName;
-  rows: number;
+  /** `null` until the file has been profiled (and for demo replays). */
+  rows: number | null;
   status: RunStatus;
   createdAt: string;
   costUsd: number;
@@ -59,7 +60,8 @@ export type RunEvent = EventBase &
         runId: string;
         fileName: string;
         table: TableName;
-        rows: number;
+        /** `null` while the row count is not known yet. */
+        rows: number | null;
       }
     | { type: "profiled"; issues: Issue[] }
     | { type: "rules_applied"; actions: string[] }
@@ -137,7 +139,12 @@ export interface EvalSummary {
   pareto: {
     system: string;
     kind: "baseline" | "router";
-    points: { costPer1kRowsUsd: number; quality: number; lambda?: number }[];
+    points: {
+      costPer1kRowsUsd: number;
+      quality: number;
+      /** Router trade-off weight; `null` for baselines. */
+      lambda: number | null;
+    }[];
   }[];
 }
 export interface ApiClient {
@@ -152,6 +159,12 @@ export interface ApiClient {
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, limit: number): Promise<DataPreview>;
   getEvalSummary(): Promise<EvalSummary>;
+  /**
+   * Demo only, never part of the HTTP API: `true` when `runId` was created
+   * through the mock, which cannot read the uploaded file and replays a
+   * sample run instead. Absent on real clients.
+   */
+  isSampleReplay?(runId: string): boolean;
 }
 
 /** Convenience: a single event variant by its `type`. */

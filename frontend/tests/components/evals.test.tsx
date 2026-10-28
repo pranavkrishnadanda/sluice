@@ -201,17 +201,17 @@ describe("buildParetoOption", () => {
         {
           system: "free",
           kind: "baseline",
-          points: [{ costPer1kRowsUsd: 0, quality: 0.7 }],
+          points: [{ costPer1kRowsUsd: 0, quality: 0.7, lambda: null }],
         },
         {
           system: "mid",
           kind: "baseline",
-          points: [{ costPer1kRowsUsd: 0.5, quality: 0.8 }],
+          points: [{ costPer1kRowsUsd: 0.5, quality: 0.8, lambda: null }],
         },
         {
           system: "dear",
           kind: "baseline",
-          points: [{ costPer1kRowsUsd: 0.9, quality: 0.85 }],
+          points: [{ costPer1kRowsUsd: 0.9, quality: 0.85, lambda: null }],
         },
       ],
     };
@@ -233,7 +233,7 @@ describe("buildParetoOption", () => {
         {
           system: "mid",
           kind: "baseline",
-          points: [{ costPer1kRowsUsd: 0.5, quality: 0.8 }],
+          points: [{ costPer1kRowsUsd: 0.5, quality: 0.8, lambda: null }],
         },
       ],
     };
@@ -259,6 +259,48 @@ describe("buildParetoOption", () => {
     expect(router).toContain("$0.12");
     expect(router).toContain("86.1%");
     expect(router).toContain("λ = 0.5");
+  });
+
+  test("a null lambda is treated as absent everywhere (never 'λ = null')", () => {
+    const summary: EvalSummary = {
+      ...EVAL_SUMMARY,
+      pareto: [
+        {
+          system: "always-small",
+          kind: "baseline",
+          points: [{ costPer1kRowsUsd: 0.08, quality: 0.8, lambda: null }],
+        },
+        {
+          system: "sluice",
+          kind: "router",
+          points: [
+            { costPer1kRowsUsd: 0.05, quality: 0.82, lambda: null },
+            { costPer1kRowsUsd: 0.12, quality: 0.86, lambda: 0.5 },
+          ],
+        },
+      ],
+    };
+    const rows = paretoRows(summary);
+    expect(rows.map((r) => r.lambda)).toEqual([null, null, 0.5]);
+    const option = buildParetoOption(summary, COLOURS);
+    const series = option.series as Array<{
+      type: string;
+      data: Array<{ lambda?: number | null }>;
+    }>;
+    const line = series.find((s) => s.type === "line");
+    expect(line?.data.map((d) => d.lambda)).toEqual([undefined, 0.5]);
+    const format = (option.tooltip as { formatter: (p: unknown) => string })
+      .formatter;
+    for (const s of series) {
+      for (const d of s.data) {
+        expect(format({ data: d, seriesType: s.type })).not.toContain("null");
+      }
+    }
+    expect(
+      format({
+        data: { name: "x", value: [0.05, 0.82], cost: 0.05, lambda: null },
+      }),
+    ).not.toContain("λ");
   });
 
   test("animation is off under reduced motion", () => {

@@ -3,14 +3,17 @@ import { formatCount } from "@/lib/format";
 
 export interface FileChipProps {
   name: string;
-  /** Row count; omitted before the file has been profiled. */
+  /** Row count; omitted (or `null`) before the file has been profiled. */
   rows?: number | null;
+  /** Shown instead of the row count, e.g. "sample run" for a demo replay. */
+  note?: string;
   className?: string;
 }
 
 /** "orders_2026-10.csv · 48,210 rows" with a file glyph. */
-export function FileChip({ name, rows, className }: FileChipProps) {
-  const label = rows == null ? name : `${name} · ${formatCount(rows)} rows`;
+export function FileChip({ name, rows, note, className }: FileChipProps) {
+  const suffix = note ?? (rows == null ? null : `${formatCount(rows)} rows`);
+  const label = suffix === null ? name : `${name} · ${suffix}`;
   return (
     <span
       className={[

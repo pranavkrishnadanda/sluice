@@ -28,7 +28,7 @@ export interface ParetoRow {
   kind: "baseline" | "router";
   costPer1kRowsUsd: number;
   quality: number;
-  lambda?: number;
+  lambda: number | null;
 }
 
 /** A data item: `value` is where it is drawn, `cost` the measured cost. */
@@ -36,7 +36,7 @@ interface ParetoDatum {
   name: string;
   value: [number, number];
   cost: number;
-  lambda?: number;
+  lambda?: number | null;
 }
 
 export const BASELINES_SERIES = "Baselines";
@@ -48,7 +48,7 @@ export function paretoRows(summary: EvalSummary): ParetoRow[] {
       kind: s.kind,
       costPer1kRowsUsd: p.costPer1kRowsUsd,
       quality: p.quality,
-      ...(p.lambda === undefined ? {} : { lambda: p.lambda }),
+      lambda: p.lambda ?? null,
     })),
   );
 }
@@ -123,7 +123,7 @@ function tooltipHtml(params: unknown): string {
     `Cost per 1k rows: ${formatUsd(d.cost)}`,
     `Quality: ${formatPct(d.value[1])}`,
   ];
-  if (d.lambda !== undefined) lines.push(`λ = ${d.lambda}`);
+  if (d.lambda != null) lines.push(`λ = ${d.lambda}`);
   return lines.join("<br/>");
 }
 
@@ -209,7 +209,7 @@ export function buildParetoOption(
           name: s.system,
           value: [drawAt(p.costPer1kRowsUsd), p.quality],
           cost: p.costPer1kRowsUsd,
-          ...(p.lambda === undefined ? {} : { lambda: p.lambda }),
+          ...(p.lambda != null ? { lambda: p.lambda } : {}),
           // Direct-label the line once, at its cheapest end.
           ...(j === 0 ? { label: { show: true } } : {}),
         }));

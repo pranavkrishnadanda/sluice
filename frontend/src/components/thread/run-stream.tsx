@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { useApi } from "@/components/api/ApiProvider";
+import { isNotFound } from "@/lib/api/errors";
 import type { RunEvent } from "@/lib/api/types";
 import {
   INITIAL_RUN_VIEW_STATE,
@@ -20,8 +21,10 @@ import {
 /**
  * - `live`: subscribed and the run has not finished.
  * - `done`: `run_finished` arrived.
- * - `lost`: the stream ended without `run_finished` (connection dropped).
- * - `error`: the stream could not be opened (e.g. unknown run).
+ * - `lost`: the stream ended or gave up reconnecting after events had
+ *   already been applied (steps so far are kept).
+ * - `error`: the stream failed before any event arrived (unreachable
+ *   server, unknown run, ...).
  */
 export type StreamConnection = "live" | "done" | "lost" | "error";
 
@@ -29,6 +32,8 @@ export interface RunStream {
   runId: string;
   state: RunViewState;
   connection: StreamConnection;
+  /** With `connection === "error"`: the API reported the run as unknown (404). */
+  notFound: boolean;
   /** Re-subscribes; replayed events are dropped by the reducer's seq check. */
   retry: () => void;
 }
@@ -48,13 +53,16 @@ function useRunStreamSubscription(runId: string): RunStream {
   // without a reset inside the effect.
   const [settled, setSettled] = useState<{
     subscription: number;
-    outcome: "ended" | "error";
+    outcome: "ended" | "failed";
+    error: unknown;
   } | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
-    const settle = (outcome: "ended" | "error") => {
-      if (!controller.signal.aborted) setSettled({ subscription, outcome });
+    const settle = (outcome: "ended" | "failed", error: unknown = null) => {
+      if (!controller.signal.aborted) {
+        setSettled({ subscription, outcome, error });
+      }
     };
     // Gate every callback on this subscription's signal: a stream that
     // ignores abort (or delivers late) must not touch state after cleanup.
@@ -63,22 +71,28 @@ function useRunStreamSubscription(runId: string): RunStream {
     };
     api.streamEvents(runId, onEvent, controller.signal).then(
       () => settle("ended"),
-      () => settle("error"),
+      (error: unknown) => settle("failed", error),
     );
     return () => controller.abort();
   }, [api, runId, subscription]);
 
   const retry = useCallback(() => setSubscription((n) => n + 1), []);
 
-  const outcome =
-    settled?.subscription === subscription ? settled.outcome : null;
+  const current = settled?.subscription === subscription ? settled : null;
+  // Once any event has been applied the run exists and its steps are on
+  // screen, so a stream that ends or gives up is a lost connection (the
+  // HTTP client rejects when it runs out of reconnects). Only a failure
+  // before the first event means the run could not be loaded at all.
   const connection: StreamConnection = state.finished
     ? "done"
-    : outcome === "ended"
-      ? "lost"
-      : (outcome ?? "live");
+    : !current
+      ? "live"
+      : current.outcome === "ended" || state.lastSeq > 0
+        ? "lost"
+        : "error";
+  const notFound = connection === "error" && isNotFound(current?.error);
 
-  return { runId, state, connection, retry };
+  return { runId, state, connection, notFound, retry };
 }
 
 const RunStreamContext = createContext<RunStream | null>(null);

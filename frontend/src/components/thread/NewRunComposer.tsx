@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useApi } from "@/components/api/ApiProvider";
+import { errorDetail } from "@/lib/api/errors";
 import type { TableName } from "@/lib/api/types";
 import { Composer } from "./Composer";
 
@@ -22,9 +23,14 @@ export function NewRunComposer({ placeholder }: { placeholder?: string }) {
     try {
       const run = await api.createRun(file, table);
       router.push(`/runs/${encodeURIComponent(run.id)}`);
-    } catch {
+    } catch (err) {
       setBusy(false);
-      setError("Couldn't start the run. Check the connection and try again.");
+      // A 4xx detail (too large, unsupported format, unknown table) says
+      // what to change; anything else is a connection or server problem.
+      setError(
+        errorDetail(err) ??
+          "Couldn't start the run. Check the connection and try again.",
+      );
     }
   };
 

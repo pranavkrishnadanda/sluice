@@ -11,12 +11,17 @@ export type Resource<T> =
       /** Last good data, shown while a newer key loads. */
       stale: boolean;
     }
-  | { status: "error"; retry: () => void };
+  | {
+      status: "error";
+      /** What the loader rejected with (e.g. an `ApiError`). */
+      error: unknown;
+      retry: () => void;
+    };
 
 interface Settled<T> {
   key: string;
   attempt: number;
-  result: { ok: true; data: T } | { ok: false };
+  result: { ok: true; data: T } | { ok: false; error: unknown };
 }
 
 /**
@@ -45,8 +50,8 @@ export function useResource<T>(
         setSettled({ key, attempt, result: { ok: true, data } });
         setLastGood(data);
       },
-      () => {
-        if (live) setSettled({ key, attempt, result: { ok: false } });
+      (error: unknown) => {
+        if (live) setSettled({ key, attempt, result: { ok: false, error } });
       },
     );
     return () => {
@@ -62,7 +67,9 @@ export function useResource<T>(
   if (current?.result.ok) {
     return { status: "ready", data: current.result.data, stale: false };
   }
-  if (current && !current.result.ok) return { status: "error", retry };
+  if (current && !current.result.ok) {
+    return { status: "error", error: current.result.error, retry };
+  }
   return lastGood === null
     ? { status: "loading" }
     : { status: "ready", data: lastGood, stale: true };

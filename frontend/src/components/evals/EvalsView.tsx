@@ -4,6 +4,8 @@ import type { ReactNode } from "react";
 import { useApi } from "@/components/api/ApiProvider";
 import { Glass } from "@/components/glass/Glass";
 import { useResource } from "@/components/panel/use-resource";
+import { DemoBadge } from "@/components/shell/DemoBadge";
+import { errorDetail } from "@/lib/api/errors";
 import type { EvalSummary } from "@/lib/api/types";
 import { ParetoChart } from "./ParetoChart";
 import { ResultsTable } from "./ResultsTable";
@@ -47,7 +49,8 @@ function Skeleton({ what, height }: { what: string; height: string }) {
   );
 }
 
-function Unavailable({ retry }: { retry: () => void }) {
+function Unavailable({ error, retry }: { error: unknown; retry: () => void }) {
+  const detail = errorDetail(error);
   return (
     <Glass className="p-4 sm:p-5">
       <div
@@ -59,7 +62,7 @@ function Unavailable({ retry }: { retry: () => void }) {
             Couldn’t load the eval results.
           </span>{" "}
           <span className="text-muted">
-            Check the connection and try again.
+            {detail ?? "Check the connection and try again."}
           </span>
         </p>
         <button
@@ -89,19 +92,26 @@ function Ready({ summary }: { summary: EvalSummary }) {
         id="evals-results"
         title="Results"
         meta={
-          Number.isNaN(generated.getTime()) ? null : (
-            <p className="text-muted text-xs">
-              Generated{" "}
-              <time dateTime={summary.generatedAt}>
-                {GENERATED.format(generated)} UTC
-              </time>
-            </p>
-          )
+          <div className="flex flex-wrap items-center gap-2">
+            {Number.isNaN(generated.getTime()) ? null : (
+              <p className="text-muted text-xs">
+                Generated{" "}
+                <time dateTime={summary.generatedAt}>
+                  {GENERATED.format(generated)} UTC
+                </time>
+              </p>
+            )}
+            <DemoBadge variant="compact" />
+          </div>
         }
       >
         <ResultsTable summary={summary} />
       </Card>
-      <Card id="evals-pareto" title="Cost vs quality">
+      <Card
+        id="evals-pareto"
+        title="Cost vs quality"
+        meta={<DemoBadge variant="compact" />}
+      >
         <ParetoChart summary={summary} />
       </Card>
     </>
@@ -131,7 +141,7 @@ export function EvalsView() {
         </>
       );
     case "error":
-      return <Unavailable retry={summary.retry} />;
+      return <Unavailable error={summary.error} retry={summary.retry} />;
     case "ready":
       return <Ready summary={summary.data} />;
   }

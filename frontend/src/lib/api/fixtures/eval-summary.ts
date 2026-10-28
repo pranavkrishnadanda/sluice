@@ -35,17 +35,17 @@ export const EVAL_SUMMARY: EvalSummary = {
     {
       system: "rules",
       kind: "baseline",
-      points: [{ costPer1kRowsUsd: 0, quality: 0.712 }],
+      points: [{ costPer1kRowsUsd: 0, quality: 0.712, lambda: null }],
     },
     {
       system: "always-small",
       kind: "baseline",
-      points: [{ costPer1kRowsUsd: 0.08, quality: 0.803 }],
+      points: [{ costPer1kRowsUsd: 0.08, quality: 0.803, lambda: null }],
     },
     {
       system: "always-strong",
       kind: "baseline",
-      points: [{ costPer1kRowsUsd: 0.94, quality: 0.874 }],
+      points: [{ costPer1kRowsUsd: 0.94, quality: 0.874, lambda: null }],
     },
     {
       system: "sluice",

@@ -1,3 +1,4 @@
+import { ApiError } from "./errors";
 import { EVAL_SUMMARY } from "./fixtures/eval-summary";
 import { generatePreview } from "./fixtures/preview";
 import {
@@ -39,6 +40,8 @@ interface MockRun {
   transforms: readonly Transform[];
   /** Which fixture's preview generator backs this run. */
   previewOf: string;
+  /** Created through {@link MockApiClient.createRun}: replays a fixture. */
+  sample: boolean;
 }
 
 const FIXTURE_RUNS: readonly MockRun[] = [
@@ -47,18 +50,21 @@ const FIXTURE_RUNS: readonly MockRun[] = [
     events: RUN_REPAIRED_EVENTS,
     transforms: RUN_REPAIRED_TRANSFORMS,
     previewOf: RUN_REPAIRED.id,
+    sample: false,
   },
   {
     summary: RUN_QUARANTINED,
     events: RUN_QUARANTINED_EVENTS,
     transforms: RUN_QUARANTINED_TRANSFORMS,
     previewOf: RUN_QUARANTINED.id,
+    sample: false,
   },
   {
     summary: RUN_CLEAN,
     events: RUN_CLEAN_EVENTS,
     transforms: RUN_CLEAN_TRANSFORMS,
     previewOf: RUN_CLEAN.id,
+    sample: false,
   },
 ];
 
@@ -89,6 +95,8 @@ function replayAs(summary: RunSummary): RunEvent[] {
         runId: summary.id,
         fileName: summary.fileName,
         table: summary.table,
+        // The file was never read: don't present the fixture's count as its.
+        rows: null,
       };
     }
     return { ...e, at };
@@ -122,7 +130,8 @@ export class MockApiClient implements ApiClient {
       id: `run-${this.#nextRun++}`,
       fileName: file.name,
       table,
-      rows: RUN_REPAIRED.rows,
+      // The mock never reads the file, so it has no row count to report.
+      rows: null,
       status: "queued",
       createdAt: new Date().toISOString(),
       costUsd: 0,
@@ -132,8 +141,13 @@ export class MockApiClient implements ApiClient {
       events: replayAs(summary),
       transforms: RUN_REPAIRED_TRANSFORMS,
       previewOf: RUN_REPAIRED.id,
+      sample: true,
     });
     return { ...summary };
+  }
+
+  isSampleReplay(runId: string): boolean {
+    return this.#runs.get(runId)?.sample ?? false;
   }
 
   async streamEvents(
@@ -156,7 +170,8 @@ export class MockApiClient implements ApiClient {
 
   async getPreview(runId: string, limit: number): Promise<DataPreview> {
     const run = this.#get(runId);
-    return generatePreview(run.previewOf, run.summary.rows, limit);
+    const fixture = this.#get(run.previewOf);
+    return generatePreview(run.previewOf, fixture.summary.rows ?? 0, limit);
   }
 
   async getEvalSummary(): Promise<EvalSummary> {
@@ -165,7 +180,12 @@ export class MockApiClient implements ApiClient {
 
   #get(runId: string): MockRun {
     const run = this.#runs.get(runId);
-    if (!run) throw new Error(`Unknown run: ${runId}`);
+    if (!run) {
+      const detail = `Unknown run: ${runId}`;
+      throw new ApiError(404, `mock:/runs/${runId}`, `404 ${detail}`, {
+        detail,
+      });
+    }
     return run;
   }
 
