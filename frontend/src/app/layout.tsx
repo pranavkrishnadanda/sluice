@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
+import { ApiProvider } from "@/components/api/ApiProvider";
 import { Backdrop } from "@/components/glass/Backdrop";
 import { ThemeProvider } from "@/components/theme/ThemeProvider";
 import { themeInitScript } from "@/components/theme/theme-script";
@@ -47,7 +48,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       </head>
       <body className="flex min-h-full flex-col">
         <Backdrop />
-        <ThemeProvider>{children}</ThemeProvider>
+        <ThemeProvider>
+          <ApiProvider>{children}</ApiProvider>
+        </ThemeProvider>
       </body>
     </html>
   );
