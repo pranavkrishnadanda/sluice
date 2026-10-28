@@ -373,9 +373,26 @@ def _presented(metric: str, ci: CI | None, n: int | None) -> CI | None:
     return (mean, lo, hi)
 
 
+def _degenerate_ratio(metric: str, ci: CI | None, n: int | None) -> bool:
+    """True when a per-case ratio metric scored exactly 0 or 1 on every one of its ``n`` cases.
+
+    Its bootstrap interval then has zero width, and no exact interval applies to a mean of
+    ratios, so the value is shown with ``(all k cases)`` and no brackets.
+    """
+    if ci is None or metric in _EXACT_AT_BOUNDARY or not n:
+        return False
+    mean, lo, hi = ci
+    return mean in (0.0, 1.0) and lo == hi == mean
+
+
 def _cell(metric: str, ci: CI | None, n_defined: int | None, n_row: int | None) -> str:
-    """``format_ci`` plus ``(n=k)`` when the metric is defined on fewer cases than the row."""
+    """``format_ci`` plus ``(n=k)`` when the metric is defined on fewer cases than the row.
+
+    A ratio metric at 0% or 100% on every case renders as ``100.0% (all k cases)`` instead.
+    """
     n = n_defined if n_defined is not None else n_row
+    if ci is not None and n and _degenerate_ratio(metric, ci, n):
+        return f"{ci[0] * 100:.1f}% (all {_plural(n, 'case')})"
     text = format_ci(_presented(metric, ci, n))
     if ci is not None and n_defined is not None and n_defined != n_row:
         text += f" (n={n_defined})"
@@ -453,7 +470,10 @@ def render_results(summaries: Sequence[EvalSummary], lock: Mapping[str, Any]) ->
         "over cases with its 95% percentile-bootstrap confidence interval in brackets (10,000 "
         "resamples, seed 0), except that a Fabrication, Contract pass or Success value of "
         "exactly 0% or 100% (0 or n of n cases) shows the exact binomial (Clopper-Pearson) 95% "
-        "interval instead, since the bootstrap of a constant has zero width; each case's "
+        "interval instead, since the bootstrap of a constant has zero width. Where Cell "
+        "accuracy or Row recall is exactly 0% or 100% on every one of k cases, every case "
+        "scored the same, so the interval is omitted and the value is followed by "
+        "`(all k cases)`. Each case's "
         "metric is first averaged over its trials, and a case "
         "where a metric is undefined (for example fabrication when nothing needed flagging) is "
         "left out of that metric. Latency and cost are not shown. Reproduce from the repository "
