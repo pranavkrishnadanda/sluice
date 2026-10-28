@@ -22,3 +22,6 @@ SANDBOX_PIDS: Final = 64
 
 MAX_ERROR_CHARS: Final = 2_000
 """Longest ``attempt_failed.error`` sent to clients (``MAX_ATTEMPT_ERROR_CHARS`` in the API)."""
+
+SANDBOX_OUTPUT_MAX_BYTES: Final = 50 * 1024 * 1024
+"""Largest sandbox output the host accepts: on disk while the container runs, and decoded."""
