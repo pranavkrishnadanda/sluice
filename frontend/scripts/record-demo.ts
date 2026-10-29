@@ -7,7 +7,10 @@
  * Needs the services and the API (`make up && make api`, the API started
  * with `SLUICE_UI_ORIGINS=http://localhost:3210,http://127.0.0.1:3210`). It
  * builds the UI against that API into `.next-e2e-live/` (the live e2e build)
- * and serves it on 3210, unless a UI is already answering there.
+ * and serves it on 3210, unless a UI is already answering there (a reused
+ * UI must call the same API, or the script stops). It drives the system
+ * Google Chrome; set SLUICE_DEMO_CHANNEL=chromium to use Playwright's
+ * Chromium instead (`bunx playwright install chromium` first).
  *
  * The run makes real model calls. A file is loaded at most once, so the
  * case must be one the backend hasn't loaded yet: a repeat is skipped as
@@ -28,7 +31,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium, type Page } from "@playwright/test";
+import { type Browser, chromium, type Page } from "@playwright/test";
 
 const API = (
   process.env.SLUICE_DEMO_API_URL?.trim() || "http://localhost:8080"
@@ -149,10 +152,25 @@ async function record(page: Page, t0: number): Promise<Marks> {
   const at = () => (Date.now() - t0) / 1_000;
   const { table, file } = loadCase(CASE_ID);
 
+  // The sidebar lists runs on load: that request shows which API the UI
+  // was built against (it matters when an already-running UI is reused).
+  const apiCall = page
+    .waitForRequest((req) => req.url().startsWith(`${API}/`), {
+      timeout: 15_000,
+    })
+    .then(
+      () => true,
+      () => false,
+    );
   await page.goto(`${UI}/runs`);
   await page
     .getByRole("heading", { level: 1, name: "New pipeline run" })
     .waitFor();
+  if (!(await apiCall)) {
+    fail(
+      `the UI on ${UI} does not call ${API}: stop it so the script builds one, or set SLUICE_DEMO_API_URL to the API it was built against`,
+    );
+  }
   if ((await page.getByText("Demo data").count()) > 0) {
     fail("the UI shows the demo badge: it was not built against the API");
   }
@@ -186,7 +204,11 @@ async function record(page: Page, t0: number): Promise<Marks> {
       undefined,
       { timeout: RUN_TIMEOUT_MS },
     )
-    .catch(() => undefined);
+    .catch(() =>
+      console.warn(
+        "record-demo: the plan never appeared; recording the run in real time",
+      ),
+    );
   await hold(page, 1_500);
   const waitFrom = at();
 
@@ -211,7 +233,11 @@ async function record(page: Page, t0: number): Promise<Marks> {
   await details
     .getByRole("table", { name: "Before and after values" })
     .waitFor({ timeout: 30_000 })
-    .catch(() => undefined);
+    .catch(() =>
+      console.warn(
+        "record-demo: no before/after table within 30 s; the Data tab shows its empty state",
+      ),
+    );
   await hold(page, 3_000);
 
   // Dark (the system scheme) to light: one press of the theme toggle.
@@ -276,10 +302,13 @@ async function main(): Promise<void> {
   mkdirSync(OUT_DIR, { recursive: true });
 
   const server = await startUi();
-  const browser = await chromium.launch({
-    channel: process.env.SLUICE_DEMO_CHANNEL ?? "chrome",
-  });
+  let browser: Browser | null = null;
   try {
+    // System Google Chrome by default; SLUICE_DEMO_CHANNEL=chromium uses
+    // Playwright's Chromium (after `bunx playwright install chromium`).
+    browser = await chromium.launch({
+      channel: process.env.SLUICE_DEMO_CHANNEL?.trim() || "chrome",
+    });
     const context = await browser.newContext({
       viewport: SIZE,
       colorScheme: "dark",
@@ -296,7 +325,7 @@ async function main(): Promise<void> {
     renameSync(await video.path(), raw);
     compress(raw, marks);
   } finally {
-    await browser.close();
+    await browser?.close();
     stopUi(server);
   }
 }

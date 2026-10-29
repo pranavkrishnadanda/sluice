@@ -65,7 +65,9 @@ sandbox-image:
 # `make up` and the API started with the UI's origin allowed:
 #   SLUICE_UI_ORIGINS=http://localhost:3210,http://127.0.0.1:3210 make api
 # The case must be one the backend hasn't loaded yet (SLUICE_DEMO_CASE, default dev-0039). Video
-# capture needs Playwright's encoder once: `cd frontend && bunx playwright install ffmpeg`.
+# capture needs Playwright's encoder once: `cd frontend && bunx playwright install ffmpeg`. It
+# drives the system Google Chrome; without it, `cd frontend && bunx playwright install chromium`
+# and run with SLUICE_DEMO_CHANNEL=chromium.
 # The palette is built from frame differences and applied with ordered dithering to changed
 # rectangles only: the frosted-glass gradients otherwise re-dither every frame (12.6 MB vs 3.4 MB).
 DEMO_VIDEO = frontend/test-results/demo/sluice-demo.webm
