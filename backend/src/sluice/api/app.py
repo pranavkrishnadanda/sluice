@@ -233,7 +233,7 @@ def create_app(
             created either way.
         execute: The execution core the worker calls (injectable for tests).
     """
-    tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
+    tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set (env or .env)
     if settings is None:
         settings = ApiSettings()
     app = FastAPI(title="Sluice API", version="1", lifespan=_lifespan)

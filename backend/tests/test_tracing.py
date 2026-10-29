@@ -97,13 +97,72 @@ def _all_values(exporter: InMemorySpanExporter) -> list[str]:
 
 
 @pytest.fixture
-def fresh_setup(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+def fresh_setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[object]:
     """Record instead of installing a global provider; reset the idempotency latch."""
     installed: list[object] = []
     monkeypatch.setattr(tracing, "_installed", False)
     monkeypatch.setattr(tracing.trace, "set_tracer_provider", installed.append)
     monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    # Never the developer's real backend/.env: a path that does not exist unless a test writes it.
+    monkeypatch.setattr(tracing, "ENV_FILE", tmp_path / "absent.env")
     return installed
+
+
+def _write_env(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _endpoint_of(provider: object) -> str:
+    (processor,) = provider._active_span_processor._span_processors  # type: ignore[attr-defined]
+    exporter = getattr(processor, "span_exporter", None) or processor._batch_processor._exporter
+    return exporter._endpoint  # type: ignore[no-any-return]
+
+
+def test_setup_tracing_reads_the_endpoint_from_the_env_file(
+    fresh_setup: list[object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    env = _write_env(
+        tmp_path / "file.env",
+        "POSTGRES_PASSWORD=x\nOTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:9/\n"
+        "OTEL_SERVICE_NAME=from-file\n",
+    )
+    monkeypatch.setattr(tracing, "ENV_FILE", env)
+    tracing.setup_tracing()
+    try:
+        (provider,) = fresh_setup
+        assert isinstance(provider, TracerProvider)
+        assert provider.resource.attributes["service.name"] == "from-file"
+        assert _endpoint_of(provider) == "http://127.0.0.1:9/v1/traces"
+    finally:
+        for p in fresh_setup:
+            p.shutdown()  # type: ignore[attr-defined]
+
+
+def test_setup_tracing_process_env_overrides_the_env_file(
+    fresh_setup: list[object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    env = _write_env(tmp_path / "file.env", "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:9\n")
+    monkeypatch.setattr(tracing, "ENV_FILE", env)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:10")
+    tracing.setup_tracing()
+    try:
+        (provider,) = fresh_setup
+        assert _endpoint_of(provider) == "http://127.0.0.1:10/v1/traces"
+    finally:
+        for p in fresh_setup:
+            p.shutdown()  # type: ignore[attr-defined]
+
+
+def test_setup_tracing_env_file_without_endpoint_installs_nothing(
+    fresh_setup: list[object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    env = _write_env(tmp_path / "file.env", "# OTEL_EXPORTER_OTLP_ENDPOINT=http://x\nA=1\n")
+    monkeypatch.setattr(tracing, "ENV_FILE", env)
+    tracing.setup_tracing()
+    assert fresh_setup == []
 
 
 def test_setup_tracing_without_endpoint_installs_nothing(
