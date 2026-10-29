@@ -38,7 +38,11 @@ class ApiSettings(BaseSettings):
     )
     max_upload_bytes: int = Field(MAX_UPLOAD_BYTES, gt=0)
     concurrency: int = Field(1, ge=1, le=4, description="Runs executed at once (Groq limits).")
-    keepalive_s: float = Field(15.0, gt=0, description="SSE keep-alive comment interval.")
+    keepalive_s: float = Field(
+        10.0,
+        gt=0,
+        description="SSE keep-alive comment interval; the contract bound is at least every 15 s.",
+    )
     landing_bucket: str = Field("sluice-landing", min_length=3, max_length=63)
 
     @field_validator("ui_origins", mode="before")

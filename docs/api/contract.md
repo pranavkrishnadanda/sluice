@@ -45,11 +45,14 @@ responses and its own connection copy for network errors and 5xx.
 
 | Status | When |
 | --- | --- |
+| `403` | A non-`GET` request (e.g. `POST /runs`) whose `Origin` header is not an allowed UI origin: `code` is `forbidden_origin`, answered before the body is read. Requests without `Origin` (curl, scripts) are allowed |
 | `404` | Unknown run id (any `/runs/{id}/...` route) |
+| `404` | `GET /evals/summary` before any scored agent eval run exists: `code` is `no_evals` |
 | `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
-| `422` | Unknown `table`, a missing form field, or a file that cannot be parsed in its format |
+| `422` | Unknown `table`, a missing form field, a malformed multipart body (including a part header longer than **8 KiB** or more than 8 headers in one part; `code: "invalid_request"`), or a file that cannot be parsed in its format |
+| `422` | `code: "too_large_decoded"`: a `.parquet` upload whose footer declares more than **5,000,000 rows** or more than **1 GiB** of decoded data (checked before the data is read) |
 
 ## Base URL, CORS and configuration
 
@@ -66,7 +69,14 @@ responses and its own connection copy for network errors and 5xx.
   `http://localhost:3000`) on **every** route, including the SSE stream and
   error responses, and answers preflight requests allowing the
   `Last-Event-ID` request header. There are no cookies
-  (`Access-Control-Allow-Credentials` is not needed) and no auth in v1.
+  (`Access-Control-Allow-Credentials` is not needed) and no auth in v1: the
+  API is meant for localhost only. Non-`GET` requests from any other origin
+  are refused with `403 forbidden_origin` (see [Errors](#errors)).
+- A refused **preflight** (an origin, method or request header that is not
+  allowed) is `400` with the usual body, e.g.
+  `{"detail": "Disallowed CORS origin.", "code": "cors_rejected"}`. It
+  carries no `Access-Control-Allow-Origin`, so the browser never exposes
+  it; it is there for curl and logs.
 
 ## Types
 
@@ -153,7 +163,7 @@ export interface ApiClient {
 | `streamEvents(runId, onEvent, signal)` | `GET /runs/{id}/events` (`Accept: text/event-stream`) | `200` SSE stream of `RunEvent`, see below |
 | `getTransforms(runId)` | `GET /runs/{id}/transforms` | `200` `Transform[]`, see below |
 | `getPreview(runId, { offset, limit })` | `GET /runs/{id}/preview?offset=<n>&limit=<n>` | `200` `DataPreview`, see below; `409` before `loaded` |
-| `getEvalSummary()` | `GET /evals/summary` | `200` `EvalSummary` |
+| `getEvalSummary()` | `GET /evals/summary` | `200` `EvalSummary`; `404` `no_evals` before any eval run |
 
 Path parameters are URL-encoded. Unknown run ids return `404`.
 
@@ -163,6 +173,9 @@ Path parameters are URL-encoded. Unknown run ids return `404`.
   may also check the content). Anything else is `415`.
 - Size limit: **100 MB**; larger uploads are `413`.
 - An unknown `table` or an unparseable file is `422`.
+- A `.parquet` file is also `422` (`too_large_decoded`) when its footer
+  declares more than 5,000,000 rows or more than 1 GiB of decoded data: a
+  small, highly compressed file can expand far beyond 100 MB in memory.
 - The new run's `rows` is `null` until the file has been profiled.
 
 ### Run summaries

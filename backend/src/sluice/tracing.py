@@ -2,8 +2,10 @@
 
 Export is opt-in: `setup_tracing` installs an SDK `TracerProvider` with a batching OTLP/HTTP
 exporter only when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set (e.g. ``http://127.0.0.1:56006`` for
-the local Phoenix of ``make up-obs``; the exporter appends ``/v1/traces``). Otherwise the API's
-no-op provider stays in place and every span below costs a few attribute writes and nothing else.
+the local Phoenix of ``make up-obs``; ``/v1/traces`` is appended), in the process environment
+or, failing that, in ``backend/.env`` (only the two ``OTEL_*`` keys are read from it). Otherwise
+the API's no-op provider stays in place and every span below costs a few attribute writes and
+nothing else.
 
 Span tree of one run (names fixed; docs/api and Plan 4 Task 7)::
 
@@ -22,7 +24,6 @@ can echo a key), so no exception event is added either.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import Final, Literal
@@ -30,8 +31,11 @@ from typing import Final, Literal
 from opentelemetry import trace
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 from opentelemetry.util.types import AttributeValue
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["Step", "setup_tracing", "span", "step_span"]
+from sluice.settings import ENV_FILE
+
+__all__ = ["ENV_FILE", "Step", "setup_tracing", "span", "step_span"]
 
 ENDPOINT_ENV: Final = "OTEL_EXPORTER_OTLP_ENDPOINT"
 SERVICE_NAME_ENV: Final = "OTEL_SERVICE_NAME"
@@ -45,16 +49,34 @@ _tracer = trace.get_tracer(TRACER_NAME)
 _installed = False
 
 
+class _TracingEnv(BaseSettings):
+    """Only the two ``OTEL_*`` keys; every other line of the env file (secrets) is ignored."""
+
+    model_config = SettingsConfigDict(extra="ignore", frozen=True, hide_input_in_errors=True)
+
+    otel_exporter_otlp_endpoint: str = ""
+    otel_service_name: str = ""
+
+
+def _tracing_env() -> _TracingEnv:
+    """Process environment first, then ``ENV_FILE`` (a missing file is fine)."""
+    return _TracingEnv(_env_file=ENV_FILE, _env_file_encoding="utf-8")  # pyright: ignore[reportCallIssue]
+
+
 def setup_tracing(service_name: str = "sluice") -> None:
     """Install the OTLP/HTTP exporting provider once, when an endpoint is configured.
 
     Idempotent: later calls do nothing (the API accepts one global provider per process). With
-    ``OTEL_EXPORTER_OTLP_ENDPOINT`` unset or blank nothing is installed and spans stay no-ops.
-    ``OTEL_SERVICE_NAME``, when set, overrides ``service_name``. Spans are exported from a
-    background thread in batches; the SDK flushes them at interpreter exit.
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` unset or blank (environment and ``backend/.env``) nothing is
+    installed and spans stay no-ops. ``OTEL_SERVICE_NAME``, when set, overrides ``service_name``.
+    Spans are exported from a background thread in batches; the SDK flushes them at exit.
     """
     global _installed
-    if _installed or not os.environ.get(ENDPOINT_ENV, "").strip():
+    if _installed:
+        return
+    env = _tracing_env()
+    endpoint = env.otel_exporter_otlp_endpoint.strip()
+    if not endpoint:
         return
     # Imported here: a process without an endpoint never loads the SDK or the exporter.
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -62,9 +84,11 @@ def setup_tracing(service_name: str = "sluice") -> None:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    name = os.environ.get(SERVICE_NAME_ENV, "").strip() or service_name
+    name = env.otel_service_name.strip() or service_name
     provider = TracerProvider(resource=Resource.create({SERVICE_NAME: name}))
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    # Explicit endpoint: the exporter only appends /v1/traces itself when it reads the variable.
+    exporter = OTLPSpanExporter(endpoint=f"{endpoint.rstrip('/')}/v1/traces")
+    provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
     _installed = True
 

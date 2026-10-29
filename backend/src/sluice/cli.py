@@ -51,7 +51,7 @@ class SplitName(StrEnum):
 @app.callback()
 def main() -> None:
     """Sluice: a self-planning agentic data pipeline."""
-    tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
+    tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set (env or .env)
 
 
 def environment() -> dict[str, str]:

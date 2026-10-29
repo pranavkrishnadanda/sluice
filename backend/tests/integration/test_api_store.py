@@ -311,6 +311,38 @@ def test_interrupted_lists_running_runs(store: RunStore) -> None:
     assert [r.id for r in store.interrupted()] == ["r1"]
 
 
+def test_worker_lock_is_held_by_one_store_per_schema_until_released(store: RunStore) -> None:
+    """Minor 7: a second API process on the same database gets no worker lock."""
+    other = RunStore(store._dsn)  # same DSN = same schema: a second API process
+    first = store.try_worker_lock()
+    assert first is not None
+    try:
+        assert other.try_worker_lock() is None
+    finally:
+        first.release()
+    again = other.try_worker_lock()
+    assert again is not None
+    again.release()
+
+
+def test_worker_lock_is_per_schema(store: RunStore, settings: Settings) -> None:
+    """Test schemas (and a dev API on ``public``) never contend for each other's lock."""
+    mine = store.try_worker_lock()
+    assert mine is not None
+    schema = f"t_api_{secrets.token_hex(4)}"
+    with psycopg.connect(settings.postgres_dsn, connect_timeout=5, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')  # generated identifier, not user input
+    try:
+        options = quote(f"-csearch_path={schema}", safe="")
+        elsewhere = RunStore(f"{settings.postgres_dsn}?options={options}").try_worker_lock()
+        assert elsewhere is not None
+        elsewhere.release()
+    finally:
+        mine.release()
+        with psycopg.connect(settings.postgres_dsn, connect_timeout=5, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
 # --------------------------------------------------------------------------------------------
 # S3BlobStore on RustFS
 # --------------------------------------------------------------------------------------------

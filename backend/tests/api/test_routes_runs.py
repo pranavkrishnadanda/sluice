@@ -27,10 +27,13 @@ from sluice.agent.events import EventLog, EventModel
 from sluice.api.app import create_app
 from sluice.api.blobs import LocalBlobStore
 from sluice.api.routes_runs import (
+    DECODED_TOO_LARGE_DETAIL,
     MAX_FIELD_BYTES,
+    MAX_PART_HEADER_BYTES,
     PREVIEW_SAVE_GRACE_S,
     TOO_LARGE_DETAIL,
     sanitise_file_name,
+    too_large_detail,
     upload_extension,
 )
 from sluice.api.schemas import RunSummary
@@ -271,6 +274,48 @@ def test_post_runs_oversized_table_field_is_422(client: TestClient, store: Route
     assert store.runs == {}
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        'Content-Disposition: form-data; name="table"; x="' + "a" * MAX_PART_HEADER_BYTES + '"',
+        "X-" + "n" * MAX_PART_HEADER_BYTES + ": v",
+    ],
+    ids=["long-value", "long-name"],
+)
+def test_post_runs_part_header_over_8kib_is_422(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore, header: str
+) -> None:
+    boundary = "b0undary"
+    body = f"--{boundary}\r\n{header}\r\n\r\norders\r\n--{boundary}--\r\n".encode()
+    res = client.post(
+        "/runs", content=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    )
+    assert res.status_code == 422
+    assert res.json()["code"] == "invalid_request"
+    assert "header" in res.json()["detail"]
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_part_header_just_under_8kib_is_accepted(client: TestClient) -> None:
+    name = "o" * (MAX_PART_HEADER_BYTES - 200) + ".csv"
+    res = _post(client, name=name)
+    assert res.status_code == 201
+    assert len(res.json()["fileName"]) == 255  # the display name is still capped
+
+
+def test_part_header_buffer_refuses_growth_past_the_cap() -> None:
+    from sluice.api.routes_runs import BadForm, _append_capped
+
+    buffer = bytearray(b"x" * MAX_PART_HEADER_BYTES)
+    with pytest.raises(BadForm, match="8 KiB"):
+        _append_capped(buffer, b"y", "a header value")
+    assert len(buffer) == MAX_PART_HEADER_BYTES
+
+
+def test_part_header_cap_is_8_kib() -> None:
+    assert MAX_PART_HEADER_BYTES == 8 * 1024
+
+
 @pytest.mark.parametrize("name", ["orders.txt", "orders", "orders.csv.exe", "orders.xlsx"])
 def test_post_runs_unsupported_extension_is_415(
     client: TestClient, store: RouteStore, blobs: LocalBlobStore, name: str
@@ -298,6 +343,29 @@ def test_post_runs_unparseable_is_422_and_blob_deleted(
     _assert_nothing_kept(store, blobs)
 
 
+def test_post_runs_parquet_declaring_too_much_data_is_422_too_large_decoded(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling F3p4: a few KB of Parquet declaring 5M+ rows is refused from its footer."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from sluice import io as sluice_io
+
+    buffer = io.BytesIO()
+    pq.write_table(pa.table({"o_orderkey": pa.nulls(sluice_io.MAX_PARQUET_ROWS + 1)}), buffer)
+    assert len(buffer.getvalue()) < 64 * 1024
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("no full read of a refused upload")
+
+    monkeypatch.setattr(sluice_io.pl, "read_parquet", refuse)
+    res = _post(client, name="bomb.parquet", data=buffer.getvalue())
+    assert res.status_code == 422
+    assert res.json() == {"detail": DECODED_TOO_LARGE_DETAIL, "code": "too_large_decoded"}
+    _assert_nothing_kept(store, blobs)
+
+
 def test_post_runs_too_large_is_413_with_contract_detail(
     store: RouteStore, blobs: LocalBlobStore
 ) -> None:
@@ -305,9 +373,36 @@ def test_post_runs_too_large_is_413_with_contract_detail(
     with TestClient(app, raise_server_exceptions=False) as client:
         res = _post(client, data=b"a,b\n" + b"1,2\n" * 300)
     assert res.status_code == 413
-    assert res.json() == {"detail": TOO_LARGE_DETAIL, "code": "too_large"}
-    assert TOO_LARGE_DETAIL == "File too large: the limit is 100 MB."
+    assert res.json() == {"detail": "File too large: the limit is 1000 bytes.", "code": "too_large"}
     _assert_nothing_kept(store, blobs)
+
+
+def test_too_large_detail_at_the_default_limit_is_the_contract_copy() -> None:
+    assert too_large_detail(MAX_UPLOAD_BYTES) == "File too large: the limit is 100 MB."
+    assert too_large_detail(MAX_UPLOAD_BYTES) == TOO_LARGE_DETAIL
+
+
+@pytest.mark.parametrize(
+    ("limit", "detail"),
+    [
+        (250 * 1024 * 1024, "File too large: the limit is 250 MB."),
+        (int(1.5 * 1024 * 1024), "File too large: the limit is 1.5 MB."),
+        (64 * 1024, "File too large: the limit is 64 KB."),
+        (1000, "File too large: the limit is 1000 bytes."),
+    ],
+)
+def test_too_large_detail_follows_max_upload_bytes(limit: int, detail: str) -> None:
+    assert too_large_detail(limit) == detail
+
+
+def test_post_runs_too_large_detail_names_a_configured_limit(
+    store: RouteStore, blobs: LocalBlobStore
+) -> None:
+    app = _app(store, blobs, max_upload_bytes=1024 * 1024)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        res = _post(client, data=b"a\n" + b"1\n" * (600 * 1024))
+    assert res.status_code == 413
+    assert res.json()["detail"] == "File too large: the limit is 1 MB."
 
 
 def test_post_runs_path_traversal_name_is_sanitised(
@@ -463,6 +558,75 @@ def test_post_runs_oversized_non_file_parts_are_413(
 
 
 # --------------------------------------------------------------------------------------------
+# POST /runs: Origin guard (Ruling F2p4; a cross-site form POST is a CORS "simple request")
+# --------------------------------------------------------------------------------------------
+
+EVIL_ORIGIN = "https://evil.example"
+
+
+def test_post_runs_from_foreign_origin_is_403_and_nothing_stored(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore, worker: FakeWorker
+) -> None:
+    res = client.post(
+        "/runs",
+        files={"file": ("orders.csv", CSV, "text/csv")},
+        data={"table": "orders"},
+        headers={"Origin": EVIL_ORIGIN},
+    )
+    assert res.status_code == 403
+    assert res.json() == {"detail": "Origin not allowed.", "code": "forbidden_origin"}
+    assert worker.notified == 0
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_from_foreign_origin_is_refused_before_reading_the_body(
+    store: RouteStore, blobs: LocalBlobStore
+) -> None:
+    body = CountingBody(4 * CHUNK)
+    origin = [(b"origin", EVIL_ORIGIN.encode())]
+    status, payload = asyncio.run(_drive(_app(store, blobs), body, origin))
+    assert (status, payload["code"]) == (403, "forbidden_origin")
+    assert body.pulled == 0
+    _assert_nothing_kept(store, blobs)
+
+
+@pytest.mark.parametrize("origin", ["null", "http://localhost:3000.evil.example", "HTTP://x"])
+def test_post_runs_from_odd_origins_is_403(
+    client: TestClient, store: RouteStore, origin: str
+) -> None:
+    res = client.post(
+        "/runs",
+        files={"file": ("orders.csv", CSV, "text/csv")},
+        data={"table": "orders"},
+        headers={"Origin": origin},
+    )
+    assert res.status_code == 403
+    assert store.runs == {}
+
+
+def test_post_runs_from_ui_origin_is_201_with_cors_header(client: TestClient) -> None:
+    ui = "http://localhost:3000"
+    res = client.post(
+        "/runs",
+        files={"file": ("orders.csv", CSV, "text/csv")},
+        data={"table": "orders"},
+        headers={"Origin": ui},
+    )
+    assert res.status_code == 201
+    assert res.headers["access-control-allow-origin"] == ui
+
+
+def test_post_runs_without_origin_is_allowed(client: TestClient) -> None:
+    assert _post(client).status_code == 201  # curl, the CLI and scripts send no Origin
+
+
+def test_get_runs_from_foreign_origin_keeps_cors_only_behaviour(client: TestClient) -> None:
+    res = client.get("/runs", headers={"Origin": EVIL_ORIGIN})
+    assert res.status_code == 200
+    assert "access-control-allow-origin" not in res.headers
+
+
+# --------------------------------------------------------------------------------------------
 # File names
 # --------------------------------------------------------------------------------------------
 
@@ -477,6 +641,9 @@ def test_post_runs_oversized_non_file_parts_are_413(
         ("", "upload.csv"),
         ("../", "upload.csv"),
         ("\x00\x01", "upload.csv"),
+        ("photo\u202egpj.csv", "photogpj.csv"),  # RIGHT-TO-LEFT OVERRIDE: display spoofing
+        ("\u2066a\u2069\u200bb\ufeff.csv", "ab.csv"),  # isolates, zero-width space, BOM
+        ("\u202a\u202b\u202c\u202d", "upload.csv"),
     ],
 )
 def test_sanitise_file_name_cases(raw: str, expected: str) -> None:

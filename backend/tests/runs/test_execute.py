@@ -146,6 +146,35 @@ def test_execute_run_unreadable_file_starts_with_null_rows(tmp_path: Path) -> No
     assert emitted[-1].status == "failed"  # type: ignore[attr-defined]
 
 
+def test_execute_run_decompression_bomb_fails_before_any_full_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling F3p4: the worker's run refuses a Parquet whose footer declares too much data."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from sluice import io as sluice_io
+    from sluice.runs.execute import DECODED_TOO_LARGE_SUMMARY
+
+    path = tmp_path / "bomb.parquet"
+    pq.write_table(pa.table({"o_orderkey": pa.nulls(sluice_io.MAX_PARQUET_ROWS + 1)}), path)
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("no full read of a refused file")
+
+    monkeypatch.setattr(sluice_io.pl, "read_parquet", refuse)
+    ran: list[object] = []
+    loads = Loads()
+    emitted: list[EventModel] = []
+    with pytest.raises(sluice_io.DecodedTooLarge):
+        _execute(path, ran.append, emitted.append, loads=loads)
+    assert ran == [] and loads.calls == []
+    assert _types(emitted) == ["run_started", "run_finished"]
+    assert emitted[0].rows is None  # type: ignore[attr-defined]
+    assert emitted[-1].status == "failed"  # type: ignore[attr-defined]
+    assert emitted[-1].summary == DECODED_TOO_LARGE_SUMMARY  # type: ignore[attr-defined]
+
+
 def test_execute_run_one_run_id_end_to_end(indian: Case) -> None:
     emitted: list[EventModel] = []
     loads = Loads()

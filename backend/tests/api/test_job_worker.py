@@ -344,6 +344,46 @@ def test_worker_terminal_adopted_on_resync_reaches_live_subscribers_once(
     assert store.finished == [("r1", "succeeded", 0.0)]
 
 
+def test_worker_resynced_events_count_in_the_running_cost_and_progress(
+    blobs: LocalBlobStore,
+) -> None:
+    """T4 deferred minor: an event found on resync is tracked like any other (cost, loaded)."""
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    store.commit_then_fail = lambda e: e.type == "node_finished"  # type: ignore[attr-defined]
+    events = [started("r1"), node_finished("n1", 0.25), finished()]
+    _run(lambda: _drive(store, blobs, scripted(events), "r1"))
+
+    assert store.types("r1") == ["run_started", "node_finished", "run_finished"]
+    (terminal,) = store.terminals("r1")
+    assert (terminal.status, terminal.cost_usd) == ("failed", 0.25)
+    assert ("r1", None, 0.25) in store.progress
+    assert store.finished == [("r1", "failed", 0.25)]
+
+
+def test_worker_resynced_loaded_sets_the_loaded_flag(blobs: LocalBlobStore) -> None:
+    from sluice.api.worker import _RunState
+
+    store = FakeStore()
+    store.add("r1", status="running")
+    log = EventLog()
+    store.append_event("r1", log.emit(started("r1")))
+    loaded = log.emit(ev.Loaded(rows_loaded=2, rows_quarantined=0, snapshot_id="42"))
+    store.append_event("r1", loaded)  # stored, but its emit reported a failure
+    state = _RunState("orders.csv")
+    state.seq = 1
+
+    async def go() -> None:  # the hub publishes onto the running loop
+        worker = _worker(store, blobs, EventHub(), scripted([]))
+        worker._close_failed("r1", state, "ConnectionError")
+
+    _run(go)
+
+    assert state.loaded is True
+    assert store.types("r1") == ["run_started", "loaded", "run_finished"]
+
+
 def test_worker_run_closed_after_its_run_finished_still_finishes_the_run(
     blobs: LocalBlobStore,
 ) -> None:
@@ -1036,3 +1076,38 @@ def test_recover_run_holding_run_finished_after_loaded_answers_no_preview(
 
     assert store.get_run("r1").status == "succeeded"  # type: ignore[union-attr]
     assert _preview_code(store, blobs) == "no_preview"
+
+
+# --------------------------------------------------------------------------------------------
+# Decompression bomb (Ruling F3p4): refused from the footer before the worker reads the file
+# --------------------------------------------------------------------------------------------
+
+
+def test_worker_fails_a_parquet_bomb_without_reading_it(
+    blobs: LocalBlobStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io as std_io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from sluice import io as sluice_io
+    from sluice.runs.execute import DECODED_TOO_LARGE_SUMMARY
+
+    store = FakeStore()
+    store.add("r1")
+    buffer = std_io.BytesIO()
+    pq.write_table(pa.table({"o_orderkey": pa.nulls(sluice_io.MAX_PARQUET_ROWS + 1)}), buffer)
+    row = store.runs["r1"]
+    store.runs["r1"] = row.model_copy(update={"blob_key": "uploads/r1/input.parquet"})
+    blobs.put_bytes("uploads/r1/input.parquet", buffer.getvalue())
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("the worker must not read a refused file in full")
+
+    monkeypatch.setattr(sluice_io.pl, "read_parquet", refuse)
+    _run(lambda: _drive(store, blobs, execute_run, "r1"))
+    assert store.types("r1") == ["run_started", "run_finished"]
+    terminal = store.events_after("r1", 0)[-1]
+    assert (terminal.status, terminal.summary) == ("failed", DECODED_TOO_LARGE_SUMMARY)  # type: ignore[attr-defined]
+    assert store.get_run("r1").status == "failed"  # type: ignore[union-attr]

@@ -13,7 +13,8 @@ Upload (``docs/api/contract.md``, "Upload"):
   displayed (:func:`sanitise_file_name`) and never touches a path.
 * Order: ``unknown table`` is known as soon as the ``table`` field arrives (before the file when
   the client sends it first); the extension is checked on the file part's headers, before any
-  of its bytes are stored. After the stream: parse check (``read_input``) and SHA-256 in a
+  of its bytes are stored. After the stream: parse check (``read_input``, which checks a
+  Parquet footer for a decompression bomb before reading the data) and SHA-256 in a
   thread, then the row is inserted and the worker is woken. Any failure after the blob was
   written deletes it.
 
@@ -45,9 +46,10 @@ from sluice.agent.events import TableName
 from sluice.api.blobs import BlobStore, TooLarge
 from sluice.api.errors import ApiError
 from sluice.api.schemas import DataPreview, RunSummary, Transform
+from sluice.api.settings import MAX_UPLOAD_BYTES
 from sluice.api.store import MAX_FILE_NAME_CHARS, TERMINAL_STATUSES, RunRow, RunStore
 from sluice.contracts.model import Contract, load_contract
-from sluice.io import read_input
+from sluice.io import DecodedTooLarge, read_input
 from sluice.runs.execute import file_sha256
 from sluice.runs.preview import PREVIEW_MAX_LIMIT, page_preview
 
@@ -56,18 +58,44 @@ _log = logging.getLogger(__name__)
 router = APIRouter()
 
 ALLOWED_EXTENSIONS: Final = (".csv", ".json", ".parquet")
+STRIPPED_CATEGORIES: Final = frozenset({"Cc", "Cf"})
+"""Unicode categories removed from display names: controls and format (bidi) characters."""
 TABLES: Final = frozenset(get_args(TableName))
 LIST_LIMIT: Final = 100
 MAX_FIELD_BYTES: Final = 1024
 """Longest accepted ``table`` field value (the real values are 6-8 bytes)."""
 MAX_PARTS: Final = 16
+MAX_PART_HEADER_BYTES: Final = 8 * 1024
+"""Longest multipart part header (name or value, and the whole line for python-multipart's own
+check); 422 ``invalid_request`` above it. HTTP request headers are uvicorn's concern."""
+MAX_PART_HEADERS: Final = 8
+"""Headers per multipart part (python-multipart's default, pinned here)."""
 MULTIPART_OVERHEAD: Final = 64 * 1024
 """Body bytes allowed on top of the file limit: boundaries, part headers, the ``table`` field."""
 MAX_OFFSET: Final = 2**31 - 1
-TOO_LARGE_DETAIL: Final = "File too large: the limit is 100 MB."
+_SIZE_UNITS: Final = (("MB", 1024 * 1024), ("KB", 1024))
+
+
+def too_large_detail(limit_bytes: int) -> str:
+    """The 413 copy for ``max_upload_bytes``: ``"File too large: the limit is 100 MB."``.
+
+    MB/KB are binary multiples (the contract's 100 MB is 100 x 2**20 bytes), rounded to one
+    decimal; below 1 KB the limit is given in bytes.
+    """
+    for unit, size in _SIZE_UNITS:
+        if limit_bytes >= size:
+            return f"File too large: the limit is {round(limit_bytes / size, 1):g} {unit}."
+    return f"File too large: the limit is {limit_bytes} bytes."
+
+
+TOO_LARGE_DETAIL: Final = too_large_detail(MAX_UPLOAD_BYTES)
+"""The 413 copy at the default limit (the contract's)."""
 UNSUPPORTED_DETAIL: Final = "Unsupported file format: upload a .csv, .json or .parquet file."
 UNKNOWN_TABLE_DETAIL: Final = "Unknown table: choose orders or lineitem."
 UNPARSEABLE_DETAIL: Final = "The file could not be read in its format."
+DECODED_TOO_LARGE_DETAIL: Final = (
+    "File too large once decoded: the limit is 5,000,000 rows or 1 GiB of data."
+)
 RUN_NOT_FOUND: Final = "Run not found."
 NOT_LOADED_DETAIL: Final = "The preview is available once the run has loaded its data."
 NOT_READY_DETAIL: Final = "The preview is not ready yet."
@@ -98,13 +126,17 @@ def upload_extension(name: str) -> str | None:
 
 
 def sanitise_file_name(raw: str, ext: str) -> str:
-    """The display name: basename only, no control characters, NFC, at most 255 characters.
+    """The display name: basename only, no control or format characters, NFC, <= 255 chars.
+
+    Format characters (``Cf``: bidi overrides and isolates such as U+202E, zero-width spaces,
+    BOM) are removed with the controls: ``"photo<U+202E>gpj.csv"`` would otherwise display as
+    ``photovsc.jpg``. This also drops ZWJ/ZWNJ, which only changes how some names render.
 
     Both ``/`` and ``\\`` separate path components (browsers on Windows may send either). An
     over-long name is cut in its stem so the extension survives. Empty -> ``"upload<ext>"``.
     """
     name = raw.replace("\\", "/").rsplit("/", 1)[-1]
-    name = "".join(ch for ch in name if unicodedata.category(ch) != "Cc")
+    name = "".join(ch for ch in name if unicodedata.category(ch) not in STRIPPED_CATEGORIES)
     name = unicodedata.normalize("NFC", name).strip()
     if name in ("", ".", ".."):
         return f"upload{ext}"
@@ -155,7 +187,8 @@ class MultipartStream:
 
     Raises (from :meth:`next`): :class:`TooLarge` once more than ``max_total`` body bytes have
     arrived, :class:`BadForm` for malformed bodies, a second ``file`` part, an over-long
-    ``table`` value, too many parts or a body that ends mid-way.
+    ``table`` value or part header (:data:`MAX_PART_HEADER_BYTES`), too many parts or a body
+    that ends mid-way. Memory: O(one chunk + MAX_PART_HEADER_BYTES).
     """
 
     def __init__(self, chunks: AsyncIterator[bytes], boundary: bytes, max_total: int) -> None:
@@ -184,6 +217,8 @@ class MultipartStream:
                 "on_headers_finished": self._on_headers_finished,
                 "on_end": self._on_end,
             },
+            max_header_size=MAX_PART_HEADER_BYTES,
+            max_header_count=MAX_PART_HEADERS,
         )
 
     async def next(self) -> Event | None:
@@ -204,7 +239,7 @@ class MultipartStream:
             try:
                 self._parser.write(chunk)
             except FormParserError as exc:
-                raise BadForm("malformed multipart body") from exc
+                raise BadForm(_parse_error_reason(exc)) from exc
         return self._pending.popleft()
 
     # parser callbacks (synchronous, called from ``write``) ----------------------------------
@@ -218,10 +253,10 @@ class MultipartStream:
         self._field.clear()
 
     def _on_header_field(self, data: bytes, start: int, end: int) -> None:
-        self._header_name += data[start:end]
+        _append_capped(self._header_name, data[start:end], "a multipart part header name")
 
     def _on_header_value(self, data: bytes, start: int, end: int) -> None:
-        self._header_value += data[start:end]
+        _append_capped(self._header_value, data[start:end], "a multipart part header value")
 
     def _on_header_end(self) -> None:
         if bytes(self._header_name).lower() == b"content-disposition":
@@ -261,6 +296,23 @@ class MultipartStream:
 
     def _on_end(self) -> None:
         self._ended = True
+
+
+def _parse_error_reason(exc: FormParserError) -> str:
+    """User-facing reason for a python-multipart error (its text is the library's own)."""
+    if "header" in str(exc).lower():
+        return (
+            f"a multipart part header is longer than {MAX_PART_HEADER_BYTES // 1024} KiB "
+            f"or a part has more than {MAX_PART_HEADERS} headers"
+        )
+    return "malformed multipart body"
+
+
+def _append_capped(buffer: bytearray, data: bytes, what: str) -> None:
+    """Grow a part-header buffer, refusing more than :data:`MAX_PART_HEADER_BYTES` in it."""
+    if len(buffer) + len(data) > MAX_PART_HEADER_BYTES:
+        raise BadForm(f"{what} is longer than {MAX_PART_HEADER_BYTES // 1024} KiB")
+    buffer += data
 
 
 async def _file_chunks(form: MultipartStream) -> AsyncIterator[bytes]:
@@ -340,10 +392,17 @@ async def _receive(
 
 
 def _check_and_hash(blobs: BlobStore, key: str) -> str:
-    """Parse-check the stored upload and return its SHA-256 (blocking)."""
+    """Parse-check the stored upload and return its SHA-256 (blocking).
+
+    A Parquet file is first checked from its footer (``read_input`` -> ``check_decoded_size``,
+    Ruling F3p4), so a decompression bomb is refused without being read in full.
+    """
     with blobs.open_local(key) as path:
         try:
             read_input(path)
+        except DecodedTooLarge:
+            _log.info("upload %s declares too much data", key)
+            raise ApiError(422, DECODED_TOO_LARGE_DETAIL, "too_large_decoded") from None
         except MemoryError:
             raise
         except Exception as exc:  # polars, decoding and shape errors alike mean "unparseable"
@@ -391,7 +450,7 @@ async def create_run(request: Request) -> RunSummary:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(_delete_quietly, blobs, written)
         if isinstance(exc, TooLarge):
-            raise ApiError(413, TOO_LARGE_DETAIL, "too_large") from None
+            raise ApiError(413, too_large_detail(limit), "too_large") from None
         if isinstance(exc, BadForm):
             raise ApiError(422, f"Invalid upload: {exc}.", "invalid_request") from None
         raise
