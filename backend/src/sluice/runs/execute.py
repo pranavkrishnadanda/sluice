@@ -67,6 +67,7 @@ __all__ = [
     "RunOutcome",
     "execute_run",
     "file_sha256",
+    "join_summary",
     "replayed",
     "resolve_run_fn",
 ]
@@ -157,6 +158,17 @@ def _output_status(out: SystemOutput, final: RunFinished | None) -> Status:
     if final is not None:
         return final.status
     return "quarantined" if out.file_quarantined or out.quarantined else "succeeded"
+
+
+def join_summary(first: str, second: str) -> str:
+    """``first; second`` without repeating a ``;``-separated clause ``first`` already has.
+
+    The pipeline's own summary of a file of another table already ends "nothing loaded"
+    (Ruling H5), so the load's "nothing loaded; the file can be retried" adds only the rest.
+    """
+    seen = {clause.strip() for clause in first.split(";")}
+    extra = [c.strip() for c in second.split(";") if c.strip() and c.strip() not in seen]
+    return "; ".join([first, *extra]) if extra else first
 
 
 def _skip_summary(result: LoadResult) -> str:
@@ -335,7 +347,7 @@ def _run_and_load(
             " (recovered an earlier commit)" if result.recovered else ""
         )
     if final is not None and not result.skipped:
-        summary = f"{final.summary}; {summary}"
+        summary = join_summary(final.summary, summary)
     final_status: Status = "succeeded" if result.skipped else status
     outcome = RunOutcome(result, final_status, out, log.cost, log.tokens)
     return _Ending(outcome, loaded, log.finished(final_status, summary))

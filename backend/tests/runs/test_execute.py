@@ -290,3 +290,53 @@ def test_execute_run_without_on_transform_gives_the_system_none(indian: Case) ->
 
     _execute(indian.input_path, system, lambda _e: None)
     assert seen == [None]
+
+
+# --- round 2: a whole-file quarantine summary says "nothing loaded" once --------------------
+
+
+def _quarantined_whole(summary: str) -> Any:
+    from sluice.agent.events import EventLog, RunFinished
+
+    final = RunFinished(status="quarantined", summary=summary, cost_usd=0.0, tokens=0)
+
+    def run_fn(case: CaseInput) -> SystemOutput:
+        return SystemOutput(
+            df=pl.DataFrame(schema=case.contract.polars_schema()),
+            flags=set(),
+            quarantined=set(),
+            file_quarantined=True,
+            cost_usd=0.0,
+            latency_s=0.0,
+            meta={"events": [EventLog().emit(final).to_dict()], "tokens": 0},
+        )
+
+    return run_fn
+
+
+def test_execute_run_whole_file_quarantine_summary_says_nothing_loaded_once(
+    indian: Case,
+) -> None:
+    emitted: list[EventModel] = []
+    mismatch = "this looks like a lineitem file, not orders; nothing loaded"
+
+    _execute(
+        indian.input_path, _quarantined_whole(mismatch), emitted.append, loads=Loads(snapshot=None)
+    )
+
+    summary = emitted[-1].summary  # type: ignore[attr-defined]
+    assert summary == f"{mismatch}; the file can be retried"
+
+
+def test_execute_run_whole_file_quarantine_summary_keeps_its_own_reason(indian: Case) -> None:
+    emitted: list[EventModel] = []
+
+    _execute(
+        indian.input_path,
+        _quarantined_whole("file quarantined: node n1 failed"),
+        emitted.append,
+        loads=Loads(snapshot=None),
+    )
+
+    summary = emitted[-1].summary  # type: ignore[attr-defined]
+    assert summary == "file quarantined: node n1 failed; nothing loaded; the file can be retried"
