@@ -3,8 +3,7 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useId, useRef } from "react";
 import type { RawInput } from "@/lib/api/types";
-import { formatCount } from "@/lib/format";
-import { DATA_ROW_HEIGHT, fixedRect, MoreStatus } from "./DataTab";
+import { DATA_ROW_HEIGHT, fixedRect, MoreStatus, rowsCaption } from "./DataTab";
 
 const OVERSCAN = 8;
 /** Request the next page when the window is this close to the loaded end. */
@@ -24,15 +23,6 @@ export interface InputTabProps {
   sample?: boolean;
   /** Fixed viewport height in px; tests only (jsdom has no layout). */
   viewportHeight?: number;
-}
-
-function caption(loaded: number, total: number, sample: boolean): string {
-  const rows = sample ? "sample rows" : "rows";
-  const count =
-    loaded < total
-      ? `${formatCount(loaded)} of ${formatCount(total)} ${rows}`
-      : `${formatCount(total)} ${rows}`;
-  return sample ? `Sample run · ${count}` : count;
 }
 
 /**
@@ -99,7 +89,13 @@ export function InputTab({
           </span>
         </div>
         <p id={captionId} className="text-pretty text-muted text-xs leading-5">
-          {caption(input.rows.length, input.totalRows, sample)}
+          {/* Same wording as the preview's caption; nothing has loaded. */}
+          {rowsCaption(
+            input.rows.length,
+            input.totalRows,
+            hasMore || input.rows.length < input.totalRows,
+            sample,
+          )}
           {" · "}
           {neverLoaded
             ? "This run didn’t load any data, so there is no before/after preview."

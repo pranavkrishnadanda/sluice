@@ -80,7 +80,9 @@ describe("raw uploaded file in the Data tab", () => {
       expect(within(table).getAllByRole("row").length).toBeGreaterThan(3),
     );
     expect(within(table).getAllByRole("row")[1]).toHaveTextContent(/^1/);
-    expect(screen.getByText(/1,000 of 48,210 rows/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/^Showing 1,000 of 48,210 uploaded rows · /),
+    ).toBeInTheDocument();
     expect(getPreview).not.toHaveBeenCalled();
   });
 
@@ -161,7 +163,7 @@ describe("raw uploaded file in the Data tab", () => {
     );
     await screen.findByRole("table", { name: "Uploaded file" });
     expect(
-      screen.getByText(/Sample run · 1,000 of 48,210 sample rows/),
+      screen.getByText(/Sample run · showing 1,000 of 48,210 sample rows/),
     ).toBeInTheDocument();
   });
 });
