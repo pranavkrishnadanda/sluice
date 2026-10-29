@@ -1343,3 +1343,13 @@ def test_pipeline_does_not_flag_a_renamed_file_of_the_right_table(medium: Case) 
     result = run(medium, script)
     assert not result.out.file_quarantined
     assert script.roles("mapper")
+
+
+def test_pipeline_paise_factor_error_tells_the_worker_to_divide_unconditionally(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0209", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS, DIVIDE_100]})
+    result = run(case, script)
+    (failed,) = result.events("attempt_failed")
+    assert "unconditionally" in failed.error  # type: ignore[attr-defined]

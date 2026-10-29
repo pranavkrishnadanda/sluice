@@ -516,3 +516,11 @@ def test_sandbox_hint_for_string_methods_called_off_the_str_namespace(
 ) -> None:
     hint = sandbox_hint(error)
     assert hint is not None and good in hint
+
+
+def test_worker_unit_finding_says_divide_unconditionally_not_by_column_name() -> None:
+    finding = "values look like paise: 100% whole numbers, median 3427380"
+    prompt = build_worker_prompt(NODE, SPEC, "amount", ["3,42,73,80"], None, finding)
+    assert "unconditionally" in prompt
+    assert "values.name" in prompt
+    assert "never branch on `values.name`" in WORKER_SYSTEM_PROMPT

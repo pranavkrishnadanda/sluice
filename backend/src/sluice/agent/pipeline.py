@@ -789,7 +789,8 @@ def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
         return (
             f"the values are in paise, but the rewrite changed the median by a factor of "
             f"{factor:.2f} (from {before.median:.2f} to {after.median:.2f}); divide every value "
-            f"by 100 (expected factor {UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
+            f"by 100 unconditionally, without checking the column name (expected factor "
+            f"{UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
         )
     return None
 

@@ -111,7 +111,9 @@ Write a module that defines exactly `def {TRANSFORM_SIGNATURE}:` at top level.
   (also with surrounding whitespace) carry no information and must become null.
 - Output text in the exact format given under "target format"; a deterministic parser reads it.
 - The source column name may carry unit hints (e.g. `_paise` or `_cents` = 1/100 of the main
-  unit, `_k` = thousands): convert to the contract unit.
+  unit, `_k` = thousands): convert to the contract unit. Decide the conversion while writing
+  the code and apply it to every value; never branch on `values.name` at runtime (the Series
+  name in the sandbox is not the hint you were shown).
 - You may import only polars, re, decimal, datetime and math. No I/O, no network, no
   environment access, no eval/exec, no dunder attributes. Prefer vectorised polars expressions;
   `map_elements` with return_dtype=pl.String is acceptable for irregular text.
@@ -393,8 +395,10 @@ def build_worker_prompt(
         if finding is None
         else (
             f"Profiler finding for the whole column: {json.dumps(finding)}. Every row is "
-            "rewritten, so convert every value (paise -> rupees: divide by 100, keep 2 "
-            "fractional digits), not only the samples' format.\n"
+            "rewritten, so convert every value (paise -> rupees: divide by 100 "
+            "unconditionally, keep 2 fractional digits), not only the samples' format. Do not "
+            "look at values.name or any column-name suffix to decide: the finding already "
+            "says the values are paise.\n"
         )
     )
     return (
