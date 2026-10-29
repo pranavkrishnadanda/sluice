@@ -143,3 +143,27 @@ screenshot lands in `test-results/screenshots/live-<case>.png`.
 and reformats the whole file. The exclude then keeps a possibly stale e2e build's
 global route types (`PageProps`, `LayoutProps`) out of `bun run typecheck`, so
 only `.next/types` is type-checked.
+
+
+### Demo GIF
+
+`scripts/record-demo.ts` records the README GIF: one real dev case through
+the live UI (upload, live run, Plan, Code and Data tabs, dark then light) at
+1440×900. Run it from the repo root with `make demo-gif`, which also converts
+the video to `docs/media/sluice-demo.gif`. It needs the same API as the
+live-backend e2e (origin 3210 allowed) and stops with a message if the API
+isn't reachable. It builds and serves a UI on 3210 unless one is already
+running there, and a reused UI must call the same API.
+
+Prerequisites: ffmpeg on `PATH` (or `FFMPEG=/path/to/ffmpeg`), Playwright's
+video encoder (`bunx playwright install ffmpeg`, once) and the system Google
+Chrome. Without Chrome, run `bunx playwright install chromium` and set
+`SLUICE_DEMO_CHANNEL=chromium`.
+
+| Variable                | Default                 | Purpose                                       |
+| ----------------------- | ----------------------- | --------------------------------------------- |
+| `SLUICE_DEMO_API_URL`   | `http://localhost:8080` | API the UI is built against                   |
+| `SLUICE_DEMO_CASE`      | `dev-0039`              | Dev case to upload; must not be loaded yet    |
+| `SLUICE_DEMO_CASES_DIR` | `../backend/cases/dev/` | Where the cases live                          |
+| `SLUICE_DEMO_PORT`      | `3210`                  | Port for the UI                               |
+| `SLUICE_DEMO_CHANNEL`   | `chrome`                | Browser channel (`chromium` for Playwright's) |

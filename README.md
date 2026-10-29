@@ -2,11 +2,15 @@
 
 **A self-planning agentic data pipeline for drifting data, measured like production.**
 
+![Sluice web UI running a drifted orders file end to end on the live API: profile, rule fixes, a two-step plan with one repair, contract checks, load, then the Plan, Code and Data tabs, in dark and light mode](docs/media/sluice-demo.gif)
+
+*A real file through the live API: renamed columns, paise and Indian-format numbers, planned, repaired after one failed attempt, verified and loaded (the wait for the models is sped up).*
+
 A file lands with renamed columns, prices in paise instead of rupees, timestamps in IST instead of UTC, three date formats in one column and a few rows pointing at customers that don't exist. Sluice profiles it, **plans its own repair pipeline**, has worker agents write transforms that run in a locked-down sandbox, checks the result against a data contract, repairs what failed, and loads clean data. It records what that cost, how long it took, and exactly which code produced which row.
 
 Every accuracy claim is graded **by code against exact ground truth**, with a baseline, a sample size and a 95% confidence interval.
 
-> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline), the web UI and the LLM agent pipeline (plan 2: LiteLLM routing, sandboxed transforms, verifier, Iceberg load with lineage) are on `main`. The first agent results, on a 30-case dev subset, are below next to the rules-only baseline. The UI runs on a clearly labelled demo backend until the API (plan 4) connects it.
+> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline), the web UI and the LLM agent pipeline (plan 2: LiteLLM routing, sandboxed transforms, verifier, Iceberg load with lineage) are on `main`. The first agent results, on a 30-case dev subset, are below next to the rules-only baseline. The FastAPI + SSE API (plan 4) serves the web UI live: drop a real file and watch it run, with traces in Phoenix.
 
 ---
 
@@ -120,7 +124,7 @@ Everything runs on a 16 GB laptop and free tiers. Running cost: ₹0.
 
 ## Web UI
 
-A chat-style interface: drop a file, watch the plan execute step by step, and inspect the before/after data, the generated code (with the diff between repair attempts), lineage and cost in a side panel. Frosted-glass panels in light and dark mode. Design mockup: [`docs/design/ui-mockup-liquid-glass.html`](docs/design/ui-mockup-liquid-glass.html) (download and open in a browser).
+A chat-style interface on the live API: drop a file, watch the plan execute step by step as the server streams it (SSE), and inspect the before/after data, the plan and the generated code (with the diff between repair attempts) in a side panel. Frosted-glass panels in light and dark mode. Without an API URL it falls back to a clearly labelled demo backend ("Demo data"). The routes and events are specified in [`docs/api/contract.md`](docs/api/contract.md); `make demo-gif` re-records the GIF above. Design mockup: [`docs/design/ui-mockup-liquid-glass.html`](docs/design/ui-mockup-liquid-glass.html) (download and open in a browser).
 
 ## Roadmap
 
@@ -129,7 +133,7 @@ A chat-style interface: drop a file, watch the plan execute step by step, and in
 - [x] **UI shell:** liquid-glass UI (light/dark), live run thread, Data/Code/Plan panel, evals page, API contract, e2e + accessibility checks
 - [x] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(first agent results on a dev subset)*
 - [ ] **Plan 3, evals at scale:** hostile set, CI eval gate, routing matrix and cost-vs-quality chart
-- [ ] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF
+- [x] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF
 
 **v2: production depth.** Event streaming (Redpanda), SLO dashboard and alerts, chaos drills and runbook, k6 load test, vLLM benchmark on a free GPU (throughput, prefix caching, self-hosted vs API cost), single-agent vs orchestrator comparison, learned router.
 
@@ -182,4 +186,5 @@ The API allows CORS from `http://localhost:3000` and `:3100` by default; for a U
 - [Design document](docs/superpowers/specs/2026-10-28-sluice-design.md): goals, anti-goals, architecture, eval method, decisions
 - [Plan 1: foundations](docs/superpowers/plans/2026-10-28-sluice-v1-p1-foundations.md)
 - [Plan 2: agent pipeline](docs/superpowers/plans/2026-10-28-sluice-v1-p2-agent-pipeline.md)
+- [Plan 4: API and live UI](docs/superpowers/plans/2026-10-29-sluice-v1-p4-api.md)
 - [API and event contract](docs/api/contract.md)
