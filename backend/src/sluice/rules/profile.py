@@ -11,17 +11,38 @@ the agent's job.
 Ties: an exact name match always wins. Otherwise, if two or more input columns normalise to the
 same contract column, none of them is matched (ambiguity is never resolved by guessing).
 
-Complexity: O(rows x columns) for the null/distinct statistics, O(columns) for matching.
+Unit check (Ruling H2a): for a matched contract column with ``unit: INR`` and dtype ``decimal``
+the profile also reports, in ``unit_issues``, values that look like whole paise (the drift op
+``unit_paise``: rupees x 100 with no fractional part). It is a report only: the rules never act
+on it, so :func:`sluice.rules.fixers.apply_rules` output does not depend on it.
+
+Complexity: O(rows x columns) for the null/distinct statistics, O(columns) for matching, plus one
+vectorised O(rows) pass (and an O(rows log rows) median/quantile) per INR column.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Final
 
 import polars as pl
 
-from sluice.contracts.model import Contract
+from sluice.contracts.model import ColumnSpec, Contract
 
 SAMPLE_SIZE = 5
+
+SENTINEL_TOKENS: frozenset[str] = frozenset({"N/A", "", "-1", "###"})
+"""Raw texts whose information is gone (compared after stripping). Re-exported by the rules."""
+
+UNIT_CHECKED: Final = "INR"
+"""The contract unit whose columns are checked for paise."""
+UNIT_MIN_VALUES: Final = 50
+"""Fewest parseable values the paise check needs before it says anything."""
+UNIT_WHOLE_SHARE: Final = 0.98
+"""Share of whole-number values at or above which an INR column looks like paise."""
+
+_NUMBER_NOISE = r"[,\s]"  # Indian grouping commas and whitespace, removed before parsing
+_NUMBER = r"^-?[0-9]+(\.[0-9]+)?$"  # ASCII digits only, like the rules (no Devanagari digits)
+_WHOLE = r"^-?[0-9]+(\.0+)?$"
 _SEPARATORS = re.compile(r"[-\s]+")
 _NEST_SEP = "."
 
@@ -49,6 +70,8 @@ class Profile:
     missing: list[str]
     extra: list[str]
     n_rows: int
+    unit_issues: dict[str, str] = field(default_factory=dict)
+    """Contract column -> why its values look like they are in the wrong unit (Ruling H2a)."""
 
 
 def normalise_name(name: str) -> str:
@@ -103,6 +126,61 @@ def contract_sources(prof: Profile) -> dict[str, str]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class Magnitude:
+    """Size statistics of the numbers in a column (absolute values; see :func:`magnitude`)."""
+
+    count: int
+    whole_share: float
+    median: float
+    p5: float
+    p95: float
+
+
+def magnitude(series: pl.Series) -> Magnitude | None:
+    """Statistics of the cells that read as plain numbers once grouping commas are removed.
+
+    Each cell is taken as text (numeric dtypes are cast), whitespace and ``,`` are removed, and
+    it counts when it is ``-?digits[.digits]`` and not a destroyed token (``"-1"``). A value is
+    *whole* when it has no fractional part or only zeros after the point. ``None`` when no cell
+    parses. Vectorised: O(rows), plus O(rows log rows) for the median and quantiles.
+    """
+    texts = series if series.dtype == pl.String else series.cast(pl.String, strict=False)
+    destroyed = texts.str.strip_chars().is_in(pl.Series(sorted(SENTINEL_TOKENS)).implode())
+    cleaned = texts.filter(~destroyed.fill_null(True)).str.replace_all(_NUMBER_NOISE, "")
+    numbers = cleaned.filter(cleaned.str.contains(_NUMBER))
+    if numbers.len() == 0:
+        return None
+    values = numbers.cast(pl.Float64, strict=False).abs()
+    whole = int(numbers.str.contains(_WHOLE).sum())
+    return Magnitude(
+        count=numbers.len(),
+        whole_share=whole / numbers.len(),
+        median=float(values.median()),  # type: ignore[arg-type]
+        p5=float(values.quantile(0.05, "nearest")),  # type: ignore[arg-type]
+        p95=float(values.quantile(0.95, "nearest")),  # type: ignore[arg-type]
+    )
+
+
+def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
+    """Why ``series`` looks like whole paise for an INR decimal column, else ``None``.
+
+    Fires when at least :data:`UNIT_MIN_VALUES` cells parse and at least
+    :data:`UNIT_WHOLE_SHARE` of them are whole numbers (Ruling H2a). Genuine rupee amounts
+    carry paise as decimals, so almost none of them are whole.
+    """
+    if spec.unit != UNIT_CHECKED or spec.dtype != "decimal":
+        return None
+    stats = magnitude(series)
+    if stats is None or stats.count < UNIT_MIN_VALUES or stats.whole_share < UNIT_WHOLE_SHARE:
+        return None
+    share = int(stats.whole_share * 100)  # floored: never shows 98% for 97.9%
+    return (
+        f"values look like paise: {share}% whole numbers, median {stats.median:.0f}; "
+        "expected INR with paise as decimals"
+    )
+
+
 def profile(df: pl.DataFrame, contract: Contract) -> Profile:
     """Profile ``df`` and match its columns to ``contract`` (see module docstring)."""
     matches = match_columns(list(df.columns), contract)
@@ -120,4 +198,9 @@ def profile(df: pl.DataFrame, contract: Contract) -> Profile:
     matched = set(matches.values())
     missing = [c.name for c in contract.columns if c.name not in matched]
     extra = [name for name in df.columns if name not in matches]
-    return Profile(columns=columns, missing=missing, extra=extra, n_rows=n)
+    units = {}
+    for name, target in matches.items():
+        if (detail := unit_issue(df[name], contract.column(target))) is not None:
+            units[target] = detail
+    ordered = {c.name: units[c.name] for c in contract.columns if c.name in units}
+    return Profile(columns=columns, missing=missing, extra=extra, n_rows=n, unit_issues=ordered)

@@ -44,9 +44,8 @@ import polars as pl
 
 from sluice.contracts.model import MONEY_PRECISION, MONEY_SCALE, ColumnSpec, Contract
 from sluice.evals.types import PK
-from sluice.rules.profile import Profile
+from sluice.rules.profile import SENTINEL_TOKENS, Profile
 
-SENTINEL_TOKENS: frozenset[str] = frozenset({"N/A", "", "-1", "###"})
 DAY_FIRST_LOCALES: frozenset[str] = frozenset({"en_IN"})
 INT_BOUNDS: dict[str, tuple[int, int]] = {
     "int32": (-(2**31), 2**31 - 1),
