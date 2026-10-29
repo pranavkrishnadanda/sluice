@@ -167,11 +167,57 @@ def _timeout_retries(config: dict[str, Any], group: str) -> int:
 
 
 def worst_case_proxy_s(config: dict[str, Any], tier: str) -> float:
-    """Every attempt of the primary and of each group in its fallback chain hangs."""
+    """Timeout-only worst case: every attempt of each group in the chain hangs until it times out.
+
+    A timeout is not retried in place, so this is one attempt per group. It does not cover slow
+    retried errors (429/500/503 that each take the full per-attempt timeout); see
+    `slow_error_worst_case_s`.
+    """
     return sum(
         _timeout(config, group) * (1 + _timeout_retries(config, group))
         for group in (tier, *_fallbacks(config)[tier])
     )
+
+
+def _retried_error_retries(config: dict[str, Any]) -> int:
+    policy = config["router_settings"]["retry_policy"]
+    return max(
+        int(policy[key])
+        for key in (
+            "RateLimitErrorRetries",
+            "InternalServerErrorRetries",
+            "ServiceUnavailableErrorRetries",
+        )
+    )
+
+
+def slow_error_worst_case_s(config: dict[str, Any], tier: str) -> float:
+    """Realistic bound with retried errors: every attempt fails slowly, at the full timeout.
+
+    Each group in the chain gets 1 + its 429/5xx retries attempts, each up to its timeout.
+    """
+    attempts = 1 + _retried_error_retries(config)
+    return sum(_timeout(config, group) * attempts for group in (tier, *_fallbacks(config)[tier]))
+
+
+@pytest.mark.parametrize("tier", TIERS)
+def test_slow_error_bound_matches_the_documented_constant(
+    config: dict[str, Any], tier: str
+) -> None:
+    from sluice.llm.client import SLOW_ERROR_WORST_CASE_S
+
+    assert slow_error_worst_case_s(config, tier) == SLOW_ERROR_WORST_CASE_S[tier]
+
+
+@pytest.mark.parametrize("tier", TIERS)
+def test_slow_errors_can_hit_the_client_timeout_and_degrade(
+    config: dict[str, Any], tier: str
+) -> None:
+    # Documented, not a bug: such a call ends at REQUEST_TIMEOUT_S as LLMUnavailable and the file
+    # falls back to rules-only output for that step. Never wrong output.
+    from sluice.llm.client import REQUEST_TIMEOUT_S
+
+    assert slow_error_worst_case_s(config, tier) >= REQUEST_TIMEOUT_S
 
 
 def test_every_deployment_has_its_own_short_timeout(config: dict[str, Any]) -> None:

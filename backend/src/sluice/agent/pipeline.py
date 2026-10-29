@@ -249,7 +249,8 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
     """
     run = _Run(case, deps, log, start=deps.clock(), records_from=len(deps.llm.records))
     try:
-        # Rate-limit back-off inside any model call must end within the file's wall cap.
+        # Rate-limit back-off inside any model call must end within the file's wall cap. Requests
+        # themselves are not cut off, so a file can overrun the cap by up to one request.
         with deps.llm.wall_budget(MAX_WALL_S_PER_FILE):
             return await _pipeline(run)
     except Exception as exc:  # not BaseException: cancellation and interrupts propagate
