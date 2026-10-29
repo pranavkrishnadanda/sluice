@@ -11,6 +11,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "SLUICE_UI_ORIGINS",
         "SLUICE_API_UI_ORIGINS",
+        "UI_ORIGINS",
         "SLUICE_API_MAX_UPLOAD_BYTES",
         "SLUICE_API_CONCURRENCY",
         "SLUICE_API_KEEPALIVE_S",
@@ -45,6 +46,16 @@ def test_ui_origins_reads_comma_separated_env(monkeypatch: pytest.MonkeyPatch) -
 def test_ui_origins_ignores_prefixed_name(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SLUICE_API_UI_ORIGINS", "http://a.test")
     assert ApiSettings().ui_origins == list(DEFAULT_UI_ORIGINS)
+
+
+def test_ui_origins_ignores_unprefixed_field_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UI_ORIGINS", "http://a.test")
+    assert ApiSettings().ui_origins == list(DEFAULT_UI_ORIGINS)
+
+
+def test_ui_origins_ignores_lowercase_field_name_kwarg() -> None:
+    # Only SLUICE_UI_ORIGINS sets the allow-list; `ui_origins=` is not an accepted input.
+    assert ApiSettings(ui_origins=["http://a.test"]).ui_origins == list(DEFAULT_UI_ORIGINS)
 
 
 def test_ui_origins_rejects_wildcard(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,7 +11,9 @@ network error. ``InternalErrorMiddleware`` sits *inside* CORS instead, so the ge
 the CORS headers like every other response.
 """
 
+import itertools
 import logging
+import traceback
 from typing import Any, Final
 
 from fastapi import FastAPI, Request
@@ -29,6 +31,10 @@ logger = logging.getLogger(__name__)
 INTERNAL_DETAIL: Final = "Internal error."
 MAX_DETAIL_CHARS: Final = 500
 """Longest validation ``detail``; FastAPI messages are short, this only bounds pathological ones."""
+MAX_LOGGED_CHAIN: Final = 8
+"""Exceptions of a ``__cause__``/``__context__`` chain written to the log."""
+MAX_LOGGED_FRAMES: Final = 64
+"""Frames per exception written to the log."""
 
 _CODES_BY_STATUS: Final[dict[int, str]] = {
     400: "bad_request",
@@ -105,10 +111,49 @@ async def _api_error(_: Request, exc: Exception) -> JSONResponse:
     return error_response(exc.status, exc.detail, exc.code)
 
 
+def _type_name(exc: BaseException) -> str:
+    """``module.QualName`` of the exception class (just ``RuntimeError`` for builtins)."""
+    cls = type(exc)
+    if cls.__module__ == "builtins":
+        return cls.__qualname__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def redacted_traceback(exc: BaseException) -> str:
+    """The exception chain as type names and ``file:line:function`` frames, nothing else.
+
+    Exception messages (``str(exc)``, of the exception and of every ``__cause__`` /
+    ``__context__``) and source lines are never included: either can hold a secret such as a DSN
+    or an API key. Walks the chain outermost first, at most :data:`MAX_LOGGED_CHAIN` exceptions
+    of at most :data:`MAX_LOGGED_FRAMES` frames each, and stops on a cycle.
+    """
+    sections: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(sections) < MAX_LOGGED_CHAIN:
+        seen.add(id(current))
+        frames = [
+            f"  at {frame.f_code.co_filename}:{lineno}:{frame.f_code.co_name}"
+            for frame, lineno in itertools.islice(
+                traceback.walk_tb(current.__traceback__), MAX_LOGGED_FRAMES
+            )
+        ]
+        sections.append("\n".join([_type_name(current), *frames]))
+        if current.__cause__ is not None:
+            current, link = current.__cause__, "caused by"
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current, link = current.__context__, "during handling of"
+        else:
+            break
+        sections[-1] += f"\n{link}:"
+    return "\n".join(sections)
+
+
 class InternalErrorMiddleware:
     """Turns an unhandled exception into the generic contract 500, inside CORS.
 
-    The exception is logged with its traceback server-side; the body never contains it. If the
+    The exception is logged server-side as type names and frame locations only
+    (:func:`redacted_traceback`), never its message; the body never contains either. If the
     response has already started (e.g. mid-way through an SSE stream) no new response can be
     sent, so the exception propagates and the connection is closed.
     """
@@ -130,8 +175,14 @@ class InternalErrorMiddleware:
 
         try:
             await self.app(scope, receive, tracking_send)
-        except Exception:
-            logger.exception("unhandled error in %s %s", scope.get("method"), scope.get("path"))
+        except Exception as exc:
+            logger.error(
+                "unhandled %s in %s %s\n%s",
+                _type_name(exc),
+                scope.get("method"),
+                scope.get("path"),
+                redacted_traceback(exc),
+            )
             if started:
                 raise
             await error_response(500, INTERNAL_DETAIL, "internal")(scope, receive, send)
@@ -152,7 +203,8 @@ def create_app(
         blobs: The blob store (typed in Task 2); kept on ``app.state.blobs``.
         worker: Start the in-process job worker. Tests pass ``False``.
     """
-    settings = settings or ApiSettings()
+    if settings is None:
+        settings = ApiSettings()
     app = FastAPI(title="Sluice API", version="1")
     app.state.settings = settings
     app.state.store = store

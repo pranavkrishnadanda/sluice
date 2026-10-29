@@ -6,7 +6,7 @@ Every knob is ``SLUICE_API_<NAME>`` except the CORS allow-list, which is ``SLUIC
 
 from typing import Annotated, Final
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_UI_ORIGINS: Final = (
@@ -33,7 +33,7 @@ class ApiSettings(BaseSettings):
 
     ui_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: list(DEFAULT_UI_ORIGINS),
-        validation_alias=AliasChoices("SLUICE_UI_ORIGINS", "ui_origins"),
+        validation_alias="SLUICE_UI_ORIGINS",
         description="Exact browser origins allowed by CORS (scheme://host[:port], no path).",
     )
     max_upload_bytes: int = Field(MAX_UPLOAD_BYTES, gt=0)

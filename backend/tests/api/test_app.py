@@ -3,18 +3,21 @@
 Tests use ``TestClient`` (in-process ASGI); nothing binds a port.
 """
 
+import logging
 from collections.abc import Iterator
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sluice.api.app import ApiError, create_app
+from sluice.api.app import ApiError, create_app, redacted_traceback
 from sluice.api.settings import ApiSettings
 
 UI_ORIGIN = "http://localhost:3100"
 EVIL_ORIGIN = "http://evil.test"
 SECRET = "sk-live-do-not-leak-0123456789"
+CAUSE_SECRET = "cause-secret-9f8e7d"
+CONTEXT_SECRET = "context-secret-1a2b3c"
 
 
 def _app() -> FastAPI:
@@ -27,6 +30,16 @@ def _app() -> FastAPI:
     @app.get("/_test/boom")
     def _boom() -> None:
         raise RuntimeError(f"database password is {SECRET}")
+
+    @app.get("/_test/chained")
+    def _chained() -> None:
+        try:
+            try:
+                raise KeyError(f"context {CONTEXT_SECRET}")
+            except KeyError as context:
+                raise ValueError(f"cause {CAUSE_SECRET}") from context
+        except ValueError as cause:
+            raise LookupError(f"outer {SECRET}") from cause
 
     @app.get("/_test/api-error")
     def _api_error() -> None:
@@ -95,11 +108,50 @@ def test_unhandled_exception_leaks_no_secret_or_traceback(client: TestClient) ->
     assert "Traceback" not in response.text and "RuntimeError" not in response.text
 
 
-def test_unhandled_exception_is_logged_server_side(
+def _logged(caplog: pytest.LogCaptureFixture) -> str:
+    """Everything a handler could write: formatted text plus each record's message and exc_info."""
+    parts = [caplog.text]
+    for record in caplog.records:
+        parts.append(record.getMessage())
+        parts.append(repr(record.exc_info))
+        parts.append(str(record.exc_text))
+    return "\n".join(parts)
+
+
+def test_unhandled_exception_log_names_type_method_and_path(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
-    client.get("/_test/boom")
-    assert any(record.exc_info for record in caplog.records)
+    with caplog.at_level(logging.ERROR, logger="sluice.api.app"):
+        client.get("/_test/boom")
+    logged = _logged(caplog)
+    assert "RuntimeError" in logged and "GET" in logged and "/_test/boom" in logged
+
+
+def test_unhandled_exception_log_has_frame_locations(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR, logger="sluice.api.app"):
+        client.get("/_test/boom")
+    assert "test_app.py:" in _logged(caplog) and "_boom" in _logged(caplog)
+
+
+def test_unhandled_exception_log_omits_exception_message(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        client.get("/_test/boom")
+    assert SECRET not in _logged(caplog)
+
+
+def test_chained_exception_log_names_types_without_messages(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        response = client.get("/_test/chained")
+    logged = _logged(caplog)
+    assert response.status_code == 500
+    assert all(name in logged for name in ("LookupError", "ValueError", "KeyError"))
+    assert not any(secret in logged for secret in (SECRET, CAUSE_SECRET, CONTEXT_SECRET))
 
 
 def test_api_error_returns_its_status_detail_and_code(client: TestClient) -> None:
@@ -173,3 +225,21 @@ def test_create_app_keeps_dependencies_on_state() -> None:
     app = create_app(settings=settings, store=store, blobs=blobs, worker=False)
     assert (app.state.settings, app.state.store, app.state.blobs) == (settings, store, blobs)
     assert app.state.worker_enabled is False
+
+
+def test_redacted_traceback_follows_implicit_context_without_messages() -> None:
+    try:
+        try:
+            raise KeyError(CONTEXT_SECRET)
+        except KeyError:
+            raise LookupError(SECRET)  # noqa: B904 - the implicit __context__ is the point
+    except LookupError as exc:
+        text = redacted_traceback(exc)
+    assert "LookupError" in text and "during handling of:" in text and "KeyError" in text
+    assert SECRET not in text and CONTEXT_SECRET not in text
+
+
+def test_redacted_traceback_stops_on_a_cycle() -> None:
+    first, second = ValueError(SECRET), KeyError(CAUSE_SECRET)
+    first.__cause__, second.__cause__ = second, first
+    assert redacted_traceback(first).count("ValueError") == 1
