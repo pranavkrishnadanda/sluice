@@ -33,6 +33,7 @@ from sluice.api.routes_runs import (
     PREVIEW_SAVE_GRACE_S,
     TOO_LARGE_DETAIL,
     sanitise_file_name,
+    too_large_detail,
     upload_extension,
 )
 from sluice.api.schemas import RunSummary
@@ -372,9 +373,36 @@ def test_post_runs_too_large_is_413_with_contract_detail(
     with TestClient(app, raise_server_exceptions=False) as client:
         res = _post(client, data=b"a,b\n" + b"1,2\n" * 300)
     assert res.status_code == 413
-    assert res.json() == {"detail": TOO_LARGE_DETAIL, "code": "too_large"}
-    assert TOO_LARGE_DETAIL == "File too large: the limit is 100 MB."
+    assert res.json() == {"detail": "File too large: the limit is 1000 bytes.", "code": "too_large"}
     _assert_nothing_kept(store, blobs)
+
+
+def test_too_large_detail_at_the_default_limit_is_the_contract_copy() -> None:
+    assert too_large_detail(MAX_UPLOAD_BYTES) == "File too large: the limit is 100 MB."
+    assert too_large_detail(MAX_UPLOAD_BYTES) == TOO_LARGE_DETAIL
+
+
+@pytest.mark.parametrize(
+    ("limit", "detail"),
+    [
+        (250 * 1024 * 1024, "File too large: the limit is 250 MB."),
+        (int(1.5 * 1024 * 1024), "File too large: the limit is 1.5 MB."),
+        (64 * 1024, "File too large: the limit is 64 KB."),
+        (1000, "File too large: the limit is 1000 bytes."),
+    ],
+)
+def test_too_large_detail_follows_max_upload_bytes(limit: int, detail: str) -> None:
+    assert too_large_detail(limit) == detail
+
+
+def test_post_runs_too_large_detail_names_a_configured_limit(
+    store: RouteStore, blobs: LocalBlobStore
+) -> None:
+    app = _app(store, blobs, max_upload_bytes=1024 * 1024)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        res = _post(client, data=b"a\n" + b"1\n" * (600 * 1024))
+    assert res.status_code == 413
+    assert res.json()["detail"] == "File too large: the limit is 1 MB."
 
 
 def test_post_runs_path_traversal_name_is_sanitised(

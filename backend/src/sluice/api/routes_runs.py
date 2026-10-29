@@ -46,6 +46,7 @@ from sluice.agent.events import TableName
 from sluice.api.blobs import BlobStore, TooLarge
 from sluice.api.errors import ApiError
 from sluice.api.schemas import DataPreview, RunSummary, Transform
+from sluice.api.settings import MAX_UPLOAD_BYTES
 from sluice.api.store import MAX_FILE_NAME_CHARS, TERMINAL_STATUSES, RunRow, RunStore
 from sluice.contracts.model import Contract, load_contract
 from sluice.io import DecodedTooLarge, read_input
@@ -72,7 +73,23 @@ MAX_PART_HEADERS: Final = 8
 MULTIPART_OVERHEAD: Final = 64 * 1024
 """Body bytes allowed on top of the file limit: boundaries, part headers, the ``table`` field."""
 MAX_OFFSET: Final = 2**31 - 1
-TOO_LARGE_DETAIL: Final = "File too large: the limit is 100 MB."
+_SIZE_UNITS: Final = (("MB", 1024 * 1024), ("KB", 1024))
+
+
+def too_large_detail(limit_bytes: int) -> str:
+    """The 413 copy for ``max_upload_bytes``: ``"File too large: the limit is 100 MB."``.
+
+    MB/KB are binary multiples (the contract's 100 MB is 100 x 2**20 bytes), rounded to one
+    decimal; below 1 KB the limit is given in bytes.
+    """
+    for unit, size in _SIZE_UNITS:
+        if limit_bytes >= size:
+            return f"File too large: the limit is {round(limit_bytes / size, 1):g} {unit}."
+    return f"File too large: the limit is {limit_bytes} bytes."
+
+
+TOO_LARGE_DETAIL: Final = too_large_detail(MAX_UPLOAD_BYTES)
+"""The 413 copy at the default limit (the contract's)."""
 UNSUPPORTED_DETAIL: Final = "Unsupported file format: upload a .csv, .json or .parquet file."
 UNKNOWN_TABLE_DETAIL: Final = "Unknown table: choose orders or lineitem."
 UNPARSEABLE_DETAIL: Final = "The file could not be read in its format."
@@ -433,7 +450,7 @@ async def create_run(request: Request) -> RunSummary:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(_delete_quietly, blobs, written)
         if isinstance(exc, TooLarge):
-            raise ApiError(413, TOO_LARGE_DETAIL, "too_large") from None
+            raise ApiError(413, too_large_detail(limit), "too_large") from None
         if isinstance(exc, BadForm):
             raise ApiError(422, f"Invalid upload: {exc}.", "invalid_request") from None
         raise
