@@ -238,8 +238,15 @@ def _spend(records: list[CallRecord]) -> tuple[int, float]:
 # --------------------------------------------------------------------------- entry point
 
 
-async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> SystemOutput:
+async def run_pipeline(
+    case: CaseInput, deps: PipelineDeps, log: EventLog, *, run_id: str | None = None
+) -> SystemOutput:
     """Run the agent pipeline over ``case.path`` (see the module docstring for the states).
+
+    ``run_id`` is the caller's run id (``[A-Za-z0-9_-]{1,64}``), used for ``run_started``,
+    ``meta["run_id"]`` and every transform id, so lineage, events and the API agree; ``None``
+    makes up a random one. Events go to ``log`` as they happen (give it an ``on_emit`` to relay
+    them live) and are also returned in ``meta["events"]``.
 
     Never raises for an ``Exception``: model and provider problems fall back as described in
     the module docstring, and anything unexpected (a read error, a sandbox or Docker API error,
@@ -247,7 +254,14 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
     ``failed``, the summary naming only the exception type) and a whole-file quarantine output.
     ``BaseException`` (``asyncio.CancelledError``, ``KeyboardInterrupt``) is never caught.
     """
-    run = _Run(case, deps, log, start=deps.clock(), records_from=len(deps.llm.records))
+    run = _Run(
+        case,
+        deps,
+        log,
+        start=deps.clock(),
+        records_from=len(deps.llm.records),
+        run_id=run_id or uuid.uuid4().hex,
+    )
     try:
         # Rate-limit back-off inside any model call must end within the file's wall cap. Requests
         # themselves are not cut off, so a file can overrun the cap by up to one request.

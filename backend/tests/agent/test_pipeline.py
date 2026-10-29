@@ -50,6 +50,7 @@ from sluice.evals.runner import SYSTEMS
 from sluice.evals.types import CaseInput, SystemOutput
 from sluice.llm.client import LLM
 from sluice.load.iceberg import PlanNodeRecord, TransformRecord, pk_text
+from sluice.runs import execute
 from sluice.sandbox.runner import SandboxResult
 from sluice.systems.agent import AgentSystem
 from sluice.systems.rules_only import RulesOnlySystem
@@ -82,6 +83,7 @@ def run(
     contract: Contract | None = None,
     reference: dict[str, set[Any]] | None = None,
     path: Path | None = None,
+    run_id: str | None = None,
 ) -> Result:
     async def go() -> Result:
         model = FunctionModel(script.respond, model_name="script-model")
@@ -91,7 +93,7 @@ def run(
             case_input = CaseInput(
                 path or case.input_path, contract or load_contract(case.table), reference or {}
             )
-            out = await run_pipeline(case_input, deps, log)
+            out = await run_pipeline(case_input, deps, log, run_id=run_id)
             return Result(out, log, llm)
 
     result = asyncio.run(go())
@@ -677,10 +679,10 @@ def test_pipeline_quarantine_reasons_are_keyed_by_loader_pk_text(
     assert finished.status == "quarantined"  # type: ignore[attr-defined]
 
 
-def test_cli_replay_accepts_pipeline_events(medium: Case) -> None:
+def test_execute_replay_accepts_pipeline_events(medium: Case) -> None:
     script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
     result = run(medium, script)
-    replayed, final = cli._replayed(result.out)
+    replayed, final = execute.replayed(result.out)
     assert [e.type for e in replayed] == [  # type: ignore[attr-defined]
         "profiled",
         "rules_applied",
@@ -998,3 +1000,16 @@ def test_pipeline_bounds_rate_limit_waits_by_the_file_wall_cap(medium: Case) -> 
     for deadline in deadlines:
         assert deadline is not None
         assert before + MAX_WALL_S_PER_FILE <= deadline <= after + MAX_WALL_S_PER_FILE
+
+
+# --------------------------------------------------------------------------- plan 4 (Task 3)
+
+
+def test_pipeline_uses_the_caller_supplied_run_id(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+    result = run(indian, script, run_id="api-run-7")
+    (started,) = result.events("run_started")
+    assert started.run_id == "api-run-7"  # type: ignore[attr-defined]
+    assert result.out.meta["run_id"] == "api-run-7"
+    (done,) = result.events("node_finished")
+    assert done.transform_id == pipeline.transform_id("api-run-7", "n1", 2)  # type: ignore[attr-defined]
