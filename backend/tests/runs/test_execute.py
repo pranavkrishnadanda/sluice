@@ -340,3 +340,129 @@ def test_execute_run_whole_file_quarantine_summary_keeps_its_own_reason(indian: 
 
     summary = emitted[-1].summary  # type: ignore[attr-defined]
     assert summary == "file quarantined: node n1 failed; nothing loaded; the file can be retried"
+
+
+# --- round 2: activity relay, the load step and the on_loaded hook ---------------------------
+
+
+def _types_and_phases(events: list[EventModel]) -> list[str]:
+    out = []
+    for e in events:
+        a: Any = e
+        out.append(f"activity:{a.phase}" if a.type == "activity" else a.type)
+    return out
+
+
+def test_execute_run_with_activity_relays_it_into_one_gapless_log(indian: Case) -> None:
+    emitted: list[EventModel] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    execute_run(
+        indian.input_path,
+        "orders",
+        run_id="run-1",
+        emit=emitted.append,
+        activity=True,
+        run_fn=_agent(script, FakeSandbox()).run,
+        load_fn=Loads(),
+        loaded_fn=lambda *_a, **_k: None,
+        settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+    )
+
+    assert [e.seq for e in emitted] == list(range(1, len(emitted) + 1))
+    assert _types_and_phases(emitted) == [
+        "run_started",
+        "activity:mapping",
+        "profiled",
+        "rules_applied",
+        "activity:planning",
+        "plan_created",
+        "node_started",
+        "activity:writing",
+        "activity:sandbox",
+        "activity:checking",
+        "activity:verifying",
+        "node_finished",
+        "verified",
+        "activity:loading",
+        "loaded",
+        "run_finished",
+    ]
+    loading = emitted[-3]
+    assert loading.message == "Loading 40 rows into the warehouse"  # type: ignore[attr-defined]
+    assert loading.node_id is None  # type: ignore[attr-defined]
+
+
+def test_execute_run_without_activity_emits_none(indian: Case) -> None:
+    emitted: list[EventModel] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    _execute(indian.input_path, _agent(script, FakeSandbox()).run, emitted.append)
+
+    assert "activity" not in _types(emitted)
+
+
+def test_execute_run_on_loaded_runs_between_loaded_and_run_finished(indian: Case) -> None:
+    emitted: list[EventModel] = []
+    calls: list[tuple[list[str], SystemOutput]] = []
+
+    execute_run(
+        indian.input_path,
+        "orders",
+        run_id="run-1",
+        emit=emitted.append,
+        on_loaded=lambda out: calls.append((_types(emitted), out)),
+        run_fn=RulesOnlySystem().run,
+        load_fn=Loads(),
+        loaded_fn=lambda *_a, **_k: None,
+        settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+    )
+
+    ((seen, out),) = calls
+    assert seen[-1] == "loaded"
+    assert _types(emitted)[-1] == "run_finished"
+    assert out.df.height > 0
+
+
+def test_execute_run_on_loaded_is_not_called_without_a_loaded_event(indian: Case) -> None:
+    calls: list[SystemOutput] = []
+
+    execute_run(
+        indian.input_path,
+        "orders",
+        run_id="run-1",
+        emit=lambda _e: None,
+        on_loaded=calls.append,
+        run_fn=RulesOnlySystem().run,
+        load_fn=Loads(skipped=True),
+        loaded_fn=lambda *_a, **_k: None,
+        settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+    )
+
+    assert calls == []
+
+
+def test_execute_run_a_failing_on_loaded_still_finishes_the_run(indian: Case) -> None:
+    emitted: list[EventModel] = []
+
+    def boom(_out: SystemOutput) -> None:
+        raise RuntimeError("preview")
+
+    outcome = execute_run(
+        indian.input_path,
+        "orders",
+        run_id="run-1",
+        emit=emitted.append,
+        on_loaded=boom,
+        run_fn=RulesOnlySystem().run,
+        load_fn=Loads(),
+        loaded_fn=lambda *_a, **_k: None,
+        settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+    )
+
+    assert _types(emitted)[-2:] == ["loaded", "run_finished"]
+    assert outcome.status != "failed"
