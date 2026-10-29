@@ -129,7 +129,7 @@ A chat-style interface: drop a file, watch the plan execute step by step, and in
 - [x] **UI shell:** liquid-glass UI (light/dark), live run thread, Data/Code/Plan panel, evals page, API contract, e2e + accessibility checks
 - [x] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(first agent results on a dev subset)*
 - [ ] **Plan 3, evals at scale:** hostile set, CI eval gate, routing matrix and cost-vs-quality chart
-- [ ] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF
+- [ ] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF *(in progress)*
 
 **v2: production depth.** Event streaming (Redpanda), SLO dashboard and alerts, chaos drills and runbook, k6 load test, vLLM benchmark on a free GPU (throughput, prefix caching, self-hosted vs API cost), single-agent vs orchestrator comparison, learned router.
 
@@ -168,4 +168,5 @@ Requires [uv](https://docs.astral.sh/uv/) (installs Python 3.14) and [Bun](https
 - [Design document](docs/superpowers/specs/2026-10-28-sluice-design.md): goals, anti-goals, architecture, eval method, decisions
 - [Plan 1: foundations](docs/superpowers/plans/2026-10-28-sluice-v1-p1-foundations.md)
 - [Plan 2: agent pipeline](docs/superpowers/plans/2026-10-28-sluice-v1-p2-agent-pipeline.md)
+- [Plan 4: API server, live UI, traces](docs/superpowers/plans/2026-10-29-sluice-v1-p4-api.md)
 - [API and event contract](docs/api/contract.md)
