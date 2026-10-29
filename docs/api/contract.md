@@ -201,6 +201,8 @@ Path parameters are URL-encoded. Unknown run ids return `404`.
 - A `.parquet` file is also `422` (`too_large_decoded`) when its footer
   declares more than 5,000,000 rows or more than 1 GiB of decoded data: a
   small, highly compressed file can expand far beyond 100 MB in memory.
+  `GET /runs/{id}/input` answers the same `422` (`too_large_decoded`) for a
+  stored file that fails this check, never a `500`.
 - The new run's `rows` is `null` until the file has been profiled.
 
 ### Run summaries
@@ -270,8 +272,10 @@ and does not change the order of the other events.
 
 - `nodeId` is the plan node the phase belongs to, or `null` for run-wide
   phases: `mapping` (schema mapping call), `planning` (planning call),
-  `loading` (writing to the warehouse) and `previewing` (building the
-  before/after preview).
+  `checking` (finding the cells the rules flagged, between `plan_created`
+  and the first `node_started`), `verifying` (re-running the rules on the
+  repaired data, just before `verified`), `loading` (writing to the
+  warehouse) and `previewing` (building the before/after preview).
 - Per-node phases, in the order an attempt goes through them: `writing`
   (the worker model writes the fix), `sandbox` (the fix runs in the
   sandbox), `checking` (the rewrite is checked against the rules),
@@ -285,9 +289,14 @@ and does not change the order of the other events.
   fix in the sandbox on 15,000 rows", "Rate limit reached on the small
   model — retrying in 14 s", "Loading 15,000 rows into the warehouse". It
   never contains prompts, model output, data values, paths or secrets.
-- The UI shows the latest `activity` (per node when `nodeId` is set, else
-  run-wide) until a later `activity`, a `node_finished` / `attempt_failed`
-  for that node, or a terminal event replaces it; `run_finished` clears all.
+- The UI shows the latest `activity` until something replaces it:
+  - a **node** activity (`nodeId` set) lasts until a later activity for
+    that node, or that node's `node_finished` / `attempt_failed`;
+  - a **run-wide** activity (`nodeId: null`) lasts until **any** later
+    event that is not an `activity` (e.g. `plan_created` ends `planning`,
+    `verified` ends the run-wide `verifying`), a later run-wide activity, or
+    a newer node activity;
+  - `run_finished` clears all.
 
 Independent nodes run concurrently, so the events of different nodes may
 interleave; the order above holds per node.
@@ -309,6 +318,21 @@ finish, and their events are still emitted) and the run does **not** emit
 `failed`: if a node's final attempt fails and another node also hits a
 provider outage, the run is `quarantined`. Nothing loads either way, and the
 quarantine is the more specific signal.
+
+**Unrepaired units.** When the profiler finds a money column whose values
+look like whole paise (a `unit` issue in `profiled.issues`), the plan must
+include a node for it. If that column ends the run without an accepted
+node (planning fell back to the rules, the plan left it out, its node ran
+out of attempts, or an outage, cap or sandbox error stopped it), nothing
+is loaded: the run ends `quarantined` (no `verified`, no `loaded`) with the
+summary "values in <column> look like paise and could not be repaired;
+nothing loaded". This also takes precedence over `failed`: loading values
+that are 100 times too large is worse than loading nothing.
+The paise check only looks at the share of whole numbers (at least 98% of
+the values, with at least 50 values): a genuine INR column that is almost
+all whole-rupee amounts (`1500`, `2300`) is reported as paise as well, and
+is held back unless the agent's repair is accepted. This is a known
+limitation.
 
 **Exactly one terminal event.** Every run ends with exactly one
 `run_finished`, whatever happens: a worker crash, a model-provider outage

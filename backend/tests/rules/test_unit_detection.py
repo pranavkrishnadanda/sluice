@@ -12,6 +12,7 @@ from sluice.contracts.model import Contract, load_contract
 from sluice.rules.fixers import apply_rules
 from sluice.rules.profile import (
     UNIT_MIN_VALUES,
+    approx,
     magnitude,
     profile,
 )
@@ -65,7 +66,7 @@ def test_profile_unit_issue_for_indian_grouped_paise(orders: Contract) -> None:
     assert grouped[0] == "10,00,000"
     prof = profile(_orders_frame(grouped), orders)
     assert "o_totalprice" in prof.unit_issues
-    assert "median 1036" in prof.unit_issues["o_totalprice"]
+    assert "median ≈ 1 million" in prof.unit_issues["o_totalprice"]  # rounded: no cell value
 
 
 def test_profile_unit_issue_counts_zero_fraction_as_whole(orders: Contract) -> None:
@@ -150,3 +151,36 @@ def test_magnitude_stats_of_paise_and_rupees() -> None:
 def test_magnitude_ignores_non_ascii_digits() -> None:
     stats = magnitude(pl.Series(["\u0967\u0968\u0969.00", "12.00"]))
     assert stats is not None and stats.count == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (0.0, "≈ 0"),
+        (3.456, "≈ 3.5"),
+        (847.0, "≈ 850"),
+        (999.6, "≈ 1 thousand"),
+        (12_345.0, "≈ 12 thousand"),
+        (123_456.0, "≈ 120 thousand"),
+        (1_036_492.0, "≈ 1 million"),
+        (3_456_789.0, "≈ 3.5 million"),
+        (-3_456_789.0, "≈ -3.5 million"),
+        (7.2e12, "≈ 7.2 trillion"),
+    ],
+)
+def test_approx_rounds_to_two_significant_figures_and_a_magnitude(value: float, text: str) -> None:
+    assert approx(value) == text
+
+
+def test_profile_unit_issue_never_shows_an_exact_median(orders: Contract) -> None:
+    prices = _paise(61)  # odd count: the median is an actual cell
+    detail = profile(_orders_frame(prices), orders).unit_issues["o_totalprice"]
+    assert not any(p in detail for p in prices)
+
+
+def test_profile_reports_a_genuine_whole_rupee_column_as_paise_known_limitation(
+    orders: Contract,
+) -> None:
+    """Pins today's behaviour: H2a cannot tell whole rupees from whole paise (documented)."""
+    whole_rupees = [str(1_500 + 50 * i) for i in range(60)]  # real INR, no paise at all
+    assert "o_totalprice" in profile(_orders_frame(whole_rupees), orders).unit_issues

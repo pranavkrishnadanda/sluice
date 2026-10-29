@@ -502,3 +502,21 @@ def test_events_resume_past_the_end_of_a_finished_run_is_not_a_warning(
 
 def test_keepalive_default_is_well_inside_the_contract_bound() -> None:
     assert ApiSettings().keepalive_s == 10.0  # the contract: at least every 15 s
+
+
+def test_events_activity_is_stored_and_replayed_after_last_event_id() -> None:
+    activity = ev.Activity(
+        node_id=None, phase="verifying", message="Re-running the rules on the repaired data"
+    )
+    events = _stamp("run-a", started("run-a"), activity, finished())
+    store = _store_with("run-a", events, "succeeded")
+
+    async def go() -> httpx.Response:
+        async with _app(store) as app:
+            return await _get(app, "/runs/run-a/events", {"Last-Event-ID": "1"})
+
+    res = _run(go)
+    got = _events(res.text)
+    assert [e["id"] for e in got] == [2, 3]
+    assert got[0]["data"] == events[1].to_dict()
+    assert PIPELINE_EVENT_ADAPTER.validate_python(got[0]["data"]) == events[1]

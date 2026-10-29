@@ -458,3 +458,38 @@ def test_propose_plan_floor_uses_the_source_column_name(orders: Contract) -> Non
         propose_plan(cands, orders, script.llm(), source_names={"o_totalprice": "price_paise"})
     )
     assert plan.nodes[0].difficulty == "hard"
+
+
+# ---------------------------------------------------------------- U1: unit columns need a node
+
+PAISE_ISSUE = {"o_totalprice": "values look like paise: 100% whole numbers, median ≈ 1 million"}
+
+
+def test_validate_plan_rejects_a_plan_without_a_node_for_a_unit_column() -> None:
+    plan = Plan.model_validate({"nodes": [node("a", "o_orderdate")]})
+
+    with pytest.raises(PlanError, match="o_totalprice.*unit issue"):
+        validate_plan(plan, CANDS, required={"o_totalprice"})
+
+
+def test_validate_plan_accepts_a_plan_covering_every_unit_column() -> None:
+    plan = Plan.model_validate({"nodes": [node("a", "o_totalprice")]})
+
+    assert validate_plan(plan, CANDS, required={"o_totalprice"}) is plan
+
+
+def test_propose_plan_re_asks_once_when_a_unit_column_has_no_node(orders: Contract) -> None:
+    script = Scripted({"nodes": []}, {"nodes": [node("a", "o_totalprice")]})
+
+    plan, records = run(propose_plan(CANDS, orders, script.llm(), issues=PAISE_ISSUE))
+
+    assert [n.column for n in plan.nodes] == ["o_totalprice"]
+    assert len(records) == 2
+    assert "unit issue" in script.prompts[-1]
+
+
+def test_propose_plan_raises_when_a_unit_column_is_omitted_twice(orders: Contract) -> None:
+    script = Scripted({"nodes": []}, {"nodes": []})
+
+    with pytest.raises(LLMOutputError, match="unit issue"):
+        run(propose_plan(CANDS, orders, script.llm(), issues=PAISE_ISSUE))

@@ -16,10 +16,16 @@ the profile also reports, in ``unit_issues``, values that look like whole paise 
 ``unit_paise``: rupees x 100 with no fractional part). It is a report only: the rules never act
 on it, so :func:`sluice.rules.fixers.apply_rules` output does not depend on it.
 
+Known limitation (deliberate, H2a): the check only sees the share of whole numbers, never the
+unit, so a genuine INR column in which at least 98% of the amounts are whole rupees (``1500``,
+``2300``) is reported as paise too. With Ruling U1 such a file is then quarantined whole unless
+a unit node is accepted. The contracts' money columns carry paise as decimals, so this is rare.
+
 Complexity: O(rows x columns) for the null/distinct statistics, O(columns) for matching, plus one
 vectorised O(rows) pass (and an O(rows log rows) median/quantile) per INR column.
 """
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Final
@@ -139,6 +145,12 @@ def number_mask(series: pl.Series) -> pl.Series:
     return _number_texts(series).str.contains(_NUMBER).fill_null(False)
 
 
+def number_values(series: pl.Series) -> pl.Series:
+    """Per row: the cell's number as ``Float64`` where :func:`number_mask` holds, else null."""
+    values = _number_texts(series).cast(pl.Float64, strict=False)
+    return pl.select(pl.when(number_mask(series)).then(values)).to_series()
+
+
 @dataclass(frozen=True, slots=True)
 class Magnitude:
     """Size statistics of the numbers in a column (absolute values; see :func:`magnitude`)."""
@@ -173,12 +185,31 @@ def magnitude(series: pl.Series) -> Magnitude | None:
     )
 
 
+_SCALES: Final = ((1e12, "trillion"), (1e9, "billion"), (1e6, "million"), (1e3, "thousand"))
+
+
+def approx(value: float) -> str:
+    """``value`` as a rough magnitude, e.g. ``"≈ 3.5 million"`` (two significant figures).
+
+    Used for data-derived numbers in user-facing text (``profiled`` issue details, worker
+    feedback), so no exact cell value can be read back from them.
+    """
+    if not math.isfinite(value):
+        return "≈ ?"
+    rounded = float(f"{value:.2g}")
+    for scale, name in _SCALES:
+        if abs(rounded) >= scale:
+            return f"≈ {rounded / scale:g} {name}"
+    return f"≈ {rounded:g}"
+
+
 def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
     """Why ``series`` looks like whole paise for an INR decimal column, else ``None``.
 
     Fires when at least :data:`UNIT_MIN_VALUES` cells parse and at least
     :data:`UNIT_WHOLE_SHARE` of them are whole numbers (Ruling H2a). Genuine rupee amounts
-    carry paise as decimals, so almost none of them are whole.
+    carry paise as decimals, so almost none of them are whole. Limitation: a genuine INR column
+    of mostly whole-rupee amounts is reported too (see the module docstring).
     """
     if spec.unit != UNIT_CHECKED or spec.dtype != "decimal":
         return None
@@ -187,7 +218,7 @@ def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
         return None
     share = int(stats.whole_share * 100)  # floored: never shows 98% for 97.9%
     return (
-        f"values look like paise: {share}% whole numbers, median {stats.median:.0f}; "
+        f"values look like paise: {share}% whole numbers, median {approx(stats.median)}; "
         "expected INR with paise as decimals"
     )
 

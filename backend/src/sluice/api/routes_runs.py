@@ -469,11 +469,12 @@ async def create_run(request: Request) -> RunSummary:
         form = MultipartStream(request.stream(), boundary, max_total)
         upload = await _receive(form, run_id, blobs, limit, written)
         checked = await asyncio.to_thread(_check_and_hash, blobs, upload.key)
+        table = await asyncio.to_thread(_resolve_table, upload, checked.columns)
         summary = await asyncio.to_thread(
             store.create_run,
             run_id=run_id,
             file_name=upload.file_name,
-            table=_resolve_table(upload, checked.columns),
+            table=table,
             blob_key=upload.key,
             file_sha256=checked.sha256,
         )
@@ -602,9 +603,14 @@ async def get_preview(
 
 
 def _raw_input(store: RunStore, blobs: BlobStore, run_id: str, offset: int, limit: int) -> RawInput:
+    """One page of the stored upload; ``422 too_large_decoded`` if its footer declares too much."""
     row = _run_or_404(store, run_id)
     with blobs.open_local(row.blob_key) as path:
-        return read_raw_page(path, offset, min(limit, PREVIEW_MAX_LIMIT))
+        try:
+            return read_raw_page(path, offset, min(limit, PREVIEW_MAX_LIMIT))
+        except DecodedTooLarge:
+            _log.info("input of run %s declares too much data", run_id)
+            raise ApiError(422, DECODED_TOO_LARGE_DETAIL, "too_large_decoded") from None
 
 
 @router.get("/runs/{run_id}/input", response_model=RawInput)

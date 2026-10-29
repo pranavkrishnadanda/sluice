@@ -26,8 +26,9 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    unit (the rules may parse paise rendered as ``12450050.00`` without flagging them). The
    fabrication guard still covers every row (destroyed tokens and nulls stay null), and the
    effect check instead requires that no cell becomes unparseable or loses its number and
-   that the column median shrinks by a factor in [80, 120] (≈ ÷100). Every other node keeps F2. Each
-   attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
+   that the column median shrinks by a factor in [80, 120] (≈ ÷100), and that every row which
+   is a number on both sides is raw / 100 to within 0.0051 (Ruling U2). Every other node keeps
+   F2. Each attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
    own reason). The attempt's transform record (when it produced code) goes to
    ``case.on_transform`` just before that event.
@@ -37,6 +38,13 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    **Failure path** (contract): when a node's final attempt fails, no new node starts (nodes in
    flight finish), there is no ``verified``, and the whole input is quarantined
    (``file_quarantined``, empty output) with ``run_finished`` status ``quarantined``.
+   **Unrepaired unit (Ruling U1).** A column with a profiler unit issue must end with an
+   accepted node: the planner must plan one (:func:`sluice.agent.plan.validate_plan` rejects a
+   plan without it, so the usual one re-ask applies). When it does not (the planner fell back,
+   the plan still omits it, the node ran out of attempts, an outage, a cap or a broken sandbox
+   stopped it), nothing loads: whole-file quarantine, status ``quarantined``, summary "values
+   in <column> look like paise and could not be repaired; nothing loaded". This beats
+   ``failed`` too (as Ruling C4c does): loading wrong-unit values is worse than failing.
 6. **rules pass 2** on the raw frame with every accepted column replaced; ``verified`` (contract
    checks on the final output) unless the run failed.
 7. ``run_finished``, exactly once (``loaded`` belongs to the loader / ``sluice run``). Its
@@ -44,8 +52,10 @@ States, in order (each one emits the contract event named after it, see ``docs/a
 
 Activity (``case.on_activity``, live-only status, never in ``log`` or ``meta["events"]``): one
 ``activity`` event when each phase starts: ``mapping`` (before the mapping call), ``planning``
-(before a planning call), and per attempt, after its ``node_started``: ``writing`` (worker call),
-``sandbox``, ``checking`` (the effect check) and ``verifying`` (verifier call). A rate-limit
+(before a planning call), run-wide ``checking`` (finding the flagged rows, between
+``plan_created`` and the first node), per attempt, after its ``node_started``: ``writing``
+(worker call), ``sandbox``, ``checking`` (the effect check) and ``verifying`` (verifier call),
+and run-wide ``verifying`` before rules pass 2. A rate-limit
 back-off inside any of those model calls (``LLM.on_backoff``) announces ``waiting`` (with the
 wait in whole seconds) and then the interrupted phase again. The copy names tiers, contract
 column names and row counts only.
@@ -156,7 +166,15 @@ from sluice.rules.fixers import (
     cell_texts,
     flagged_raw_rows,
 )
-from sluice.rules.profile import Profile, contract_sources, magnitude, number_mask, profile
+from sluice.rules.profile import (
+    Profile,
+    approx,
+    contract_sources,
+    magnitude,
+    number_mask,
+    number_values,
+    profile,
+)
 from sluice.sandbox.runner import SandboxError, SandboxResult
 
 __all__ = ["MAX_TOKENS_PER_FILE", "MAX_WALL_S_PER_FILE", "PipelineDeps", "run_pipeline"]
@@ -169,6 +187,9 @@ MAX_ISSUE_DETAIL_CHARS: Final = 200
 UNIT_FACTOR_MIN: Final = 80.0
 UNIT_FACTOR_MAX: Final = 120.0
 """A unit node's rewrite must shrink the column median by a factor in this range (≈ ÷100)."""
+
+UNIT_ROW_TOLERANCE: Final = 0.0051
+"""Per row, a unit node's rewrite must be within this of raw / 100 (rounding to 2 decimals)."""
 
 Sandbox = Callable[[str, pl.Series], SandboxResult]
 
@@ -445,6 +466,9 @@ async def _pipeline(run: _Run) -> SystemOutput:
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
+        if (unrepaired := _unit_unrepaired(prof1, [])) is not None:
+            actions = [*map_actions, *pass1.actions, f"file quarantined: {unrepaired}"]
+            return _quarantine_file(run, actions, None, [], mapping, unrepaired, summary=unrepaired)
         return _finish(run, pass1, map_actions + pass1.actions, None, [], mapping)
 
     run.emit(
@@ -462,6 +486,13 @@ async def _pipeline(run: _Run) -> SystemOutput:
         )
     )
     outcomes = await _run_nodes(run, plan, frame, prof1, candidates, _hints(mapping))
+    if (unrepaired := _unit_unrepaired(prof1, outcomes)) is not None:
+        # Ruling U1: whatever stopped the unit node (exhausted, outage, cap, broken sandbox),
+        # loading values still in paise is worse than loading nothing.
+        actions = [*map_actions, *pass1.actions, f"file quarantined: {unrepaired}"]
+        return _quarantine_file(
+            run, actions, plan, outcomes, mapping, unrepaired, summary=unrepaired
+        )
     if run.halted is not None:
         actions = [*map_actions, *pass1.actions, f"file quarantined: {run.halted}"]
         return _quarantine_file(run, actions, plan, outcomes, mapping, run.halted)
@@ -478,6 +509,7 @@ async def _pipeline(run: _Run) -> SystemOutput:
         rewritten = frame.with_columns(
             [values.alias(source[column]) for column, values in accepted.items()]
         )
+        run.activity("verifying", "Re-running the rules on the repaired data")
         with tracing.step_span("rules_pass_2"):
             final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
     actions = map_actions + final.actions
@@ -511,6 +543,8 @@ async def _run_nodes(
     pending = list(plan.nodes)
     done: set[str] = set()
     source = contract_sources(prof)
+    if plan.nodes:  # one rules pass over the whole frame: say so, it can take a while
+        run.activity("checking", f"Finding the cells the rules flagged in {frame.height:,} rows")
     flagged = flagged_raw_rows(frame, run.case.contract, prof)
     while pending:
         if run.halted is not None:  # a final failure: no new node starts
@@ -811,7 +845,9 @@ def _effect(
     Rejects a rewrite that makes the rules flag a cell they parsed before, and then, for an
     ordinary node, one that recovers no flagged cell. For a unit node (``unit``, Ruling H2c) the
     second check is instead :func:`_unit_error`: no cell that held a number may lose it, and the
-    median must shrink by a factor in [:data:`UNIT_FACTOR_MIN`, :data:`UNIT_FACTOR_MAX`].
+    median must shrink by a factor in [:data:`UNIT_FACTOR_MIN`, :data:`UNIT_FACTOR_MAX`], and
+    every row whose raw and rewritten cells are both numbers must be raw / 100 within
+    :data:`UNIT_ROW_TOLERANCE` (Ruling U2).
     Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a duplicate copy
     is never mistaken for a newly broken cell. Builds the verifier's evidence: raw ->
     rewritten pairs (flagged rows first, then other changed rows, at most
@@ -871,7 +907,10 @@ def _effect(
 def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
     """Why a unit node's rewrite (paise -> rupees, every row) is not a ÷100 rescale, or None.
 
-    Vectorised, O(rows) plus two medians. Counts are over raw rows.
+    Checks, in order: no number is lost; the median shrinks by ≈ 100 (the clearer message for
+    a rewrite that is wrong everywhere); every row where both sides are numbers is raw / 100
+    within :data:`UNIT_ROW_TOLERANCE` (Ruling U2; the error names a count and at most five row
+    indices, never values). Vectorised, O(rows) plus two medians. Counts are over raw rows.
     """
     lost = (number_mask(raw) & ~number_mask(out)).arg_true()
     if lost.len():
@@ -886,9 +925,19 @@ def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
     if not UNIT_FACTOR_MIN <= factor <= UNIT_FACTOR_MAX:
         return (
             f"the values are in paise, but the rewrite changed the median by a factor of "
-            f"{factor:.2f} (from {before.median:.2f} to {after.median:.2f}); divide every value "
+            f"{factor:.2f} (from {approx(before.median)} to {approx(after.median)}); divide "
+            "every value "
             f"by 100 unconditionally, without checking the column name (expected factor "
             f"{UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
+        )
+    # Ruling U2: the median alone lets a share of the rows stay in paise or be divided by 10.
+    # Every row where both sides are numbers must be raw / 100, give or take the rounding.
+    delta = (number_values(raw) / 100 - number_values(out)).abs()
+    bad = (delta > UNIT_ROW_TOLERANCE).fill_null(False).arg_true()
+    if bad.len():
+        return (
+            f"{bad.len()} row(s) are not the raw value divided by 100 (rows "
+            f"{bad.head(5).to_list()}); divide every value by 100 unconditionally"
         )
     return None
 
@@ -1099,6 +1148,19 @@ def _finish(
         cost_usd=run.cost(),
         latency_s=run.elapsed(),
         meta=_meta(run, actions, plan, outcomes, mapping, reasons),
+    )
+
+
+def _unit_unrepaired(prof: Profile, outcomes: list[_NodeOutcome]) -> str | None:
+    """The whole-file quarantine reason when a unit-issue column has no accepted node (U1).
+
+    ``None`` when every column with a profiler unit issue was repaired by an accepted node.
+    """
+    accepted = {o.node.column for o in outcomes if o.accepted}
+    if not (columns := [c for c in prof.unit_issues if c not in accepted]):
+        return None
+    return (
+        f"values in {', '.join(columns)} look like paise and could not be repaired; nothing loaded"
     )
 
 

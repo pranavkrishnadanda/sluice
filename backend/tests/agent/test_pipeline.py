@@ -1178,8 +1178,8 @@ def test_pipeline_profiled_reports_the_unit_issue(cases_dir: Path, orders_df: pl
     units = [i for i in profiled.issues if i.kind == "unit"]  # type: ignore[attr-defined]
     assert [i.column for i in units] == ["o_totalprice"]
     assert units[0].detail.startswith("values look like paise: 100% whole numbers")
-    (plan_prompt,) = script.roles("orchestrator")
-    assert json.dumps(units[0].detail) in plan_prompt
+    plan_prompt = script.roles("orchestrator")[0]  # re-asked: the empty plan omits the unit column
+    assert json.dumps(units[0].detail, ensure_ascii=False) in plan_prompt
 
 
 def _lineitem_paise_case(cases_dir: Path, lineitem_df: pl.DataFrame, case_id: str) -> Case:
@@ -1213,6 +1213,69 @@ def test_pipeline_repairs_paise_the_rules_parse_in_every_row(
     assert agent_grade.cell_accuracy == 1.0
     assert agent_grade.fabrication_rate in (None, 0.0)
     assert grade(case, rules_out, {}).cell_accuracy < 1.0  # type: ignore[operator]
+
+
+UNIT_SUMMARY = "values in l_extendedprice look like paise and could not be repaired; nothing loaded"
+
+
+def _assert_unit_quarantine(result: Result) -> None:
+    (finished,) = result.events("run_finished")
+    assert finished.status == "quarantined"  # type: ignore[attr-defined]
+    assert finished.summary == UNIT_SUMMARY  # type: ignore[attr-defined]
+    assert not result.events("verified")
+    assert result.out.file_quarantined
+    assert result.out.df.is_empty()
+    assert result.out.meta["file_quarantine_reason"] == UNIT_SUMMARY
+
+
+def test_pipeline_quarantines_unrepaired_paise_when_the_planner_is_down(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    """Ruling U1: loading values still in paise is worse than loading nothing."""
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0210")
+    script = Script(down=frozenset({"orchestrator"}))
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    _assert_unit_quarantine(result)
+    assert "planning" in result.out.meta["llm_error"]
+
+
+def test_pipeline_quarantines_paise_the_plan_omits_after_one_re_ask(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0211")
+    script = Script(plan={"nodes": []})
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    assert len(script.roles("orchestrator")) == 2  # the validator rejected the empty plan once
+    assert "unit issue" in script.roles("orchestrator")[1]
+    _assert_unit_quarantine(result)
+
+
+def test_pipeline_quarantines_paise_when_the_unit_node_is_exhausted(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0212")
+    script = Script(plan=LINE_PLAN, workers={"l_extendedprice": [NOOP]})
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    assert len(result.events("attempt_failed")) == MAX_ATTEMPTS
+    _assert_unit_quarantine(result)
+
+
+def test_pipeline_quarantines_paise_when_an_outage_stops_the_unit_node(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    """An outage would normally make the run ``failed`` with pass 1 output; U1 quarantines."""
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0213")
+    script = Script(plan=LINE_PLAN, down=frozenset({"worker"}))
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    _assert_unit_quarantine(result)
 
 
 def test_pipeline_repairs_indian_grouped_paise_to_rupees(
@@ -1407,10 +1470,12 @@ def test_pipeline_announces_each_phase_once_when_it_starts(indian: Case) -> None
     assert [_activity(e) for e in seen] == [
         ("mapping", None, None, None, None),
         ("planning", None, "strong", None, None),
+        ("checking", None, None, None, None),  # finding the flagged rows before the first node
         ("writing", "n1", "small", 1, None),
         ("sandbox", "n1", "small", 1, None),
         ("checking", "n1", "small", 1, None),
         ("verifying", "n1", "small", 1, None),
+        ("verifying", None, None, None, None),  # rules pass 2 on the repaired data
     ]
     assert all(e.type == "activity" for e in seen)  # type: ignore[attr-defined]
 
@@ -1432,6 +1497,7 @@ def test_pipeline_activity_interleaves_with_the_milestone_events(indian: Case) -
         "rules_applied",
         "activity:planning",
         "plan_created",
+        "activity:checking",
         "node_started",
         "activity:writing",
         "activity:sandbox",
@@ -1442,6 +1508,7 @@ def test_pipeline_activity_interleaves_with_the_milestone_events(indian: Case) -
         "activity:checking",
         "activity:verifying",
         "node_finished",
+        "activity:verifying",
         "verified",
         "run_finished",
     ]
@@ -1453,13 +1520,18 @@ def test_pipeline_activity_copy_names_the_tier_column_and_rows(indian: Case) -> 
 
     result = run(indian, script, on_activity=seen.append)
 
-    messages = {e.phase: e.message for e in seen}  # type: ignore[attr-defined]
+    messages = {e.phase: e.message for e in seen if e.node_id is not None}  # type: ignore[attr-defined]
+    run_wide = [(e.phase, e.message) for e in seen if e.node_id is None]  # type: ignore[attr-defined]
     rows = result.events("run_started")[0].rows  # type: ignore[attr-defined]
+    assert run_wide[2:] == [
+        ("checking", f"Finding the cells the rules flagged in {rows:,} rows"),
+        ("verifying", "Re-running the rules on the repaired data"),
+    ]
     assert messages["writing"] == "Asking the small model to write a fix for o_totalprice"
     assert messages["sandbox"] == f"Running the fix in the sandbox on {rows:,} rows"
     assert messages["checking"] == "Checking the rewrite against the rules"
     assert messages["verifying"] == "The verifier is checking the result"
-    assert messages["planning"] == "Asking the strong model to plan repairs for 1 column"
+    assert run_wide[1] == ("planning", "Asking the strong model to plan repairs for 1 column")
 
 
 def test_pipeline_rate_limit_wait_is_announced_then_the_phase_resumes(indian: Case) -> None:
@@ -1491,3 +1563,52 @@ def test_pipeline_without_an_activity_sink_is_unchanged(indian: Case) -> None:
 
     assert "activity" not in [e.type for e in result.log.events]  # type: ignore[attr-defined]
     assert "activity" not in [e["type"] for e in result.out.meta["events"]]
+
+
+# --- U2: per-row ÷100 check for a unit node ---------------------------------------------------
+
+_PAISE_RAW = [str(1_000_000 + 1_371 * i) for i in range(100)]
+
+
+def _rupees(paise: str, divisor: int = 100) -> str:
+    return f"{int(paise) / divisor:.2f}"
+
+
+def _unit_error(out: list[str]) -> str | None:
+    return pipeline._unit_error(pl.Series("p", _PAISE_RAW), pl.Series("p", out))
+
+
+def test_unit_error_rejects_a_rewrite_that_leaves_a_fifth_of_the_rows_in_paise() -> None:
+    out = [p if i % 5 == 0 else _rupees(p) for i, p in enumerate(_PAISE_RAW)]
+
+    error = _unit_error(out)
+
+    assert error is not None
+    assert "20 row(s)" in error
+    assert "[0, 5, 10, 15, 20]" in error
+    assert not any(v in error for v in _PAISE_RAW)  # row indices only, never values
+
+
+def test_unit_error_rejects_a_rewrite_that_divides_some_rows_by_ten() -> None:
+    out = [_rupees(p, 10) if i % 10 < 3 else _rupees(p) for i, p in enumerate(_PAISE_RAW)]
+
+    error = _unit_error(out)
+
+    assert error is not None
+    assert "30 row(s)" in error
+
+
+def test_unit_error_accepts_a_correct_rewrite_rounded_to_two_decimals() -> None:
+    raw = [f"{p}.6" for p in _PAISE_RAW]  # fractional paise: ÷100 needs rounding
+    out = [f"{float(r) / 100:.2f}" for r in raw]
+
+    assert pipeline._unit_error(pl.Series("p", raw), pl.Series("p", out)) is None
+
+
+def test_unit_error_median_message_shows_rounded_magnitudes_only() -> None:
+    raw = [str(1_000_000 + 1_371 * i) for i in range(101)]
+    error = pipeline._unit_error(pl.Series("p", raw), pl.Series("p", raw))  # nothing divided
+
+    assert error is not None and "factor" in error
+    assert "≈ 1.1 million" in error
+    assert not any(v in error for v in raw)

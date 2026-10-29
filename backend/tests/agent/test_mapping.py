@@ -32,7 +32,7 @@ from sluice.agent.mapping import (
     table_mismatch,
     validate_mapping,
 )
-from sluice.contracts.model import known_contracts, load_contract
+from sluice.contracts.model import ColumnSpec, Contract, known_contracts, load_contract
 from sluice.llm.client import LLM, LLMUnavailable
 from sluice.rules.profile import match_columns
 
@@ -530,3 +530,14 @@ def test_resolve_table_close_call_is_none() -> None:
 
 def test_resolve_table_no_columns_is_none() -> None:
     assert resolve_table([], known_contracts("v1")) is None
+
+
+def _toy_contract(name: str) -> Contract:
+    columns = tuple(ColumnSpec(f"{name}{i}", "string") for i in range(10))
+    return Contract(name, "v1", (f"{name}0",), columns)
+
+
+def test_resolve_table_margin_of_exactly_twenty_points_is_not_lost_to_float_error() -> None:
+    # 7/10 vs 5/10: a 20-point margin that plain floats compute as 0.19999999999999996.
+    columns = [*(f"a{i}" for i in range(7)), *(f"b{i}" for i in range(5))]
+    assert resolve_table(columns, [_toy_contract("a"), _toy_contract("b")]) == "a"

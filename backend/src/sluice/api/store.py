@@ -5,7 +5,7 @@ Tables (created by :meth:`RunStore.ensure_schema`, idempotent, under an advisory
 * ``api_runs``: one row per upload; ``status`` moves ``queued -> running -> <terminal>``.
 * ``run_events``: every pipeline event of a run, keyed ``(run_id, seq)``; ``payload`` is the
   contract JSON (camelCase), parsed back with :data:`~sluice.agent.events.PIPELINE_EVENT_ADAPTER`,
-  which covers all ten contract event types.
+  which covers all eleven contract event types (``activity`` included).
 * ``run_artefacts``: the preview blob key and the transforms of a run (transforms are appended
   live, one per attempt that produced code; the preview key is set when the run has finished).
 

@@ -3,6 +3,7 @@ raw-input route, against a real RunStore (Postgres, own schema) and S3BlobStore 
 bucket). No worker runs, so the runs stay queued: the raw rows are served from creation.
 """
 
+import json
 import secrets
 from collections.abc import Iterator
 from pathlib import Path
@@ -117,3 +118,44 @@ def test_auto_upload_of_an_unrecognisable_file_is_422_and_keeps_nothing(
 def test_get_input_of_an_unknown_run_is_404(client: TestClient) -> None:
     res = client.get("/runs/nope/input")
     assert res.status_code == 404
+
+
+def test_activity_survives_the_store_and_an_sse_resume_with_last_event_id(
+    client: TestClient, store: RunStore, tmp_path: Path
+) -> None:
+    from sluice.agent import events as ev
+    from sluice.agent.events import EventLog
+
+    csv = tmp_path / "orders.csv"
+    csv.write_text("o_orderkey,o_custkey\n1,10\n", encoding="utf-8")
+    run_id = _upload(client, csv, "orders")["id"]
+    log = EventLog()
+    stamped = [
+        log.emit(ev.RunStarted(run_id=run_id, file_name="orders.csv", table="orders", rows=1)),
+        log.emit(
+            ev.Activity(
+                node_id="n1",
+                phase="waiting",
+                message="Rate limit reached on the small model — retrying in 14 s",
+                tier="small",
+                attempt=2,
+                retry_in_s=14,
+            )
+        ),
+        log.emit(ev.RunFinished(status="succeeded", summary="done", cost_usd=0.0, tokens=0)),
+    ]
+    for event in stamped:
+        store.append_event(run_id, event)
+    store.finish(run_id, "succeeded", 0.0)
+
+    res = client.get(f"/runs/{run_id}/events", headers={"Last-Event-ID": "1"})
+
+    assert res.status_code == 200
+    data = [
+        json.loads(line.removeprefix("data: "))
+        for line in res.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [d["seq"] for d in data] == [2, 3]
+    assert data[0] == stamped[1].to_dict()  # every field, camelCase, as emitted
+    assert data[0]["retryInS"] == 14 and data[0]["nodeId"] == "n1"
