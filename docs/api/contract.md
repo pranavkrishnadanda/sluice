@@ -310,6 +310,16 @@ finish, and their events are still emitted) and the run does **not** emit
 provider outage, the run is `quarantined`. Nothing loads either way, and the
 quarantine is the more specific signal.
 
+**Unrepaired units.** When the profiler finds a money column whose values
+look like whole paise (a `unit` issue in `profiled.issues`), the plan must
+include a node for it. If that column ends the run without an accepted
+node (planning fell back to the rules, the plan left it out, its node ran
+out of attempts, or an outage, cap or sandbox error stopped it), nothing
+is loaded: the run ends `quarantined` (no `verified`, no `loaded`) with the
+summary "values in <column> look like paise and could not be repaired;
+nothing loaded". This also takes precedence over `failed`: loading values
+that are 100 times too large is worse than loading nothing.
+
 **Exactly one terminal event.** Every run ends with exactly one
 `run_finished`, whatever happens: a worker crash, a model-provider outage
 or a spend/time cap still produces a `run_finished` (status `failed` or

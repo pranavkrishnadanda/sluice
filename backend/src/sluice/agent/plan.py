@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Final, Literal, TypeGuard
 
 import polars as pl
@@ -240,11 +240,15 @@ def _check_acyclic(nodes: list[PlanNode]) -> None:
         raise PlanError(f"depends_on has a cycle through node(s) {stuck[:10]}")
 
 
-def validate_plan(plan: Plan, candidates: dict[str, list[str]]) -> Plan:
+def validate_plan(
+    plan: Plan, candidates: dict[str, list[str]], *, required: Collection[str] = ()
+) -> Plan:
     """Return ``plan`` unchanged if it is semantically valid, else raise :class:`PlanError`.
 
     Rules: every column is a candidate, at most one node per column, node ids unique, every
-    ``depends_on`` id names a node in the plan, and the dependency graph is acyclic.
+    ``depends_on`` id names a node in the plan, the dependency graph is acyclic, and every
+    ``required`` column (one with a profiler unit issue, Ruling U1) has a node: its values are
+    all in the wrong unit, so a plan that leaves it alone would load them unrepaired.
     """
     ids: set[str] = set()
     columns: set[str] = set()
@@ -261,6 +265,11 @@ def validate_plan(plan: Plan, candidates: dict[str, list[str]]) -> Plan:
         if unknown := sorted(set(n.depends_on) - ids):
             raise PlanError(f"node {n.id!r} depends on unknown node(s) {unknown[:10]}")
     _check_acyclic(plan.nodes)
+    if missing := sorted(set(required) - columns):
+        raise PlanError(
+            f"column(s) {missing[:10]} have a unit issue and need a node: "
+            "every value is in the wrong unit"
+        )
     return plan
 
 
@@ -303,7 +312,8 @@ async def propose_plan(
     ``source_names`` maps a contract column to the input column it is read from. Both feed
     :func:`difficulty_floor`: the returned plan's difficulties are at least their floor.
 
-    Empty ``candidates`` returns ``Plan(nodes=[])`` without calling a model. A failed attempt
+    Empty ``candidates`` returns ``Plan(nodes=[])`` without calling a model. Every candidate
+    with an ``issues`` entry must get a node (Ruling U1). A failed attempt
     (the client's schema repair failed, or :func:`validate_plan` rejected the plan) is
     re-requested once with a short error text (at most :data:`PLAN_FEEDBACK_CHARS`) appended.
 
@@ -330,7 +340,8 @@ async def propose_plan(
         records.append(record)
         if plan is not None:
             try:
-                valid = validate_plan(plan, candidates)
+                required = (issues or {}).keys() & candidates.keys()
+                valid = validate_plan(plan, candidates, required=required)
                 return _with_floor(
                     valid, candidates, contract, issues or {}, source_names or {}
                 ), records

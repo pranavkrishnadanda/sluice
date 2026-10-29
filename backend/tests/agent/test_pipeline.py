@@ -1178,7 +1178,7 @@ def test_pipeline_profiled_reports_the_unit_issue(cases_dir: Path, orders_df: pl
     units = [i for i in profiled.issues if i.kind == "unit"]  # type: ignore[attr-defined]
     assert [i.column for i in units] == ["o_totalprice"]
     assert units[0].detail.startswith("values look like paise: 100% whole numbers")
-    (plan_prompt,) = script.roles("orchestrator")
+    plan_prompt = script.roles("orchestrator")[0]  # re-asked: the empty plan omits the unit column
     assert json.dumps(units[0].detail) in plan_prompt
 
 
@@ -1213,6 +1213,69 @@ def test_pipeline_repairs_paise_the_rules_parse_in_every_row(
     assert agent_grade.cell_accuracy == 1.0
     assert agent_grade.fabrication_rate in (None, 0.0)
     assert grade(case, rules_out, {}).cell_accuracy < 1.0  # type: ignore[operator]
+
+
+UNIT_SUMMARY = "values in l_extendedprice look like paise and could not be repaired; nothing loaded"
+
+
+def _assert_unit_quarantine(result: Result) -> None:
+    (finished,) = result.events("run_finished")
+    assert finished.status == "quarantined"  # type: ignore[attr-defined]
+    assert finished.summary == UNIT_SUMMARY  # type: ignore[attr-defined]
+    assert not result.events("verified")
+    assert result.out.file_quarantined
+    assert result.out.df.is_empty()
+    assert result.out.meta["file_quarantine_reason"] == UNIT_SUMMARY
+
+
+def test_pipeline_quarantines_unrepaired_paise_when_the_planner_is_down(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    """Ruling U1: loading values still in paise is worse than loading nothing."""
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0210")
+    script = Script(down=frozenset({"orchestrator"}))
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    _assert_unit_quarantine(result)
+    assert "planning" in result.out.meta["llm_error"]
+
+
+def test_pipeline_quarantines_paise_the_plan_omits_after_one_re_ask(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0211")
+    script = Script(plan={"nodes": []})
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    assert len(script.roles("orchestrator")) == 2  # the validator rejected the empty plan once
+    assert "unit issue" in script.roles("orchestrator")[1]
+    _assert_unit_quarantine(result)
+
+
+def test_pipeline_quarantines_paise_when_the_unit_node_is_exhausted(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0212")
+    script = Script(plan=LINE_PLAN, workers={"l_extendedprice": [NOOP]})
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    assert len(result.events("attempt_failed")) == MAX_ATTEMPTS
+    _assert_unit_quarantine(result)
+
+
+def test_pipeline_quarantines_paise_when_an_outage_stops_the_unit_node(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    """An outage would normally make the run ``failed`` with pass 1 output; U1 quarantines."""
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0213")
+    script = Script(plan=LINE_PLAN, down=frozenset({"worker"}))
+
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    _assert_unit_quarantine(result)
 
 
 def test_pipeline_repairs_indian_grouped_paise_to_rupees(

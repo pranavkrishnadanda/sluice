@@ -37,6 +37,13 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    **Failure path** (contract): when a node's final attempt fails, no new node starts (nodes in
    flight finish), there is no ``verified``, and the whole input is quarantined
    (``file_quarantined``, empty output) with ``run_finished`` status ``quarantined``.
+   **Unrepaired unit (Ruling U1).** A column with a profiler unit issue must end with an
+   accepted node: the planner must plan one (:func:`sluice.agent.plan.validate_plan` rejects a
+   plan without it, so the usual one re-ask applies). When it does not (the planner fell back,
+   the plan still omits it, the node ran out of attempts, an outage, a cap or a broken sandbox
+   stopped it), nothing loads: whole-file quarantine, status ``quarantined``, summary "values
+   in <column> look like paise and could not be repaired; nothing loaded". This beats
+   ``failed`` too (as Ruling C4c does): loading wrong-unit values is worse than failing.
 6. **rules pass 2** on the raw frame with every accepted column replaced; ``verified`` (contract
    checks on the final output) unless the run failed.
 7. ``run_finished``, exactly once (``loaded`` belongs to the loader / ``sluice run``). Its
@@ -445,6 +452,9 @@ async def _pipeline(run: _Run) -> SystemOutput:
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
+        if (unrepaired := _unit_unrepaired(prof1, [])) is not None:
+            actions = [*map_actions, *pass1.actions, f"file quarantined: {unrepaired}"]
+            return _quarantine_file(run, actions, None, [], mapping, unrepaired, summary=unrepaired)
         return _finish(run, pass1, map_actions + pass1.actions, None, [], mapping)
 
     run.emit(
@@ -462,6 +472,13 @@ async def _pipeline(run: _Run) -> SystemOutput:
         )
     )
     outcomes = await _run_nodes(run, plan, frame, prof1, candidates, _hints(mapping))
+    if (unrepaired := _unit_unrepaired(prof1, outcomes)) is not None:
+        # Ruling U1: whatever stopped the unit node (exhausted, outage, cap, broken sandbox),
+        # loading values still in paise is worse than loading nothing.
+        actions = [*map_actions, *pass1.actions, f"file quarantined: {unrepaired}"]
+        return _quarantine_file(
+            run, actions, plan, outcomes, mapping, unrepaired, summary=unrepaired
+        )
     if run.halted is not None:
         actions = [*map_actions, *pass1.actions, f"file quarantined: {run.halted}"]
         return _quarantine_file(run, actions, plan, outcomes, mapping, run.halted)
@@ -1099,6 +1116,19 @@ def _finish(
         cost_usd=run.cost(),
         latency_s=run.elapsed(),
         meta=_meta(run, actions, plan, outcomes, mapping, reasons),
+    )
+
+
+def _unit_unrepaired(prof: Profile, outcomes: list[_NodeOutcome]) -> str | None:
+    """The whole-file quarantine reason when a unit-issue column has no accepted node (U1).
+
+    ``None`` when every column with a profiler unit issue was repaired by an accepted node.
+    """
+    accepted = {o.node.column for o in outcomes if o.accepted}
+    if not (columns := [c for c in prof.unit_issues if c not in accepted]):
+        return None
+    return (
+        f"values in {', '.join(columns)} look like paise and could not be repaired; nothing loaded"
     )
 
 
