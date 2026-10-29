@@ -1,24 +1,26 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  type DataPreview,
-  PREVIEW_MAX_LIMIT,
-  type PreviewRow,
-} from "@/lib/api/types";
+import { type DataPreview, PREVIEW_MAX_LIMIT } from "@/lib/api/types";
 import { useResource } from "./use-resource";
 
 /** Rows per preview request: the server's maximum page size. */
 export const PREVIEW_PAGE_SIZE = PREVIEW_MAX_LIMIT;
 
-export type PreviewPages =
+/** A paged response: the preview, or the raw uploaded file. */
+interface Paged {
+  rows: readonly unknown[];
+  nextOffset: number | null;
+}
+
+export type PreviewPages<P extends Paged = DataPreview> =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; error: unknown; retry: () => void }
   | {
       status: "ready";
       /** Every page loaded so far, concatenated; `nextOffset` is the next. */
-      preview: DataPreview;
+      preview: P;
       loadingMore: boolean;
       /** The last next-page request failed; `loadMore` retries it. */
       moreError: unknown;
@@ -26,35 +28,31 @@ export type PreviewPages =
       loadMore: () => void;
     };
 
-interface Extra {
+interface Extra<P extends Paged> {
   /** The first page these follow; a refetched first page drops them. */
-  base: DataPreview;
-  rows: PreviewRow[];
+  base: P;
+  rows: P["rows"][number][];
   nextOffset: number | null;
   loading: boolean;
   error: unknown;
 }
 
 /**
- * The run preview, paged: the first page loads with `key` (like
+ * A run's paged rows (the preview, or the raw upload): the first page loads with `key` (like
  * {@link useResource}); later pages load only when `loadMore` is called,
  * typically as the virtualised table nears the end of what is loaded.
  * `load`'s `signal` aborts when `key` changes or the hook unmounts.
  */
-export function usePreviewPages(
+export function usePreviewPages<P extends Paged = DataPreview>(
   key: string | null,
-  load: (
-    offset: number,
-    limit: number,
-    signal: AbortSignal,
-  ) => Promise<DataPreview>,
-): PreviewPages {
+  load: (offset: number, limit: number, signal: AbortSignal) => Promise<P>,
+): PreviewPages<P> {
   const first = useResource(key, (signal) =>
     load(0, PREVIEW_PAGE_SIZE, signal),
   );
-  const [extra, setExtra] = useState<Extra | null>(null);
+  const [extra, setExtra] = useState<Extra<P> | null>(null);
   // The first page a next-page request is in flight for (no double fetch).
-  const inFlight = useRef<DataPreview | null>(null);
+  const inFlight = useRef<P | null>(null);
   // Aborts next-page requests made for the current key.
   const more = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -67,7 +65,7 @@ export function usePreviewPages(
   const base = first.status === "ready" ? first.data : null;
   const current = base && extra?.base === base ? extra : null;
 
-  const preview = useMemo<DataPreview | null>(() => {
+  const preview = useMemo<P | null>(() => {
     if (!base) return null;
     if (!current) return base;
     return {

@@ -56,7 +56,7 @@ type ObserveRect = VirtualizerOptions<
 >["observeElementRect"];
 
 /** A fixed viewport for environments without layout (tests). */
-function fixedRect(height: number): ObserveRect {
+export function fixedRect(height: number): ObserveRect {
   return (_instance, cb) => {
     cb({ width: 360, height });
     return undefined;
@@ -291,7 +291,7 @@ interface WindowItem {
 }
 
 /** Below the table: "Loading more rows…" or a failed page with Retry. */
-function MoreStatus({
+export function MoreStatus({
   failed,
   onRetry,
 }: {

@@ -5,11 +5,12 @@ import { type ReactNode, useMemo, useState } from "react";
 import { useApi } from "@/components/api/ApiProvider";
 import { DemoBadge } from "@/components/shell/DemoBadge";
 import { useRunStream } from "@/components/thread/run-stream";
-import { errorDetail, retryWhileNotReady } from "@/lib/api/errors";
-import type { Transform } from "@/lib/api/types";
+import { errorDetail, isNotFound, retryWhileNotReady } from "@/lib/api/errors";
+import type { InputPreview, Transform } from "@/lib/api/types";
 import type { RunViewState } from "@/lib/run-state";
 import { CodeTab, type NoCodeReason } from "./CodeTab";
 import { DataTab, DataTabSkeleton } from "./DataTab";
+import { InputTab } from "./InputTab";
 import { PlanTab } from "./PlanTab";
 import { type PreviewPages, usePreviewPages } from "./use-preview-pages";
 import { type Resource, useResource } from "./use-resource";
@@ -128,29 +129,86 @@ function Note({ children }: { children: ReactNode }) {
   );
 }
 
-/**
- * The Data tab body. The preview exists only once the run has loaded (the
- * API answers 409 before), so a live run shows a note instead of fetching.
- */
-function DataPanel({
+/** The Data tab before `loaded` (or for a run that never loads). */
+function InputPanel({
   state,
   pages,
   viewportHeight,
   sample,
 }: {
+  state: RunViewState;
+  pages: PreviewPages<InputPreview>;
+  viewportHeight?: number;
+  sample: boolean;
+}) {
+  switch (pages.status) {
+    case "idle":
+    case "loading":
+      return (
+        <output aria-label="Loading the uploaded file" className="contents">
+          <DataTabSkeleton />
+        </output>
+      );
+    case "error":
+      // A run from before the raw-input route, or whose upload is gone.
+      if (isNotFound(pages.error)) {
+        return (
+          <Note>
+            {state.finished
+              ? "No preview — this run didn’t load any data, and its uploaded file isn’t available."
+              : "The uploaded file isn’t available yet. The before/after preview appears once the data has loaded."}
+          </Note>
+        );
+      }
+      return (
+        <Unavailable
+          what="the uploaded file"
+          error={pages.error}
+          retry={pages.retry}
+        />
+      );
+    case "ready":
+      return (
+        <InputTab
+          input={pages.preview}
+          loadingMore={pages.loadingMore}
+          moreError={pages.moreError}
+          onLoadMore={pages.loadMore}
+          neverLoaded={state.finished}
+          sample={sample}
+          viewportHeight={viewportHeight}
+        />
+      );
+  }
+}
+
+/**
+ * The Data tab body. The before/after preview exists only once the run
+ * has loaded (the API answers 409 before), so until then — and for a run
+ * that never loads — the raw uploaded rows are shown instead.
+ */
+function DataPanel({
+  state,
+  pages,
+  input,
+  viewportHeight,
+  sample,
+}: {
   state: RunViewState | null;
   pages: PreviewPages;
+  input: PreviewPages<InputPreview>;
   viewportHeight?: number;
   /** The demo mock replays a fixture for this run (see `isSampleReplay`). */
   sample: boolean;
 }) {
   if (state && !state.loaded) {
     return (
-      <Note>
-        {state.finished
-          ? "No preview — this run didn’t load any data."
-          : "The before/after preview appears once the data has loaded."}
-      </Note>
+      <InputPanel
+        state={state}
+        pages={input}
+        viewportHeight={viewportHeight}
+        sample={sample}
+      />
     );
   }
   switch (pages.status) {
@@ -232,6 +290,11 @@ export function SidePanel({
         signal,
       ),
   );
+  // The raw upload: available from creation, wanted only until `loaded`.
+  const input = usePreviewPages(
+    opened.has("data") && !loaded ? `${runId}|input` : null,
+    (offset, limit) => api.getInput(runId, { offset, limit }),
+  );
   const transforms = useResource(
     opened.has("code") ? `${runId}|${transformsKey(state)}` : null,
     () => api.getTransforms(runId),
@@ -284,6 +347,7 @@ export function SidePanel({
         <DataPanel
           state={state}
           pages={pages}
+          input={input}
           viewportHeight={dataViewportHeight}
           sample={sample}
         />
