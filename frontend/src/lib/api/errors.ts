@@ -87,19 +87,43 @@ export const NOT_READY_RETRY_MS: readonly number[] = [
 /**
  * Calls `load`, retrying while it rejects with `409 not_ready` (see
  * {@link isNotReady}), once after each delay in `delays`. Any other error,
- * or `not_ready` after the last retry, rejects as usual.
+ * or `not_ready` after the last retry, rejects as usual. Aborting `signal`
+ * clears the pending wait and rejects with the signal's reason (an
+ * `AbortError`), so a closed panel or a changed run stops retrying.
  */
 export async function retryWhileNotReady<T>(
   load: () => Promise<T>,
   delays: readonly number[] = NOT_READY_RETRY_MS,
+  signal?: AbortSignal,
 ): Promise<T> {
   for (const delay of delays) {
+    signal?.throwIfAborted();
     try {
       return await load();
     } catch (err) {
       if (!isNotReady(err)) throw err;
     }
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    await wait(delay, signal);
   }
+  signal?.throwIfAborted();
   return load();
+}
+
+/** Resolves after `ms`, or rejects (timer cleared) once `signal` aborts. */
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

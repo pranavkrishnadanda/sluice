@@ -104,4 +104,40 @@ describe("retryWhileNotReady", () => {
     await expect(retryWhileNotReady(load, [0, 0])).rejects.toBe(other);
     expect(load).toHaveBeenCalledTimes(1);
   });
+
+  test("an abort cancels the pending retry timer and stops retrying", async () => {
+    vi.useFakeTimers();
+    try {
+      const load = vi.fn<() => Promise<string>>().mockRejectedValue(notReady());
+      const controller = new AbortController();
+      const result = retryWhileNotReady(
+        load,
+        [1_000, 1_000],
+        controller.signal,
+      );
+      const settled = result.then(
+        () => null,
+        (err: unknown) => err,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
+
+      controller.abort();
+      expect(await settled).toMatchObject({ name: "AbortError" });
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(load).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an already-aborted signal does not call load", async () => {
+    const load = vi.fn<() => Promise<string>>().mockResolvedValue("ok");
+    await expect(
+      retryWhileNotReady(load, [0], AbortSignal.abort()),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(load).not.toHaveBeenCalled();
+  });
 });

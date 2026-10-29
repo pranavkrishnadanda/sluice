@@ -224,8 +224,13 @@ export function SidePanel({
     opened.has("data") && loaded ? runId : null,
     // Just after `loaded` the preview may still be being written: the API
     // answers 409 `not_ready` and the contract says to retry shortly.
-    (offset, limit) =>
-      retryWhileNotReady(() => api.getPreview(runId, { offset, limit })),
+    // The retries stop when the panel closes or the run changes.
+    (offset, limit, signal) =>
+      retryWhileNotReady(
+        () => api.getPreview(runId, { offset, limit }),
+        undefined,
+        signal,
+      ),
   );
   const transforms = useResource(
     opened.has("code") ? `${runId}|${transformsKey(state)}` : null,

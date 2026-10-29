@@ -28,12 +28,13 @@ interface Settled<T> {
  * Loads `load()` whenever `key` changes (`null` = not wanted yet). While a
  * new key loads, the last good data stays on screen marked `stale` instead
  * of flashing a skeleton. A result that arrives after the key moved on, or
- * after unmount, is dropped. `load` is an effect event (always the latest,
+ * after unmount, is dropped, and `load`'s `signal` aborts then (so pending
+ * retry timers can stop). `load` is an effect event (always the latest,
  * never a dependency), so it need not be memoised; change `key` to refetch.
  */
 export function useResource<T>(
   key: string | null,
-  load: () => Promise<T>,
+  load: (signal: AbortSignal) => Promise<T>,
 ): Resource<T> {
   const [attempt, setAttempt] = useState(0);
   const [settled, setSettled] = useState<Settled<T> | null>(null);
@@ -44,7 +45,8 @@ export function useResource<T>(
   useEffect(() => {
     if (key === null) return;
     let live = true;
-    run().then(
+    const controller = new AbortController();
+    run(controller.signal).then(
       (data) => {
         if (!live) return;
         setSettled({ key, attempt, result: { ok: true, data } });
@@ -56,6 +58,7 @@ export function useResource<T>(
     );
     return () => {
       live = false;
+      controller.abort();
     };
   }, [key, attempt]);
 

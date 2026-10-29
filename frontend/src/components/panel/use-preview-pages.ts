@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   type DataPreview,
   PREVIEW_MAX_LIMIT,
@@ -39,15 +39,30 @@ interface Extra {
  * The run preview, paged: the first page loads with `key` (like
  * {@link useResource}); later pages load only when `loadMore` is called,
  * typically as the virtualised table nears the end of what is loaded.
+ * `load`'s `signal` aborts when `key` changes or the hook unmounts.
  */
 export function usePreviewPages(
   key: string | null,
-  load: (offset: number, limit: number) => Promise<DataPreview>,
+  load: (
+    offset: number,
+    limit: number,
+    signal: AbortSignal,
+  ) => Promise<DataPreview>,
 ): PreviewPages {
-  const first = useResource(key, () => load(0, PREVIEW_PAGE_SIZE));
+  const first = useResource(key, (signal) =>
+    load(0, PREVIEW_PAGE_SIZE, signal),
+  );
   const [extra, setExtra] = useState<Extra | null>(null);
   // The first page a next-page request is in flight for (no double fetch).
   const inFlight = useRef<DataPreview | null>(null);
+  // Aborts next-page requests made for the current key.
+  const more = useRef<AbortController | null>(null);
+  useEffect(() => {
+    if (key === null) return;
+    const controller = new AbortController();
+    more.current = controller;
+    return () => controller.abort();
+  }, [key]);
 
   const base = first.status === "ready" ? first.data : null;
   const current = base && extra?.base === base ? extra : null;
@@ -76,7 +91,8 @@ export function usePreviewPages(
       loading: true,
       error: null,
     });
-    load(offset, PREVIEW_PAGE_SIZE).then(
+    const signal = more.current?.signal ?? AbortSignal.abort();
+    load(offset, PREVIEW_PAGE_SIZE, signal).then(
       (page) => {
         if (inFlight.current === base) inFlight.current = null;
         setExtra((prev) =>
@@ -92,6 +108,7 @@ export function usePreviewPages(
       },
       (error: unknown) => {
         if (inFlight.current === base) inFlight.current = null;
+        if (signal.aborted) return;
         setExtra((prev) =>
           prev?.base === base ? { ...prev, loading: false, error } : prev,
         );

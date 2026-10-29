@@ -393,6 +393,56 @@ describe("data tab", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  describe("not_ready retries stop when the panel goes away", () => {
+    const notReady = () =>
+      new ApiError(409, "/runs/x/preview", "409 Not ready", {
+        code: "not_ready",
+      });
+
+    test("on unmount (panel closed)", async () => {
+      vi.useFakeTimers();
+      try {
+        const getPreview = vi
+          .fn<ApiClient["getPreview"]>()
+          .mockImplementation(() => Promise.reject(notReady()));
+        const { unmount } = renderPanel("x", null, {
+          ...withPreview(bigPreview(1)),
+          getPreview,
+        });
+        await act(() => vi.advanceTimersByTimeAsync(300));
+        expect(getPreview).toHaveBeenCalledTimes(2);
+        unmount();
+        await act(() => vi.advanceTimersByTimeAsync(30_000));
+        expect(getPreview).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    test("when the run changes", async () => {
+      vi.useFakeTimers();
+      try {
+        const getPreview = vi
+          .fn<ApiClient["getPreview"]>()
+          .mockImplementation(() => Promise.reject(notReady()));
+        const client = { ...withPreview(bigPreview(1)), getPreview };
+        const { rerender } = renderPanel("run-a", null, client);
+        await act(() => vi.advanceTimersByTimeAsync(0));
+        rerender(
+          <ApiProvider client={client}>
+            <SidePanel runId="run-b" state={null} dataViewportHeight={480} />
+          </ApiProvider>,
+        );
+        await act(() => vi.advanceTimersByTimeAsync(30_000));
+        const runs = getPreview.mock.calls.map(([id]) => id);
+        expect(runs.filter((id) => id === "run-a")).toHaveLength(1);
+        expect(runs.filter((id) => id === "run-b").length).toBeGreaterThan(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   test("a run without a stored preview (409 no_preview) is not retried", async () => {
     const getPreview = vi.fn<ApiClient["getPreview"]>().mockRejectedValue(
       new ApiError(409, "/runs/x/preview", "409 No preview", {
