@@ -15,15 +15,20 @@ import {
  *   reports text contrast as "incomplete" rather than checking it; this pass
  *   covers every other rule. The translucent colours themselves are guarded
  *   worst-case by tests/design/contrast.test.ts.
- * - "opaque": reduced transparency (the app's own solid-glass fallback) with
- *   the decorative ring hidden, so axe measures real rendered contrast for
- *   every text node on glass.
+ * - "opaque": reduced transparency (the app's own solid-glass fallback, with
+ *   no colour blobs) and reduced motion, plus the decorative ring hidden, so
+ *   axe measures real, settled rendered contrast for every text node on glass.
  */
 const MODES = ["translucent", "opaque"] as const;
 type Mode = (typeof MODES)[number];
 
 async function beforeLoad(page: Page, mode: Mode) {
-  if (mode === "opaque") await emulateReducedTransparency(page);
+  if (mode !== "opaque") return;
+  await emulateReducedTransparency(page);
+  // Measure settled colours: new thread content fades in from opacity 0
+  // (.rise-in), and a scan mid-fade reads muted text as failing contrast.
+  // The app's reduced-motion rule turns every animation off.
+  await page.emulateMedia({ reducedMotion: "reduce" });
 }
 
 async function afterLoad(page: Page, mode: Mode) {
