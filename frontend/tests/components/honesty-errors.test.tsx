@@ -166,6 +166,39 @@ describe("API error details", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(detail);
   });
 
+  test("composer refuses a file over 100 MB without uploading it", async () => {
+    const createRun = vi.fn<ApiClient["createRun"]>();
+    render(
+      <ApiProvider client={liveClient({ createRun })}>
+        <NewRunComposer />
+      </ApiProvider>,
+    );
+    const user = userEvent.setup();
+    const at = (size: number) => {
+      const file = new File(["a"], "big.csv", { type: "text/csv" });
+      Object.defineProperty(file, "size", { value: size });
+      return file;
+    };
+    await user.upload(
+      screen.getByLabelText("Attach a file"),
+      at(100 * 1024 * 1024 + 1),
+    );
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "File too large: the limit is 100 MB.",
+    );
+    expect(createRun).not.toHaveBeenCalled();
+
+    // Exactly at the limit is allowed.
+    createRun.mockReturnValue(new Promise(() => {}));
+    await user.upload(
+      screen.getByLabelText("Attach a file"),
+      at(100 * 1024 * 1024),
+    );
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(createRun).toHaveBeenCalledTimes(1);
+  });
+
   test("composer keeps the connection copy for 5xx and network errors", async () => {
     const createRun = vi
       .fn<ApiClient["createRun"]>()

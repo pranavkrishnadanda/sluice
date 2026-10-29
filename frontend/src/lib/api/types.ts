@@ -5,6 +5,8 @@
 
 /** Server maximum for `GET /runs/{id}/preview?limit=`. */
 export const PREVIEW_MAX_LIMIT = 1_000;
+/** Server maximum upload size for `POST /runs` (100 MB), in bytes. */
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 /** `attempt_failed.error` is truncated to this many characters. */
 export const MAX_ATTEMPT_ERROR_CHARS = 2_000;
 
