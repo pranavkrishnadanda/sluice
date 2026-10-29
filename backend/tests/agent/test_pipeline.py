@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import threading
 import time
 from collections.abc import Callable
@@ -19,27 +18,31 @@ from typing import Any
 
 import polars as pl
 import pytest
-from model_fakes import output_part
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    SystemPromptPart,
-    UserPromptPart,
+from pipeline_fakes import (
+    ALL_NULL,
+    CANNED,
+    CRASH,
+    DOWN,
+    FILL_ZERO,
+    ISO_DATES,
+    NO_TRANSFORM,
+    NOOP,
+    STRIP_COMMAS,
+    TOKENS_PER_CALL,
+    FakeSandbox,
+    Script,
+    _module,
+    node,
 )
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.usage import RequestUsage
 
 from sluice import cli
 from sluice.agent import pipeline
 from sluice.agent.caps import MAX_ATTEMPTS
 from sluice.agent.events import PIPELINE_EVENT_ADAPTER, EventLog, EventModel
-from sluice.agent.mapping import SYSTEM_PROMPT as MAPPER_PROMPT
 from sluice.agent.pipeline import PipelineDeps, run_pipeline
-from sluice.agent.plan import SYSTEM_PROMPT as PLANNER_PROMPT
-from sluice.agent.verifier import VERIFIER_SYSTEM_PROMPT
-from sluice.agent.worker import WORKER_SYSTEM_PROMPT, precheck_code
+from sluice.agent.worker import precheck_code
 from sluice.contracts.model import Contract, load_contract
 from sluice.drift.cases import Case, Recipe, build_case
 from sluice.evals.graders import grade
@@ -50,138 +53,6 @@ from sluice.load.iceberg import PlanNodeRecord, TransformRecord, pk_text
 from sluice.sandbox.runner import SandboxResult
 from sluice.systems.agent import AgentSystem
 from sluice.systems.rules_only import RulesOnlySystem
-
-TOKENS_PER_CALL = 150  # 100 in + 50 out, see Script.respond
-
-
-def _module(body: str) -> str:
-    return f"import polars as pl\n\n\ndef transform(values: pl.Series) -> pl.Series:\n{body}\n"
-
-
-STRIP_COMMAS = _module(
-    "    gone = values.str.strip_chars().is_in(['N/A', '', '-1', '###'])\n"
-    "    return pl.select(pl.when(gone).then(None).otherwise(values.str.replace_all(',', '')))"
-    ".to_series()"
-)
-CRASH = _module("    raise ValueError('boom')")
-FILL_ZERO = _module("    return pl.Series(['0.00'] * len(values))")
-ALL_NULL = _module("    return pl.Series([None] * len(values))")
-NOOP = _module("    return values")
-ISO_DATES = _module(
-    "    return values.str.to_date('%d %b %Y', strict=False).dt.strftime('%Y-%m-%d')"
-)
-NO_TRANSFORM = "import polars as pl\n\nx = 1\n"  # fails precheck: no `def transform`
-DOWN = "<provider outage>"  # a worker queue entry that makes that call fail with HTTP 503
-
-_ROLE_BY_PROMPT = {
-    MAPPER_PROMPT: "mapper",
-    PLANNER_PROMPT: "orchestrator",
-    WORKER_SYSTEM_PROMPT: "worker",
-    VERIFIER_SYSTEM_PROMPT: "verifier",
-}
-
-
-def _iso_dates(values: pl.Series) -> pl.Series:
-    parsed = values.str.to_date("%d %b %Y", strict=False).dt.strftime("%Y-%m-%d")
-    return pl.Series(values.name, parsed).fill_null(values)
-
-
-def _strip_commas(values: pl.Series) -> pl.Series:
-    gone = values.str.strip_chars().is_in(["N/A", "", "-1", "###"])
-    stripped = values.str.replace_all(",", "")
-    return pl.select(pl.when(gone).then(None).otherwise(stripped)).to_series()
-
-
-CANNED: dict[str, Callable[[pl.Series], SandboxResult]] = {
-    STRIP_COMMAS: lambda v: SandboxResult(True, _strip_commas(v), None, 3),
-    CRASH: lambda v: SandboxResult(False, None, "ValueError: boom (line 5)", 3),
-    FILL_ZERO: lambda v: SandboxResult(True, pl.Series(["0.00"] * v.len()), None, 3),
-    ALL_NULL: lambda v: SandboxResult(True, pl.Series([None] * v.len()), None, 3),
-    NOOP: lambda v: SandboxResult(True, v, None, 3),
-    ISO_DATES: lambda v: SandboxResult(True, _iso_dates(v), None, 3),
-}
-
-
-@dataclass
-class FakeSandbox:
-    """Maps a known transform source to a canned result; records each call."""
-
-    on_call: Callable[[], None] | None = None
-    calls: list[str] = field(default_factory=list)
-
-    def __call__(self, code: str, values: pl.Series) -> SandboxResult:
-        assert values.dtype == pl.String
-        self.calls.append(code)
-        if self.on_call is not None:
-            self.on_call()
-        return CANNED[code](values)
-
-
-def _texts(messages: list[ModelMessage]) -> tuple[str, str]:
-    system = user = ""
-    for message in messages:
-        if isinstance(message, ModelRequest):
-            for part in message.parts:
-                if isinstance(part, SystemPromptPart) and not system:
-                    system = part.content
-                elif isinstance(part, UserPromptPart) and not user:
-                    user = str(part.content)
-    return system, user
-
-
-@dataclass
-class Script:
-    """A FunctionModel playing every role: mapper, orchestrator, worker (per column), verifier."""
-
-    mapping: dict[str, Any] = field(default_factory=lambda: {"mappings": []})
-    plan: dict[str, Any] = field(default_factory=lambda: {"nodes": []})
-    workers: dict[str, list[str]] = field(default_factory=dict)
-    verdicts: list[bool] = field(default_factory=list)
-    down: frozenset[str] = frozenset()
-    down_columns: frozenset[str] = frozenset()  # worker outage for these columns only
-    calls: list[tuple[str, str]] = field(default_factory=list)
-
-    def respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        system, user = _texts(messages)
-        role = _ROLE_BY_PROMPT[system]
-        self.calls.append((role, user))
-        if role in self.down:
-            raise ModelHTTPError(503, "script")
-        if role == "mapper":
-            out: dict[str, Any] = self.mapping
-        elif role == "orchestrator":
-            out = self.plan
-        elif role == "worker":
-            match = re.search(r'column "([^"]+)"', user)
-            assert match is not None
-            if match.group(1) in self.down_columns:
-                raise ModelHTTPError(503, "script")
-            queue = self.workers[match.group(1)]
-            code = queue.pop(0) if len(queue) > 1 else queue[0]
-            if code == DOWN:
-                raise ModelHTTPError(503, "script")
-            out = {"code": code, "explanation": "fix"}
-        else:
-            accept = self.verdicts.pop(0) if self.verdicts else True
-            out = {"accept": accept, "reason": "pairs look right" if accept else "100x too large"}
-        return ModelResponse(
-            parts=[output_part(info, json.dumps(out))],
-            usage=RequestUsage(input_tokens=100, output_tokens=50),
-            model_name="script-model",
-        )
-
-    def roles(self, role: str) -> list[str]:
-        return [user for r, user in self.calls if r == role]
-
-
-def node(nid: str, column: str, *deps: str, difficulty: str = "easy") -> dict[str, Any]:
-    return {
-        "id": nid,
-        "column": column,
-        "issue": f"{column} needs a reformat",
-        "difficulty": difficulty,
-        "depends_on": list(deps),
-    }
 
 
 @dataclass
