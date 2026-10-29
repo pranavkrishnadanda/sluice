@@ -161,7 +161,21 @@ cd backend && PYTHONPATH=src uv run sluice eval --system rules --split dev --tri
 cd frontend && bun install && bun run dev
 ```
 
-Requires [uv](https://docs.astral.sh/uv/) (installs Python 3.14) and [Bun](https://bun.sh/). The UI shows a "Demo data" badge until it is pointed at a real backend; see [`frontend/README.md`](frontend/README.md).
+Requires [uv](https://docs.astral.sh/uv/) (installs Python 3.14) and [Bun](https://bun.sh/). The UI shows a "Demo data" badge until it is pointed at a real backend.
+
+To run real files through the real pipeline, start the services and the API, then point the UI at it:
+
+```bash
+cp backend/.env.example backend/.env   # then fill in your model keys
+make up                                # Postgres, Redis, RustFS, LiteLLM
+make api                               # FastAPI on http://localhost:8080
+
+# in another shell: the URL is inlined at build time, so restart `bun run dev`
+# (or rebuild) whenever it changes
+cd frontend && NEXT_PUBLIC_SLUICE_API_URL=http://localhost:8080 bun run dev
+```
+
+The API allows CORS from `http://localhost:3000` and `:3100` by default; for a UI on any other origin, start it with that origin listed, e.g. `SLUICE_UI_ORIGINS=http://localhost:3210,http://127.0.0.1:3210 make api`. See [`frontend/README.md`](frontend/README.md) for the live-backend end-to-end test.
 
 ## Read more
 
