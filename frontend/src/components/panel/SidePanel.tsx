@@ -6,7 +6,7 @@ import { useApi } from "@/components/api/ApiProvider";
 import { DemoBadge } from "@/components/shell/DemoBadge";
 import { useRunStream } from "@/components/thread/run-stream";
 import { errorDetail, isNotFound, retryWhileNotReady } from "@/lib/api/errors";
-import type { InputPreview, Transform } from "@/lib/api/types";
+import type { RawInput, Transform } from "@/lib/api/types";
 import type { RunViewState } from "@/lib/run-state";
 import { CodeTab, type NoCodeReason } from "./CodeTab";
 import { DataTab, DataTabSkeleton } from "./DataTab";
@@ -137,7 +137,7 @@ function InputPanel({
   sample,
 }: {
   state: RunViewState;
-  pages: PreviewPages<InputPreview>;
+  pages: PreviewPages<RawInput>;
   viewportHeight?: number;
   sample: boolean;
 }) {
@@ -196,7 +196,7 @@ function DataPanel({
 }: {
   state: RunViewState | null;
   pages: PreviewPages;
-  input: PreviewPages<InputPreview>;
+  input: PreviewPages<RawInput>;
   viewportHeight?: number;
   /** The demo mock replays a fixture for this run (see `isSampleReplay`). */
   sample: boolean;

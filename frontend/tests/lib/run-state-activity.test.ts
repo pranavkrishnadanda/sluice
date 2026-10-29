@@ -213,6 +213,11 @@ describe("per-attempt tier", () => {
     );
   });
 
+  test("a null node_started.tier (older stored runs) keeps the planned tier", () => {
+    const s = run(started, plan, { ...nodeStarted(1), tier: null } as Body);
+    expect(s?.nodes[0]?.tier).toBe("small");
+  });
+
   test("without node_started.tier the planned tier stays", () => {
     expect(run(started, plan, nodeStarted(1))?.nodes[0]?.tier).toBe("small");
   });

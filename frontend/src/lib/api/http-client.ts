@@ -3,8 +3,8 @@ import type {
   ApiClient,
   DataPreview,
   EvalSummary,
-  InputPreview,
   PreviewPage,
+  RawInput,
   RunEvent,
   RunSummary,
   TableChoice,
@@ -149,7 +149,7 @@ export class HttpApiClient implements ApiClient {
     );
   }
 
-  getInput(runId: string, page: PreviewPage): Promise<InputPreview> {
+  getInput(runId: string, page: PreviewPage): Promise<RawInput> {
     return this.#json(
       `/runs/${encodeURIComponent(runId)}/input?${pageQuery(page)}`,
     );

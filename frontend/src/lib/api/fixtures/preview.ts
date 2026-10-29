@@ -1,10 +1,10 @@
 import {
   type DataPreview,
-  type InputPreview,
   PREVIEW_MAX_LIMIT,
   type PreviewCell,
   type PreviewPage,
   type PreviewRow,
+  type RawInput,
 } from "../types";
 
 /**
@@ -199,7 +199,7 @@ export function generateInput(
   runId: string,
   totalRows: number,
   page: PreviewPage,
-): InputPreview {
+): RawInput {
   const spec = SPECS[runId];
   if (!spec) throw new Error(`No input fixture for ${runId}`);
   const preview = generatePreview(runId, totalRows, page);

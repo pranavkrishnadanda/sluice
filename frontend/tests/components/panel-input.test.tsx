@@ -5,7 +5,7 @@ import { SidePanel } from "@/components/panel/SidePanel";
 import { ApiError } from "@/lib/api/errors";
 import { RUN_REPAIRED_EVENTS } from "@/lib/api/fixtures/run-repaired";
 import { MockApiClient } from "@/lib/api/mock-client";
-import type { ApiClient, InputPreview, RunEvent } from "@/lib/api/types";
+import type { ApiClient, RawInput, RunEvent } from "@/lib/api/types";
 import {
   INITIAL_RUN_VIEW_STATE,
   type RunViewState,
@@ -113,7 +113,7 @@ describe("raw uploaded file in the Data tab", () => {
   });
 
   test("nulls read as null and pages load as the window needs rows", async () => {
-    const page = (offset: number): InputPreview => ({
+    const page = (offset: number): RawInput => ({
       columns: ["a"],
       rows: Array.from({ length: 5 }, (_, i) => [
         i === 0 ? null : `${offset + i}`,

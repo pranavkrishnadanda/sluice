@@ -21,8 +21,8 @@ import type {
   ApiClient,
   DataPreview,
   EvalSummary,
-  InputPreview,
   PreviewPage,
+  RawInput,
   RunEvent,
   RunSummary,
   TableChoice,
@@ -226,7 +226,7 @@ export class MockApiClient implements ApiClient {
     return generatePreview(run.previewOf, fixture.summary.rows ?? 0, page);
   }
 
-  async getInput(runId: string, page: PreviewPage): Promise<InputPreview> {
+  async getInput(runId: string, page: PreviewPage): Promise<RawInput> {
     // Available from creation, like the server. A created run's file was
     // never read, so its rows are the sample run's (the UI says so).
     const run = this.#get(runId);

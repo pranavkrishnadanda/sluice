@@ -45,7 +45,16 @@ const AFTER: Record<string, readonly ActivityBody[]> = {
       attempt: 1,
     }),
   ],
-  "attempt_failed n1:1": [
+  // A back-off interrupts a model call: `waiting` carries the current
+  // attempt, and the interrupted phase is announced again after it.
+  "node_started n1:2": [
+    act({
+      nodeId: "n1",
+      phase: "writing",
+      message: "Asking the strong model to write a fix for amt",
+      tier: "strong",
+      attempt: 2,
+    }),
     act({
       nodeId: "n1",
       phase: "waiting",
@@ -54,8 +63,6 @@ const AFTER: Record<string, readonly ActivityBody[]> = {
       attempt: 2,
       retryInS: 3,
     }),
-  ],
-  "node_started n1:2": [
     act({
       nodeId: "n1",
       phase: "writing",
@@ -80,6 +87,9 @@ const AFTER: Record<string, readonly ActivityBody[]> = {
       attempt: 1,
     }),
   ],
+  loaded: [
+    act({ phase: "previewing", message: "Building the before/after preview" }),
+  ],
   verified: [
     act({
       phase: "loading",
@@ -89,7 +99,7 @@ const AFTER: Record<string, readonly ActivityBody[]> = {
 };
 
 function keyOf(e: RunEvent): string {
-  if (e.type === "node_started" || e.type === "attempt_failed") {
+  if (e.type === "node_started") {
     return `${e.type} ${e.nodeId}:${e.attempt}`;
   }
   return e.type;

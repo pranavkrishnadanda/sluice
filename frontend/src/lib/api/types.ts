@@ -237,7 +237,7 @@ export interface EvalSummary {
 export interface ApiClient {
   readonly isDemo: boolean;
   listRuns(): Promise<RunSummary[]>;
-  createRun(file: File, table: TableName): Promise<RunSummary>;
+  createRun(file: File, table: TableChoice): Promise<RunSummary>;
   streamEvents(
     runId: string,
     onEvent: (e: RunEvent) => void,
@@ -245,6 +245,8 @@ export interface ApiClient {
   ): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
+  /** The uploaded file's raw rows (`GET /runs/{id}/input`), from creation. */
+  getInput(runId: string, page: PreviewPage): Promise<RawInput>;
   getEvalSummary(): Promise<EvalSummary>;
   /**
    * Demo only, never part of the HTTP API: `true` when `runId` was created

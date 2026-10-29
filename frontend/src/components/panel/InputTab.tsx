@@ -2,7 +2,7 @@
 
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useId, useRef } from "react";
-import type { InputPreview } from "@/lib/api/types";
+import type { RawInput } from "@/lib/api/types";
 import { formatCount } from "@/lib/format";
 import { DATA_ROW_HEIGHT, fixedRect, MoreStatus } from "./DataTab";
 
@@ -14,7 +14,7 @@ const CELL =
 
 export interface InputTabProps {
   /** Every page of the raw upload loaded so far. */
-  input: InputPreview;
+  input: RawInput;
   loadingMore?: boolean;
   moreError?: unknown;
   onLoadMore?: () => void;

@@ -30,11 +30,17 @@ describe("mock live replay", () => {
         "waiting",
         "verifying",
         "loading",
+        "previewing",
       ]),
     );
     const waiting = activity.find((e) => e.phase === "waiting");
     expect(waiting?.retryInS).toBeGreaterThan(0);
     expect(waiting?.nodeId).toBe("n1");
+    // Backend semantics: the current attempt, then the interrupted phase again.
+    expect(waiting?.attempt).toBe(2);
+    const after =
+      activity[activity.indexOf(waiting as (typeof activity)[number]) + 1];
+    expect(after).toMatchObject({ phase: "writing", attempt: 2 });
   });
 
   test("a created run's events are stamped as they stream", async () => {
