@@ -59,7 +59,9 @@ import requests
 import urllib3
 from docker.context import ContextAPI
 from docker.types import LogConfig, Ulimit
+from opentelemetry import trace
 
+from sluice import tracing
 from sluice.agent.caps import (
     MAX_ERROR_CHARS,
     SANDBOX_CPUS,
@@ -209,19 +211,22 @@ def run_transform(
     """
     if values.dtype != pl.String:
         raise TypeError(f"values must be a String series, got {values.dtype}")
-    start = time.monotonic()
-    docker_client = client if client is not None else get_docker_client()
-    try:
-        work = _make_workdir()
+    # `_run_container` / `_wait` add sluice.exit_code and set sluice.timed_out on this span.
+    with tracing.span("sluice.sandbox", {"sluice.timed_out": False}) as current:
+        start = time.monotonic()
+        docker_client = client if client is not None else get_docker_client()
         try:
-            _write_inputs(work.in_fd, code, values)
-            outcome = _run_container(docker_client, work, len(values), timeout_s)
+            work = _make_workdir()
+            try:
+                _write_inputs(work.in_fd, code, values)
+                outcome = _run_container(docker_client, work, len(values), timeout_s)
+            finally:
+                _remove_workdir(work)
         finally:
-            _remove_workdir(work)
-    finally:
-        if client is None:  # opened here, so closed here: no socket leak across many runs
-            docker_client.close()
-    duration_ms = int((time.monotonic() - start) * 1000)
+            if client is None:  # opened here, so closed here: no socket leak across many runs
+                docker_client.close()
+        duration_ms = int((time.monotonic() - start) * 1000)
+        current.set_attribute("sluice.duration_ms", duration_ms)
     if isinstance(outcome, pl.Series):
         return SandboxResult(ok=True, values=outcome, error=None, duration_ms=duration_ms)
     return SandboxResult(
@@ -430,6 +435,7 @@ def _run_container(
                 f"sandbox image {SANDBOX_IMAGE} not found: run `make sandbox-image`"
             ) from exc
         exit_code, reason = _wait(container, out_fd, timeout_s)
+        trace.get_current_span().set_attribute("sluice.exit_code", exit_code)
         if reason is not None:
             return reason
         if _out_size_exceeds(out_fd, SANDBOX_OUTPUT_MAX_BYTES):  # written after the last poll
@@ -453,6 +459,7 @@ def _wait(container: Any, out_fd: int, timeout_s: int) -> tuple[int, str | None]
                     f"Docker daemon unreachable while waiting for the sandbox ({timeout_s}s)"
                 )
             _kill(container)
+            trace.get_current_span().set_attribute("sluice.timed_out", True)
             return -1, f"timeout: transform did not finish within {timeout_s}s"
         try:
             status = container.wait(timeout=min(POLL_INTERVAL_S, remaining))

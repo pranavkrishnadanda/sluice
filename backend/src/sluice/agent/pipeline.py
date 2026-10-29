@@ -80,6 +80,7 @@ from typing import Any, Final
 
 import polars as pl
 
+from sluice import tracing
 from sluice.agent import plan as planning
 from sluice.agent.caps import (
     MAX_ATTEMPTS,
@@ -289,16 +290,19 @@ async def _pipeline(run: _Run) -> SystemOutput:
     mapping: ColumnMapping | None = None
     frame = raw
     try:
-        mapping, _ = await propose_mapping(raw, contract, deps.llm)
-        frame = apply_mapping(raw, mapping)
+        with tracing.step_span("mapping"):
+            mapping, _ = await propose_mapping(raw, contract, deps.llm)
+            frame = apply_mapping(raw, mapping)
     except (LLMUnavailable, LLMOutputError) as exc:
         run.llm_failed("mapping", exc)
     map_actions = _mapping_actions(mapping)
 
-    prof1 = profile(frame, contract)
+    with tracing.step_span("profile"):
+        prof1 = profile(frame, contract)
     run.sources = raw_sources(contract, prof1, mapping)
     try:
-        pass1 = apply_rules(frame, contract, prof1, case.reference)
+        with tracing.step_span("rules_pass_1"):
+            pass1 = apply_rules(frame, contract, prof1, case.reference)
     except UnkeyableInputError as exc:
         reason = str(exc)
         actions = [*map_actions, f"file quarantined: {reason}"]
@@ -316,7 +320,8 @@ async def _pipeline(run: _Run) -> SystemOutput:
         run.errors.append("planning: skipped, no model route is available")
     else:
         try:
-            plan, _ = await planning.propose_plan(candidates, contract, deps.llm)
+            with tracing.step_span("plan"):
+                plan, _ = await planning.propose_plan(candidates, contract, deps.llm)
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
@@ -353,7 +358,8 @@ async def _pipeline(run: _Run) -> SystemOutput:
         rewritten = frame.with_columns(
             [values.alias(source[column]) for column, values in accepted.items()]
         )
-        final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
+        with tracing.step_span("rules_pass_2"):
+            final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
     actions = map_actions + final.actions
     return _finish(run, final, actions, plan, outcomes, mapping)
 
@@ -452,7 +458,7 @@ async def _run_node(
         started = run.deps.clock()
         run.emit(NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS))
         records: list[CallRecord] = []
-        error, rewritten = await _attempt(
+        error, rewritten = await _traced_attempt(
             run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
             values, frame, flagged_before, records,
         )  # fmt: skip
@@ -490,6 +496,32 @@ async def _run_node(
     outcome.stop = f"no accepted transform after {MAX_ATTEMPTS} attempts"
     if run.halted is None:  # the contract's failure path: hold the whole input back
         run.halted = f"node {node.id} ({node.column}): {outcome.stop}"
+
+
+async def _traced_attempt(
+    run: _Run,
+    outcome: _NodeOutcome,
+    attempt: int,
+    tier: Tier,
+    spec: ColumnSpec,
+    source_name: str,
+    shown_name: str,
+    samples: list[str],
+    prior_error: str | None,
+    values: pl.Series,
+    frame: pl.DataFrame,
+    flagged_before: set[int],
+    records: list[CallRecord],
+) -> tuple[str | None, pl.Series | None]:
+    """`_attempt` inside its ``sluice.node.attempt`` span."""
+    attributes = {"sluice.node_id": outcome.node.id, "sluice.attempt": attempt, "sluice.tier": tier}
+    with tracing.span("sluice.node.attempt", attributes) as current:
+        error, rewritten = await _attempt(
+            run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
+            values, frame, flagged_before, records,
+        )  # fmt: skip
+        current.set_attribute("sluice.outcome", "accepted" if error is None else "failed")
+    return error, rewritten
 
 
 async def _attempt(

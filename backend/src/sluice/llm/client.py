@@ -44,6 +44,7 @@ from email.utils import parsedate_to_datetime
 from typing import Final, Literal, Self
 
 import httpx2
+from opentelemetry.trace import Span, SpanKind
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, NativeOutput, PromptedOutput, capture_run_messages
 from pydantic_ai.exceptions import (
@@ -59,6 +60,7 @@ from pydantic_ai.output import OutputSpec
 from pydantic_ai.providers.litellm import LiteLLMProvider
 from pydantic_ai.settings import ModelSettings
 
+from sluice import tracing
 from sluice.llm import prices
 
 Tier = Literal["small", "strong"]
@@ -336,6 +338,26 @@ class LLM:
                 the generation twice. Its `record` carries the spent tokens and rejected attempts.
             LLMUnavailable: the proxy failed, was unreachable, or stayed rate-limited (no record).
         """
+        # One `chat <tier>` span per call (GenAI semantic conventions); never prompt text.
+        attributes = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system": "litellm",
+            "gen_ai.request.model": tier,
+            "sluice.role": role,
+        }
+        with tracing.span(f"chat {tier}", attributes, kind=SpanKind.CLIENT) as span:
+            try:
+                output, record = await self._run(role, tier, system, prompt, output_type)
+            except LLMOutputError as exc:
+                _annotate(span, exc.record)
+                raise
+            _annotate(span, record)
+            return output, record
+
+    async def _run[T](
+        self, role: str, tier: Tier, system: str, prompt: str, output_type: type[T]
+    ) -> tuple[T, CallRecord]:
+        """`run` without its span."""
         agent = Agent(
             self._override or self._models[tier],
             output_type=_wrap_output(output_type, self.output_mode),
@@ -442,6 +464,19 @@ class LLM:
         )
         self.records.append(record)
         return record
+
+
+def _annotate(span: Span, record: CallRecord) -> None:
+    """Put a call's accounting on its span: model, token counts, cost (no text)."""
+    span.set_attributes(
+        {
+            "gen_ai.response.model": record.model,
+            "gen_ai.usage.input_tokens": record.input_tokens,
+            "gen_ai.usage.output_tokens": record.output_tokens,
+            "sluice.cost_usd": record.cost_usd,
+            "sluice.cached": record.cached,
+        }
+    )
 
 
 def _wrap_output[T](output_type: type[T], mode: OutputMode) -> OutputSpec[T]:

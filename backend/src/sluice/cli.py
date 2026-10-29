@@ -15,6 +15,7 @@ import pydantic_ai
 import typer
 from sqlalchemy.exc import SQLAlchemyError
 
+from sluice import tracing
 from sluice.agent.events import EventModel, RunFinished
 from sluice.drift.cases import build_split, load_reference, load_split, split_hash, unexpected_files
 from sluice.evals.runner import SYSTEMS, format_ci, latest_summaries, render_results, run_eval
@@ -50,6 +51,7 @@ class SplitName(StrEnum):
 @app.callback()
 def main() -> None:
     """Sluice: a self-planning agentic data pipeline."""
+    tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 
 
 def environment() -> dict[str, str]:
