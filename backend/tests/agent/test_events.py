@@ -86,7 +86,7 @@ def _emitted() -> list[dict]:
 def test_caps_values_match_the_plan() -> None:
     assert caps.MAX_ATTEMPTS == 3
     assert caps.MAX_TOKENS_PER_FILE == 60_000
-    assert caps.MAX_WALL_S_PER_FILE == 180
+    assert caps.MAX_WALL_S_PER_FILE == 300
     assert caps.SANDBOX_TIMEOUT_S == 20
     assert caps.SANDBOX_MEM_MB == 512
     assert caps.SANDBOX_PIDS == 64

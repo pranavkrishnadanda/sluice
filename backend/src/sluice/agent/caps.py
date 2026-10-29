@@ -8,8 +8,11 @@ MAX_ATTEMPTS: Final = 3
 MAX_TOKENS_PER_FILE: Final = 60_000
 """Model tokens one file may spend; once reached, no new attempts start."""
 
-MAX_WALL_S_PER_FILE: Final = 180
-"""Wall-clock seconds one file may take; once reached, no new attempts start."""
+MAX_WALL_S_PER_FILE: Final = 300
+"""Wall-clock seconds one file may take; once reached, no new attempts start.
+
+Raised from 180 s with the strong deployments' 60 s per-attempt timeout: it must exceed the
+client's ``REQUEST_TIMEOUT_S`` (180 s), see ``tests/llm/test_litellm_config.py``."""
 
 SANDBOX_TIMEOUT_S: Final = 20
 """Seconds one generated transform may run inside the sandbox."""

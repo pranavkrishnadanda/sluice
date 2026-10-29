@@ -71,31 +71,32 @@ schema in the prompt (``prompted``), or Pydantic AI's required output tool (``to
 
 DEFAULT_OUTPUT_MODE: Final[OutputMode] = "native"
 
-REQUEST_TIMEOUT_S: Final = 120.0
+REQUEST_TIMEOUT_S: Final = 180.0
 """Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
 
 Nested between the proxy's timeout-only worst case and the per-file wall cap, so a hung
 deployment still reaches its last fallback and one hung call cannot by itself exceed a file's
-wall time. From ``backend/litellm/config.yaml`` (per-attempt timeout 30 s on every deployment; a
-timeout is not retried, it goes to the next group of the chain), the path where every attempt
-*times out* is:
+wall time. From ``backend/litellm/config.yaml`` (per-attempt timeout 60 s on the strong chain's
+own deployments, 30 s on the small ones; a timeout is not retried, it goes to the next group of
+the chain), the path where every attempt *times out* is:
 
-* strong: gpt-oss-120b 30 + Gemini 30 + qwen 30 = 90 s
+* strong: gpt-oss-120b 60 + Gemini 60 + qwen 30 = 150 s
 * small:  gpt-oss-20b 30 + qwen 30 = 60 s
 
-so 90 s < 120 s (this) < 180 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
+so 150 s < 180 s (this) < 300 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
 overhead and *fast-failing* 429/5xx retries. ``tests/llm/test_litellm_config.py`` asserts the
 nesting from the config itself.
 
 This does not bound *slow* errors: LiteLLM retries a 429/500/503 twice on the same group, so a
-group can take up to 3 attempts x 30 s (`SLOW_ERROR_WORST_CASE_S`). Such a call hits this
+group can take up to 3 attempts x its timeout (`SLOW_ERROR_WORST_CASE_S`). Such a call hits this
 timeout first and surfaces as `LLMUnavailable`: the file degrades to rules-only output for that
 step, never to wrong output. The numbers are left as they are, since a client timeout above the
 slow-error bound would exceed the per-file wall cap."""
 
-SLOW_ERROR_WORST_CASE_S: Final[dict[str, float]] = {"strong": 270.0, "small": 180.0}
+SLOW_ERROR_WORST_CASE_S: Final[dict[str, float]] = {"strong": 450.0, "small": 180.0}
 """Proxy time if every attempt of every group in the chain fails slowly with a retried error:
-attempts per group (1 + 2 retries) x groups x 30 s. strong = 3 x 3 x 30, small = 3 x 2 x 30.
+attempts per group (1 + 2 retries) x each group's timeout. strong = 3 x (60 + 60 + 30),
+small = 3 x (30 + 30).
 Above `REQUEST_TIMEOUT_S` on purpose (see there); the config test recomputes it from the YAML."""
 
 CONNECT_TIMEOUT_S: Final = 5.0
