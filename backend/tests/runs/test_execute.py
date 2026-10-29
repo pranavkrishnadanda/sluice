@@ -163,6 +163,9 @@ def test_execute_run_one_run_id_end_to_end(indian: Case) -> None:
     assert loads.calls[0]["run_id"] == run_id
     (done,) = [e for e in emitted if e.type == "node_finished"]  # type: ignore[attr-defined]
     assert done.transform_id == transform_id(run_id, "n1", 2)  # type: ignore[attr-defined]
+    ids = [t["transform_id"] for t in meta["transforms"]]
+    assert ids == [transform_id(run_id, "n1", 1), transform_id(run_id, "n1", 2)]
+    assert done.transform_id in ids  # type: ignore[attr-defined]
 
 
 def test_execute_run_skipped_load_emits_no_loaded(indian: Case) -> None:

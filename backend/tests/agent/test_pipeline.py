@@ -1013,3 +1013,33 @@ def test_pipeline_uses_the_caller_supplied_run_id(indian: Case) -> None:
     assert result.out.meta["run_id"] == "api-run-7"
     (done,) = result.events("node_finished")
     assert done.transform_id == pipeline.transform_id("api-run-7", "n1", 2)  # type: ignore[attr-defined]
+
+
+def test_pipeline_meta_transforms_carry_their_transform_ids(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+    result = run(indian, script, run_id="r1")
+    records = [TransformRecord.model_validate(t) for t in result.out.meta["transforms"]]
+    assert [t.transform_id for t in records] == [
+        pipeline.transform_id("r1", "n1", 1),
+        pipeline.transform_id("r1", "n1", 2),
+    ]
+    (done,) = result.events("node_finished")
+    assert done.transform_id == records[-1].transform_id  # type: ignore[attr-defined]
+
+
+def test_pipeline_meta_mapping_names_the_raw_source_of_each_contract_column(
+    medium: Case,
+) -> None:
+    script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    result = run(medium, script)
+    mapping = result.out.meta["mapping"]
+    contract = load_contract("orders")
+    assert list(mapping) == [c.name for c in contract.columns]
+    assert mapping["o_totalprice"] == "amt"
+    assert mapping["o_orderkey"] == "o_orderkey"
+
+
+def test_pipeline_meta_mapping_without_a_model_mapping_follows_the_rules(indian: Case) -> None:
+    script = Script(down=frozenset({"mapper"}))
+    result = run(indian, script)
+    assert result.out.meta["mapping"]["o_totalprice"] == "o_totalprice"

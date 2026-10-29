@@ -183,9 +183,9 @@ def test_lineage_rows_present(
         ],
         "transforms": [
             {"node_id": "n1", "attempt": 1, "code": "def transform(df): return df",
-             "model": "small", "passed": False},
+             "model": "small", "passed": False, "transform_id": f"t1{run_id}"},
             {"node_id": "n1", "attempt": 2, "code": "def transform(df):\n    return df",
-             "model": "small", "passed": True},
+             "model": "small", "passed": True, "transform_id": f"t2{run_id}"},
         ],
     }  # fmt: skip
     result = _load(_out(clean, cost_usd=0.0123, meta=meta), orders, settings, ns, sha, run_id)
@@ -211,11 +211,11 @@ def test_lineage_rows_present(
     assert nodes == [("n1", "o_comment", "small", 2, True)]
     transforms = _rows(
         pg,
-        "SELECT attempt, length(code_sha256), passed FROM transforms WHERE run_id = %s "
-        "ORDER BY attempt",
+        "SELECT attempt, length(code_sha256), passed, transform_id FROM transforms "
+        "WHERE run_id = %s ORDER BY attempt",
         run_id,
     )
-    assert transforms == [(1, 64, False), (2, 64, True)]
+    assert transforms == [(1, 64, False, f"t1{run_id}"), (2, 64, True, f"t2{run_id}")]
 
 
 def test_crash_between_iceberg_commit_and_record_does_not_duplicate_on_retry(
@@ -470,3 +470,59 @@ def test_cli_failed_run_loads_nothing_and_retry_loads(
     second = CliRunner().invoke(cli.app, ["run", str(path), "--table", "orders"])
     assert second.exit_code == 0, second.output
     assert '"type":"loaded"' in second.stdout
+
+
+# --- plan 4 Task 3: one run id end to end; node_finished.transformId is persisted ------------
+
+
+def test_execute_run_node_finished_transform_ids_are_in_the_transforms_table(
+    orders_df: pl.DataFrame, tmp_path: Path, settings: Settings, ns: str, pg: psycopg.Connection
+) -> None:
+    import functools
+
+    from pipeline_fakes import CRASH, STRIP_COMMAS, FakeSandbox, Script, node
+    from pydantic_ai.models.function import FunctionModel
+
+    from sluice.agent.events import EventModel
+    from sluice.drift.cases import Recipe, build_case
+    from sluice.llm.client import LLM
+    from sluice.runs.execute import execute_run
+    from sluice.systems.agent import AgentSystem
+
+    recipe = Recipe("orders", "medium", [("indian_number_string", {"column": "o_totalprice"})],
+                    "csv", "utf-8", 30)  # fmt: skip
+    sample = orders_df.sample(200, seed=secrets.randbelow(2**31))  # a new file hash every run
+    case = build_case("dev-0201", "dev", recipe, {"orders": sample}, 7, tmp_path)
+    script = Script(
+        plan={"nodes": [node("n1", "o_totalprice")]},
+        workers={"o_totalprice": [CRASH, STRIP_COMMAS]},
+    )
+    system = AgentSystem(
+        llm_factory=lambda: LLM(
+            "http://litellm.test", "k", model_override=FunctionModel(script.respond)
+        ),
+        sandbox=FakeSandbox(),
+    )
+    emitted: list[EventModel] = []
+    run_id = secrets.token_hex(16)
+
+    outcome = execute_run(
+        case.input_path,
+        "orders",
+        run_id=run_id,
+        emit=emitted.append,
+        run_fn=system.run,
+        load_fn=functools.partial(load_output, namespace=ns),
+        loaded_fn=functools.partial(iceberg.find_load, namespace=ns),
+    )
+
+    assert outcome.status == "succeeded"
+    assert "loaded" in [e.type for e in emitted]  # type: ignore[attr-defined]
+    finished = [e.transform_id for e in emitted if e.type == "node_finished"]  # type: ignore[attr-defined]
+    stored = _rows(
+        pg,
+        "SELECT attempt, transform_id, passed FROM transforms WHERE run_id = %s ORDER BY attempt",
+        run_id,
+    )
+    assert [t for _, t, passed in stored if passed] == finished
+    assert len(stored) == 2 and all(t for _, t, _ in stored)
