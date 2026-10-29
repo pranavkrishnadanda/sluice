@@ -1,0 +1,227 @@
+{
+  "system": "agent",
+  "split": "dev",
+  "trials": 1,
+  "n_cases": 30,
+  "metrics": {
+    "cell_accuracy": [
+      0.9666666666666667,
+      0.9,
+      1.0
+    ],
+    "fabrication_rate": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "row_recall": [
+      0.9666666666666667,
+      0.9,
+      1.0
+    ],
+    "row_precision": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "contract_pass": [
+      0.9666666666666667,
+      0.9,
+      1.0
+    ],
+    "success": [
+      0.9666666666666667,
+      0.9,
+      1.0
+    ],
+    "cost_usd": [
+      0.0005093125,
+      0.000278027375,
+      0.0007734136249999997
+    ],
+    "latency_s": [
+      14.276289266592357,
+      5.6038530195098915,
+      23.471657034353896
+    ]
+  },
+  "pass_hat_k": null,
+  "by_difficulty": {
+    "easy": {
+      "cell_accuracy": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "fabrication_rate": null,
+      "row_recall": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "row_precision": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contract_pass": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "success": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "cost_usd": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "latency_s": [
+        0.018389518806626173,
+        0.014951269121692432,
+        0.02291211859661747
+      ]
+    },
+    "medium": {
+      "cell_accuracy": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "fabrication_rate": null,
+      "row_recall": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "row_precision": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contract_pass": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "success": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "cost_usd": [
+        0.00087555,
+        0.0004487,
+        0.0013078416666666664
+      ],
+      "latency_s": [
+        23.92268910176224,
+        7.742676206675568,
+        44.671485456918084
+      ]
+    },
+    "hard": {
+      "cell_accuracy": [
+        0.9,
+        0.7,
+        1.0
+      ],
+      "fabrication_rate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "row_recall": [
+        0.9,
+        0.7,
+        1.0
+      ],
+      "row_precision": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contract_pass": [
+        0.9,
+        0.7,
+        1.0
+      ],
+      "success": [
+        0.9,
+        0.7,
+        1.0
+      ],
+      "cost_usd": [
+        0.0007399424999999999,
+        0.0002982286875,
+        0.0012676021874999997
+      ],
+      "latency_s": [
+        21.278219137503765,
+        2.77152803769568,
+        40.778787399604624
+      ]
+    }
+  },
+  "n_by_difficulty": {
+    "easy": 11,
+    "medium": 9,
+    "hard": 10
+  },
+  "n_defined": {
+    "cell_accuracy": 30,
+    "fabrication_rate": 7,
+    "row_recall": 30,
+    "row_precision": 29,
+    "contract_pass": 30,
+    "success": 30,
+    "cost_usd": 30,
+    "latency_s": 30
+  },
+  "n_defined_by_difficulty": {
+    "easy": {
+      "cell_accuracy": 11,
+      "fabrication_rate": 0,
+      "row_recall": 11,
+      "row_precision": 11,
+      "contract_pass": 11,
+      "success": 11,
+      "cost_usd": 11,
+      "latency_s": 11
+    },
+    "medium": {
+      "cell_accuracy": 9,
+      "fabrication_rate": 0,
+      "row_recall": 9,
+      "row_precision": 9,
+      "contract_pass": 9,
+      "success": 9,
+      "cost_usd": 9,
+      "latency_s": 9
+    },
+    "hard": {
+      "cell_accuracy": 10,
+      "fabrication_rate": 7,
+      "row_recall": 10,
+      "row_precision": 9,
+      "contract_pass": 10,
+      "success": 10,
+      "cost_usd": 10,
+      "latency_s": 10
+    }
+  },
+  "created_at": "2026-10-29T03:13:47Z",
+  "n_file_quarantined": 1,
+  "n_file_quarantined_by_difficulty": {
+    "easy": 0,
+    "medium": 0,
+    "hard": 1
+  },
+  "n_file_quarantined_fabrication_defined": 0,
+  "cases_sha256": "c80c69b9f8d65d0226d407e579a51b4ad0e95826d60fac8d67e7131c885a9977",
+  "limit": 30,
+  "split_sha256": "3014f4ad70dfa9f83904248062e92ad5f5a7235fa0cf60f1fb5c568b67450f18"
+}

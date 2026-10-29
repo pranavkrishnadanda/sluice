@@ -1,0 +1,227 @@
+{
+  "system": "rules",
+  "split": "dev",
+  "trials": 1,
+  "n_cases": 30,
+  "metrics": {
+    "cell_accuracy": [
+      0.8409416252155064,
+      0.7293837629079442,
+      0.9324769368787276
+    ],
+    "fabrication_rate": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "row_recall": [
+      0.9,
+      0.8,
+      1.0
+    ],
+    "row_precision": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "contract_pass": [
+      0.9,
+      0.8,
+      1.0
+    ],
+    "success": [
+      0.43333333333333335,
+      0.26666666666666666,
+      0.6
+    ],
+    "cost_usd": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "latency_s": [
+      0.006783436091306309,
+      0.005884144423471299,
+      0.007707302114285993
+    ]
+  },
+  "pass_hat_k": null,
+  "by_difficulty": {
+    "easy": {
+      "cell_accuracy": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "fabrication_rate": null,
+      "row_recall": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "row_precision": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contract_pass": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "success": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "cost_usd": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "latency_s": [
+        0.00839860617733476,
+        0.007041695629595779,
+        0.009809486452617089
+      ]
+    },
+    "medium": {
+      "cell_accuracy": [
+        0.8133943062739104,
+        0.6003909609012591,
+        0.9365640405354504
+      ],
+      "fabrication_rate": null,
+      "row_recall": [
+        0.8888888888888888,
+        0.6666666666666666,
+        1.0
+      ],
+      "row_precision": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contract_pass": [
+        0.8888888888888888,
+        0.6666666666666666,
+        1.0
+      ],
+      "success": [
+        0.1111111111111111,
+        0.0,
+        0.3333333333333333
+      ],
+      "cost_usd": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "latency_s": [
+        0.006562370328336126,
+        0.005143641014001332,
+        0.007999648120150797
+      ]
+    },
+    "hard": {
+      "cell_accuracy": [
+        0.69077,
+        0.44075,
+        0.8815205
+      ],
+      "fabrication_rate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "row_recall": [
+        0.8,
+        0.5,
+        1.0
+      ],
+      "row_precision": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contract_pass": [
+        0.8,
+        0.5,
+        1.0
+      ],
+      "success": [
+        0.1,
+        0.0,
+        0.3
+      ],
+      "cost_usd": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "latency_s": [
+        0.0052057081833481785,
+        0.003988028987660073,
+        0.006243909268232528
+      ]
+    }
+  },
+  "n_by_difficulty": {
+    "easy": 11,
+    "medium": 9,
+    "hard": 10
+  },
+  "n_defined": {
+    "cell_accuracy": 30,
+    "fabrication_rate": 7,
+    "row_recall": 30,
+    "row_precision": 27,
+    "contract_pass": 30,
+    "success": 30,
+    "cost_usd": 30,
+    "latency_s": 30
+  },
+  "n_defined_by_difficulty": {
+    "easy": {
+      "cell_accuracy": 11,
+      "fabrication_rate": 0,
+      "row_recall": 11,
+      "row_precision": 11,
+      "contract_pass": 11,
+      "success": 11,
+      "cost_usd": 11,
+      "latency_s": 11
+    },
+    "medium": {
+      "cell_accuracy": 9,
+      "fabrication_rate": 0,
+      "row_recall": 9,
+      "row_precision": 8,
+      "contract_pass": 9,
+      "success": 9,
+      "cost_usd": 9,
+      "latency_s": 9
+    },
+    "hard": {
+      "cell_accuracy": 10,
+      "fabrication_rate": 7,
+      "row_recall": 10,
+      "row_precision": 8,
+      "contract_pass": 10,
+      "success": 10,
+      "cost_usd": 10,
+      "latency_s": 10
+    }
+  },
+  "created_at": "2026-10-29T02:40:36Z",
+  "n_file_quarantined": 3,
+  "n_file_quarantined_by_difficulty": {
+    "easy": 0,
+    "medium": 1,
+    "hard": 2
+  },
+  "n_file_quarantined_fabrication_defined": 2,
+  "cases_sha256": "c80c69b9f8d65d0226d407e579a51b4ad0e95826d60fac8d67e7131c885a9977",
+  "limit": 30,
+  "split_sha256": "3014f4ad70dfa9f83904248062e92ad5f5a7235fa0cf60f1fb5c568b67450f18"
+}

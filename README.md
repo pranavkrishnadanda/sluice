@@ -6,7 +6,7 @@ A file lands with renamed columns, prices in paise instead of rupees, timestamps
 
 Every accuracy claim is graded **by code against exact ground truth**, with a baseline, a sample size and a 95% confidence interval.
 
-> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline), the web UI and the LLM agent pipeline (plan 2: LiteLLM routing, sandboxed transforms, verifier, Iceberg load with lineage) are on `main`. The only published numbers so far are the rules-only baseline below; the first agent results need live model keys and are next. The UI runs on a clearly labelled demo backend until the API (plan 4) connects it.
+> **Status:** v1 in progress. The measurement foundations (benchmark, graders, rules-only baseline), the web UI and the LLM agent pipeline (plan 2: LiteLLM routing, sandboxed transforms, verifier, Iceberg load with lineage) are on `main`. The first agent results, on a 30-case dev subset, are below next to the rules-only baseline. The UI runs on a clearly labelled demo backend until the API (plan 4) connects it.
 
 ---
 
@@ -91,15 +91,16 @@ All headline numbers come with bootstrap 95% CIs; version comparisons use McNema
 
 **Results**
 
-Rules-only baseline on the `dev` split (300 cases, 1 trial), 95% CIs; full tables, definitions and the reproduce command are in [`evals/RESULTS.md`](evals/RESULTS.md), and CI re-renders that file on every push:
+First agent results on a `dev` subset (the first 30 cases by id, 1 trial), against the rules-only baseline on the same 30 cases and on the full 300-case `dev` split, with 95% CIs. Full tables, definitions and the reproduce command are in [`evals/RESULTS.md`](evals/RESULTS.md); CI re-runs the rules row and re-renders that file on every push.
 
 | System | Cell accuracy | Fabrication | Contract pass | Success | Files quarantined |
 |---|---|---|---|---|---|
-| Rules only (baseline) | 88.9% [86.2, 91.2] | 0.0% [0.0, 5.4] (n=66) | 94.7% [92.0, 97.0] | 38.7% [33.3, 44.3] | 16/300 |
+| **Sluice agent**, dev subset n=30 | **96.7%** [90.0, 100.0] | **0.0%** [0.0, 41.0] (n=7) | **96.7%** [90.0, 100.0] | **96.7%** [90.0, 100.0] | 1/30 |
+| Rules only, same 30 cases | 84.1% [72.9, 93.2] | 0.0% [0.0, 41.0] (n=7) | 90.0% [80.0, 100.0] | 43.3% [26.7, 60.0] | 3/30 |
+| Rules only, full dev (n=300) | 88.9% [86.2, 91.2] | 0.0% [0.0, 5.4] (n=66) | 94.7% [92.0, 97.0] | 38.7% [33.3, 44.3] | 16/300 |
 | Always strongest model (baseline) | — | — | — | — | — |
-| Sluice agent | — | — | — | — | — |
 
-*The agent and model baselines arrive with plan 2. The rules baseline never guesses: it flags what it cannot parse, which is why fabrication is 0% and success is low on medium and hard cases.*
+*The agent run used Groq `openai/gpt-oss-120b` (strong) and `openai/gpt-oss-20b` (small) through LiteLLM, on free tiers: ₹0 billed, about $0.015 at list prices for the 30 files, mean 14 s per file. Neither system fabricated a value, but with only 7 cases containing unrecoverable cells, the fabrication interval is still wide; plan 3 runs the full split, more trials (pass^k) and the always-strongest baseline. The rules baseline never guesses: it flags what it cannot parse, which is why its success is low on medium and hard cases.*
 
 ## Stack
 
@@ -126,7 +127,7 @@ A chat-style interface: drop a file, watch the plan execute step by step, and in
 **v1: promotable core**
 - [x] **Plan 1, foundations:** TPC-H generation, drift generator, data contracts, code graders, statistics, rules-only baseline
 - [x] **UI shell:** liquid-glass UI (light/dark), live run thread, Data/Code/Plan panel, evals page, API contract, e2e + accessibility checks
-- [x] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(first agent results pending live keys)*
+- [x] **Plan 2, agent pipeline:** services stack, LiteLLM + models, sandbox, orchestrator and workers, Iceberg load and lineage *(first agent results on a dev subset)*
 - [ ] **Plan 3, evals at scale:** hostile set, CI eval gate, routing matrix and cost-vs-quality chart
 - [ ] **Plan 4, API and README results:** FastAPI + SSE server for the UI, traces, results GIF
 

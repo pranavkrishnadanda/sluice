@@ -227,6 +227,14 @@ backend/tests/{llm,sandbox,agent,integration}/...
   - Expect ≈ 100% cached calls and $0 on the second run (`tokens` and `costUsd` in its `run_finished`).
 - [ ] **Step 4: Commit** `docs: publish first agent results on a dev subset`
 
+### Task 10 record (2026-10-29)
+
+- **Models (LiteLLM, Groq free tier):** `strong` = `openai/gpt-oss-120b` → Gemini `gemini-3.8-flash` → `qwen/qwen3.8-27b`; `small` = `openai/gpt-oss-20b` → `qwen/qwen3.8-27b`. No local vLLM (owner's choice; block kept commented in `backend/litellm/config.yaml`). Groq limits from the owner's console: 30 RPM, 1K RPD, 8K TPM, 200K TPD per model. Gemini's project had no prepaid credit (HTTP 402), so the router skipped it.
+- **Step 1:** `make test-integration` 38 passed; `pytest -m live` 2 passed.
+- **First run** exposed three issues, fixed before the published run: Groq gpt-oss `output_parse_failed` on tool-call output (now json_schema native output, with one retry on provider parse failures); the small tier collapsing into cooldown without vLLM (routing above, plus rate-limit back-off); Gemini 402 (moves on to the next fallback). First-run numbers: cell accuracy 97.4%, success 66.7%, fabrication 0.0%.
+- **Published run** (`evals/published/20261029T031347Z-agent-dev`): cell accuracy 96.7%, fabrication 0.0% (n=7), contract pass 96.7%, success 96.7%, 1/30 files quarantined (dev-0009, hard). Rules on the same 30: 84.1% / 0.0% / 90.0% / 43.3%. 30 files took 7 min 12 s; about $0.015 at list prices (₹0 billed on free tiers).
+- **Step 3:** `sluice run` of dev-0012 (hard, orders) loaded 500 rows in 3.6 s; a plain repeat was skipped as already loaded; after deleting its `loads` row the re-run recovered the earlier Iceberg commit (same snapshot) and appended nothing. Cache: an identical repeated request returned in 3 ms vs 145 ms uncached (served from Redis; this LiteLLM version sends no cache-hit header).
+
 ---
 
 ## Done when
