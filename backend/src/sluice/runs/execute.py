@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal
 
+from sluice import tracing
 from sluice.agent.events import (
     PIPELINE_EVENT_ADAPTER,
     EventLog,
@@ -238,19 +239,23 @@ def execute_run(
     """
     contract = load_contract(table, contract_version)
     log = _PublicLog(emit)
-    log.publish(
-        RunStarted(run_id=run_id, file_name=path.name, table=table, rows=_count_rows(path))  # type: ignore[arg-type]
-    )
-    try:
-        ending = _run_and_load(
-            path, contract, run_id, log, run_fn, load_fn, loaded_fn, settings_fn, reference_fn
+    # The trace root: the pipeline's step and node-attempt spans (and the load step) nest here.
+    with tracing.span("sluice.run", {"sluice.run_id": run_id, "sluice.table": table}) as root:
+        log.publish(
+            RunStarted(run_id=run_id, file_name=path.name, table=table, rows=_count_rows(path))  # type: ignore[arg-type]
         )
-    except Exception as exc:
-        log.publish(log.finished("failed", type(exc).__name__))
-        raise
-    if ending.loaded is not None:
-        log.publish(ending.loaded)
-    log.publish(ending.finished)
+        try:
+            ending = _run_and_load(
+                path, contract, run_id, log, run_fn, load_fn, loaded_fn, settings_fn, reference_fn
+            )
+        except Exception as exc:
+            root.set_attribute("sluice.status", "failed")
+            log.publish(log.finished("failed", type(exc).__name__))
+            raise
+        root.set_attribute("sluice.status", ending.outcome.status)
+        if ending.loaded is not None:
+            log.publish(ending.loaded)
+        log.publish(ending.finished)
     return ending.outcome
 
 
@@ -288,9 +293,10 @@ def _run_and_load(
         outcome = RunOutcome(None, "failed", out, log.cost, log.tokens)
         return _Ending(outcome, None, log.finished("failed", summary))
 
-    result = load_fn(
-        out, contract, run_id=run_id, file_sha256=sha, settings=settings, status=status
-    )
+    with tracing.step_span("load"):
+        result = load_fn(
+            out, contract, run_id=run_id, file_sha256=sha, settings=settings, status=status
+        )
     loaded = None
     if not result.skipped and result.snapshot_id is not None:
         loaded = Loaded(

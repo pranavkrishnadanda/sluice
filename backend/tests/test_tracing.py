@@ -39,17 +39,18 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from sluice import tracing
-from sluice.agent.events import EventLog
+from sluice.agent.events import EventModel
 from sluice.agent.mapping import SYSTEM_PROMPT as MAPPER_PROMPT
-from sluice.agent.pipeline import PipelineDeps, run_pipeline
 from sluice.agent.plan import SYSTEM_PROMPT as PLANNER_PROMPT
 from sluice.agent.verifier import VERIFIER_SYSTEM_PROMPT
 from sluice.agent.worker import WORKER_SYSTEM_PROMPT
-from sluice.contracts.model import load_contract
 from sluice.drift.cases import Case, Recipe, build_case
-from sluice.evals.types import CaseInput
-from sluice.llm.client import LLM, LLMUnavailable
+from sluice.evals.types import CaseInput, SystemOutput
+from sluice.llm.client import LLM, LLMOutputError, LLMUnavailable
+from sluice.load.iceberg import LoadResult
+from sluice.runs.execute import RunOutcome, execute_run
 from sluice.sandbox import runner
+from sluice.systems.agent import AgentSystem
 
 API_KEY = "sk-sluice-trace-test-key-9f8e7d6c5b4a"
 
@@ -144,7 +145,8 @@ def test_setup_tracing_honours_otel_service_name(
     tracing.setup_tracing()
     try:
         (provider,) = fresh_setup
-        assert provider.resource.attributes["service.name"] == "sluice-api"  # type: ignore[attr-defined]
+        resource = provider.resource  # type: ignore[attr-defined]
+        assert resource.attributes["service.name"] == "sluice-api"
     finally:
         for p in fresh_setup:
             p.shutdown()  # type: ignore[attr-defined]
@@ -392,27 +394,56 @@ def priced_case(tmp_path_factory: pytest.TempPathFactory, orders_df: pl.DataFram
 
 @dataclass
 class Traced:
-    log: EventLog
+    events: list[EventModel]
     llm: LLM
     script: Script
+    outcome: RunOutcome
+
+
+PUBLIC_RUN_ID = "run-public-7"
+
+
+def _fake_load(out: SystemOutput, contract: Any, **kw: Any) -> LoadResult:
+    return LoadResult(
+        snapshot_id="42",
+        rows_loaded=out.df.height,
+        rows_quarantined=len(out.quarantined),
+        skipped=False,
+    )
+
+
+def _execute(path: Path, run_fn: Any, events: list[EventModel]) -> RunOutcome:
+    return execute_run(
+        path,
+        "orders",
+        run_id=PUBLIC_RUN_ID,
+        emit=events.append,
+        run_fn=run_fn,
+        load_fn=_fake_load,
+        loaded_fn=lambda *_a, **_k: None,
+        settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+    )
 
 
 @pytest.fixture
 def traced_run(priced_case: Case, spans: InMemorySpanExporter, sandbox_dir: None) -> Traced:
+    """One agent run through the shared execution core, on the real runner (fake Docker)."""
     script = Script()
+    llms: list[LLM] = []
 
     def sandbox(code: str, values: pl.Series) -> runner.SandboxResult:
         return runner.run_transform(code, values, client=FakeDocker())  # type: ignore[arg-type]
 
-    async def go() -> Traced:
-        async with _llm(script.respond) as llm:
-            log = EventLog()
-            deps = PipelineDeps(llm=llm, sandbox=sandbox, clock=lambda: 0.0)
-            case = CaseInput(priced_case.input_path, load_contract("orders"), {})
-            await run_pipeline(case, deps, log)
-            return Traced(log, llm, script)
+    def factory() -> LLM:
+        llms.append(_llm(script.respond))
+        return llms[-1]
 
-    return asyncio.run(go())
+    events: list[EventModel] = []
+    system = AgentSystem(llm_factory=factory, sandbox=sandbox)
+    outcome = _execute(priced_case.input_path, system.run, events)
+    (llm,) = llms
+    return Traced(events, llm, script, outcome)
 
 
 def _ancestors(s: ReadableSpan, by_id: dict[int, ReadableSpan]) -> list[str]:
@@ -430,12 +461,11 @@ def test_pipeline_run_is_one_root_span_with_run_attributes(
 ) -> None:
     (root,) = [s for s in spans.get_finished_spans() if s.parent is None]
     assert root.name == "sluice.run"
-    (started,) = [e for e in traced_run.log.events if e.type == "run_started"]  # type: ignore[attr-defined]
-    (finished,) = [e for e in traced_run.log.events if e.type == "run_finished"]  # type: ignore[attr-defined]
+    (started,) = [e for e in traced_run.events if e.type == "run_started"]  # type: ignore[attr-defined]
     attrs = dict(root.attributes or {})
-    assert attrs["sluice.run_id"] == started.run_id  # type: ignore[attr-defined]
+    assert attrs["sluice.run_id"] == PUBLIC_RUN_ID == started.run_id  # type: ignore[attr-defined]
     assert attrs["sluice.table"] == "orders"
-    assert attrs["sluice.status"] == finished.status == "succeeded"  # type: ignore[attr-defined]
+    assert attrs["sluice.status"] == traced_run.outcome.status == "succeeded"
     assert {s.context.trace_id for s in spans.get_finished_spans()} == {root.context.trace_id}
 
 
@@ -445,7 +475,7 @@ def test_pipeline_steps_are_descendants_of_the_run(
     by_id = {s.context.span_id: s for s in spans.get_finished_spans()}
     steps = _named(spans, "sluice.step")
     assert sorted(str((s.attributes or {})["sluice.step"]) for s in steps) == sorted(
-        ["mapping", "profile", "rules_pass_1", "plan", "rules_pass_2"]
+        ["mapping", "profile", "rules_pass_1", "plan", "rules_pass_2", "load"]
     )
     assert all(_ancestors(s, by_id) == ["sluice.run"] for s in steps)
 
@@ -541,3 +571,44 @@ def test_phoenix_service_is_opt_in_pinned_and_loopback_only() -> None:
     assert phoenix["ports"] == ["127.0.0.1:56006:6006"]  # UI + OTLP/HTTP share 6006
     others = [s for name, s in compose["services"].items() if name != "phoenix"]
     assert all("profiles" not in s for s in others)
+
+
+def test_execute_run_failure_marks_the_run_span_failed(
+    priced_case: Case, spans: InMemorySpanExporter
+) -> None:
+    def boom(case: CaseInput) -> SystemOutput:
+        raise RuntimeError(f"system crashed {API_KEY}")
+
+    with pytest.raises(RuntimeError):
+        _execute(priced_case.input_path, boom, [])
+
+    (root,) = _named(spans, "sluice.run")
+    assert (root.attributes or {})["sluice.run_id"] == PUBLIC_RUN_ID
+    assert (root.attributes or {})["sluice.status"] == "failed"
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.status.description == "RuntimeError"
+    assert not any(API_KEY in v for v in _all_values(spans))
+
+
+def test_llm_output_error_span_keeps_the_spent_tokens(spans: InMemorySpanExporter) -> None:
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[output_part(info, json.dumps({"wrong": API_KEY}))],
+            usage=RequestUsage(input_tokens=5, output_tokens=3),
+            model_name="m",
+        )
+
+    async def go() -> None:
+        async with _llm(respond) as llm:
+            await llm.run("worker", "small", "s", "p", Answer)
+
+    with pytest.raises(LLMOutputError) as caught:
+        asyncio.run(go())
+
+    (s,) = _named(spans, "chat small")
+    attrs = dict(s.attributes or {})
+    assert s.status.status_code is StatusCode.ERROR
+    assert s.status.description == "LLMOutputError"
+    assert attrs["gen_ai.usage.input_tokens"] == caught.value.record.input_tokens > 0
+    assert attrs["gen_ai.usage.output_tokens"] == caught.value.record.output_tokens > 0
+    assert not any(API_KEY in v for v in _all_values(spans))

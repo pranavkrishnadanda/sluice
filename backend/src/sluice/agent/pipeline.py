@@ -499,12 +499,27 @@ async def _run_node(
 
 
 async def _traced_attempt(
-    run: _Run, outcome: _NodeOutcome, attempt: int, tier: Tier, *rest: Any
+    run: _Run,
+    outcome: _NodeOutcome,
+    attempt: int,
+    tier: Tier,
+    spec: ColumnSpec,
+    source_name: str,
+    shown_name: str,
+    samples: list[str],
+    prior_error: str | None,
+    values: pl.Series,
+    frame: pl.DataFrame,
+    flagged_before: set[int],
+    records: list[CallRecord],
 ) -> tuple[str | None, pl.Series | None]:
     """`_attempt` inside its ``sluice.node.attempt`` span."""
     attributes = {"sluice.node_id": outcome.node.id, "sluice.attempt": attempt, "sluice.tier": tier}
     with tracing.span("sluice.node.attempt", attributes) as current:
-        error, rewritten = await _attempt(run, outcome, attempt, tier, *rest)
+        error, rewritten = await _attempt(
+            run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
+            values, frame, flagged_before, records,
+        )  # fmt: skip
         current.set_attribute("sluice.outcome", "accepted" if error is None else "failed")
     return error, rewritten
 
