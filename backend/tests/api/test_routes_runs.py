@@ -613,6 +613,9 @@ def test_get_runs_from_foreign_origin_keeps_cors_only_behaviour(client: TestClie
         ("", "upload.csv"),
         ("../", "upload.csv"),
         ("\x00\x01", "upload.csv"),
+        ("photo\u202egpj.csv", "photogpj.csv"),  # RIGHT-TO-LEFT OVERRIDE: display spoofing
+        ("\u2066a\u2069\u200bb\ufeff.csv", "ab.csv"),  # isolates, zero-width space, BOM
+        ("\u202a\u202b\u202c\u202d", "upload.csv"),
     ],
 )
 def test_sanitise_file_name_cases(raw: str, expected: str) -> None:

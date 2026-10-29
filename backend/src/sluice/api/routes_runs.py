@@ -57,6 +57,8 @@ _log = logging.getLogger(__name__)
 router = APIRouter()
 
 ALLOWED_EXTENSIONS: Final = (".csv", ".json", ".parquet")
+STRIPPED_CATEGORIES: Final = frozenset({"Cc", "Cf"})
+"""Unicode categories removed from display names: controls and format (bidi) characters."""
 TABLES: Final = frozenset(get_args(TableName))
 LIST_LIMIT: Final = 100
 MAX_FIELD_BYTES: Final = 1024
@@ -107,13 +109,17 @@ def upload_extension(name: str) -> str | None:
 
 
 def sanitise_file_name(raw: str, ext: str) -> str:
-    """The display name: basename only, no control characters, NFC, at most 255 characters.
+    """The display name: basename only, no control or format characters, NFC, <= 255 chars.
+
+    Format characters (``Cf``: bidi overrides and isolates such as U+202E, zero-width spaces,
+    BOM) are removed with the controls: ``"photo<U+202E>gpj.csv"`` would otherwise display as
+    ``photovsc.jpg``. This also drops ZWJ/ZWNJ, which only changes how some names render.
 
     Both ``/`` and ``\\`` separate path components (browsers on Windows may send either). An
     over-long name is cut in its stem so the extension survives. Empty -> ``"upload<ext>"``.
     """
     name = raw.replace("\\", "/").rsplit("/", 1)[-1]
-    name = "".join(ch for ch in name if unicodedata.category(ch) != "Cc")
+    name = "".join(ch for ch in name if unicodedata.category(ch) not in STRIPPED_CATEGORIES)
     name = unicodedata.normalize("NFC", name).strip()
     if name in ("", ".", ".."):
         return f"upload{ext}"
