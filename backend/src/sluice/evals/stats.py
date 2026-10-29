@@ -4,6 +4,7 @@
   first; the point estimate is the exact sample mean (``math.fsum``), the interval is the
   ``alpha / 2`` and ``1 - alpha / 2`` quantiles of ``n_resamples`` resampled means. Resampling
   is vectorised (an index matrix per chunk) and deterministic given ``seed``.
+* ``bootstrap_quantile_ci`` -- the same percentile bootstrap for a quantile (p95 latency).
 * ``pass_at_k`` -- unbiased estimator of "at least one of ``k`` trials succeeds", from ``n``
   trials with ``c`` successes: ``1 - C(n - c, k) / C(n, k)`` (Chen et al. 2021, Codex).
 * ``pass_hat_k`` -- tau-bench's pass^k, "all ``k`` trials succeed": ``C(c, k) / C(n, k)``
@@ -75,6 +76,55 @@ def bootstrap_ci(
     lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
     # A resampled mean cannot leave the data range; clamp away last-ulp summation error.
     return (mean, float(min(max(lo, lo_v), hi_v)), float(min(max(hi, lo_v), hi_v)))
+
+
+def bootstrap_quantile_ci(
+    values: Sequence[float | None],
+    q: float,
+    n_resamples: int = 10_000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> tuple[float, float, float] | None:
+    """Return ``(quantile, lo, hi)``: the sample ``q``-quantile and its percentile-bootstrap CI.
+
+    Like :func:`bootstrap_ci` but for a quantile (e.g. ``q=0.95`` for a p95 latency): the point
+    estimate is ``numpy.quantile`` (linear interpolation) of the data, the interval the
+    ``alpha / 2`` and ``1 - alpha / 2`` quantiles of ``n_resamples`` resampled ``q``-quantiles.
+    ``None`` entries are dropped; ``None`` if nothing remains; constant input is exact. Same
+    time and memory bounds as :func:`bootstrap_ci`.
+
+    Raises:
+        ValueError: if ``q`` is not in ``[0, 1]``, ``n_resamples < 1``, ``alpha`` is not in
+            ``(0, 1)``, or a value is not finite.
+    """
+    if not 0.0 <= q <= 1.0:
+        raise ValueError(f"q must be in [0, 1], got {q}")
+    if n_resamples < 1:
+        raise ValueError(f"n_resamples must be >= 1, got {n_resamples}")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    kept = [float(v) for v in values if v is not None]
+    if not kept:
+        return None
+    if not all(math.isfinite(v) for v in kept):
+        raise ValueError("bootstrap_quantile_ci values must be finite")
+    lo_v, hi_v = min(kept), max(kept)
+    if lo_v == hi_v:
+        return (lo_v, lo_v, lo_v)
+
+    data = np.asarray(kept, dtype=np.float64)
+    n = data.size
+    rng = np.random.default_rng(seed)
+    stats = np.empty(n_resamples, dtype=np.float64)
+    rows_per_chunk = max(1, _MAX_CHUNK_ELEMENTS // n)
+    for start in range(0, n_resamples, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_resamples)
+        idx = rng.integers(0, n, size=(stop - start, n))
+        stats[start:stop] = np.quantile(data[idx], q, axis=1)
+
+    point = float(np.quantile(data, q))
+    lo, hi = np.quantile(stats, [alpha / 2, 1 - alpha / 2])
+    return (point, float(min(max(lo, lo_v), hi_v)), float(min(max(hi, lo_v), hi_v)))
 
 
 def clopper_pearson(k: int, n: int, alpha: float = 0.05) -> tuple[float, float]:

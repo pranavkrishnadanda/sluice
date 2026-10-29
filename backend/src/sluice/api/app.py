@@ -268,6 +268,13 @@ def create_app(
     app.state.hub = None
     app.state.worker = None
 
+    # Imported here: the route modules import ``ApiError`` from this module.
+    from sluice.api import routes_evals, routes_runs
+
+    app.state.evals_dir = routes_evals.DEFAULT_EVALS_DIR
+    app.include_router(routes_runs.router)
+    app.include_router(routes_evals.router)
+
     app.add_exception_handler(StarletteHTTPException, _http_exception)
     app.add_exception_handler(RequestValidationError, _request_validation)
     app.add_exception_handler(ApiError, _api_error)
