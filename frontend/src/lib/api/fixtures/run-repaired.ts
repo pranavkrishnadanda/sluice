@@ -91,7 +91,16 @@ export const RUN_REPAIRED_EVENTS = buildEvents(RUN_REPAIRED.createdAt, [
       ],
     },
   ],
-  [40, { type: "node_started", nodeId: "n1", attempt: 1, maxAttempts: 3 }],
+  [
+    40,
+    {
+      type: "node_started",
+      nodeId: "n1",
+      attempt: 1,
+      maxAttempts: 3,
+      tier: "small",
+    },
+  ],
   [
     1_380,
     {
@@ -104,7 +113,16 @@ export const RUN_REPAIRED_EVENTS = buildEvents(RUN_REPAIRED.createdAt, [
       costUsd: 0.0011,
     },
   ],
-  [30, { type: "node_started", nodeId: "n1", attempt: 2, maxAttempts: 3 }],
+  [
+    30,
+    {
+      type: "node_started",
+      nodeId: "n1",
+      attempt: 2,
+      maxAttempts: 3,
+      tier: "strong",
+    },
+  ],
   [
     2_140,
     {
@@ -118,7 +136,16 @@ export const RUN_REPAIRED_EVENTS = buildEvents(RUN_REPAIRED.createdAt, [
       transformId: "t-repaired-n1-2",
     },
   ],
-  [30, { type: "node_started", nodeId: "n2", attempt: 1, maxAttempts: 3 }],
+  [
+    30,
+    {
+      type: "node_started",
+      nodeId: "n2",
+      attempt: 1,
+      maxAttempts: 3,
+      tier: "small",
+    },
+  ],
   [
     820,
     {

@@ -6,18 +6,27 @@ States, in order (each one emits the contract event named after it, see ``docs/a
 1. **read** the file; ``run_started`` (with the row count).
 2. **map** (``propose_mapping`` -> ``apply_mapping``): the model renames source columns the
    deterministic matcher left over. No event of its own; its renames are listed in
-   ``rules_applied.actions``.
+   ``rules_applied.actions``. Before it, ``table_mismatch`` (Ruling H5) ends a run whose
+   column names clearly belong to another known table's contract: ``profiled``,
+   ``rules_applied``, then ``run_finished`` (``quarantined``, a plain summary), no model call.
 3. **rules pass 1** (``profile`` + ``apply_rules``); ``profiled``, ``rules_applied``. A file whose
    primary key cannot be found is quarantined whole here, exactly as the rules-only system does.
 4. **plan** (``candidate_columns`` -> ``propose_plan``); ``plan_created``. No candidates means no
    model call and an empty plan.
 5. **work**, nodes in dependency waves, the nodes of one wave concurrently (``asyncio.gather``).
    Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` (unchecked draft)
-   -> ``precheck_code``
+   -> ``prepare_code`` (``precheck_code``, after one dedent of a uniformly indented module)
    -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> keep only the rewritten
    cells pass 1 flagged, in every raw copy of a row (Ruling F2: parsed cells keep their raw
    text; duplicates stay identical, so dedupe is unchanged) -> an effect check (the
-   rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``. Each
+   rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``.
+   **Unit exception (Ruling H2c, deliberate).** For a node whose column has a profiler unit
+   issue (values that look like whole paise for an INR column), the accepted rewrite applies to
+   every row of the column, not only the flagged ones, because every value is in the wrong
+   unit (the rules may parse paise rendered as ``12450050.00`` without flagging them). The
+   fabrication guard still covers every row (destroyed tokens and nulls stay null), and the
+   effect check instead requires that no cell becomes unparseable or loses its number and
+   that the column median shrinks by a factor in [80, 120] (≈ ÷100). Every other node keeps F2. Each
    attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
    own reason). The attempt's transform record (when it produced code) goes to
@@ -32,6 +41,14 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    checks on the final output) unless the run failed.
 7. ``run_finished``, exactly once (``loaded`` belongs to the loader / ``sluice run``). Its
    ``tokens``/``costUsd`` are the full run totals (mapping, planning and verifier calls too).
+
+Activity (``case.on_activity``, live-only status, never in ``log`` or ``meta["events"]``): one
+``activity`` event when each phase starts: ``mapping`` (before the mapping call), ``planning``
+(before a planning call), and per attempt, after its ``node_started``: ``writing`` (worker call),
+``sandbox``, ``checking`` (the effect check) and ``verifying`` (verifier call). A rate-limit
+back-off inside any of those model calls (``LLM.on_backoff``) announces ``waiting`` (with the
+wait in whole seconds) and then the interrupted phase again. The copy names tiers, contract
+column names and row counts only.
 
 Fallbacks: model and provider problems never raise. ``LLMUnavailable`` (every route failed) or
 ``LLMOutputError`` from mapping or planning skip that step: the frame stays as it was, so the
@@ -74,6 +91,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -90,10 +108,14 @@ from sluice.agent.caps import (
     MAX_WALL_S_PER_FILE,
 )
 from sluice.agent.events import (
+    ACTIVITY_MESSAGE_MAX_CHARS,
+    Activity,
+    ActivityPhase,
     AttemptFailed,
     EventLog,
     EventModel,
     Issue,
+    ModelTier,
     NodeFinished,
     NodeStarted,
     PlanCreated,
@@ -104,14 +126,29 @@ from sluice.agent.events import (
     Verified,
 )
 from sluice.agent.events import PlanNode as EventPlanNode
-from sluice.agent.mapping import ColumnMapping, apply_mapping, propose_mapping
+from sluice.agent.mapping import ColumnMapping, apply_mapping, propose_mapping, table_mismatch
 from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
-from sluice.agent.worker import clip, guard_output, precheck_code, write_transform
-from sluice.contracts.model import ColumnSpec, Contract
+from sluice.agent.worker import (
+    clip,
+    guard_output,
+    prepare_code,
+    sandbox_feedback,
+    write_transform,
+)
+from sluice.contracts.model import ColumnSpec, Contract, known_contracts
 from sluice.contracts.validate import validate
 from sluice.evals.types import CaseInput, SystemOutput, pk_text
 from sluice.io import read_input
-from sluice.llm.client import LLM, CallRecord, LLMError, LLMOutputError, LLMUnavailable, Tier
+from sluice.llm.client import (
+    LLM,
+    Backoff,
+    BackoffHook,
+    CallRecord,
+    LLMError,
+    LLMOutputError,
+    LLMUnavailable,
+    Tier,
+)
 from sluice.rules.fixers import (
     RuleResult,
     UnkeyableInputError,
@@ -119,7 +156,7 @@ from sluice.rules.fixers import (
     cell_texts,
     flagged_raw_rows,
 )
-from sluice.rules.profile import Profile, contract_sources, profile
+from sluice.rules.profile import Profile, contract_sources, magnitude, number_mask, profile
 from sluice.sandbox.runner import SandboxError, SandboxResult
 
 __all__ = ["MAX_TOKENS_PER_FILE", "MAX_WALL_S_PER_FILE", "PipelineDeps", "run_pipeline"]
@@ -128,6 +165,10 @@ MAX_LLM_ERROR_CHARS: Final = 300
 """``meta["llm_error"]`` is cut to this length (the client's messages carry no provider text)."""
 
 MAX_ISSUE_DETAIL_CHARS: Final = 200
+
+UNIT_FACTOR_MIN: Final = 80.0
+UNIT_FACTOR_MAX: Final = 120.0
+"""A unit node's rewrite must shrink the column median by a factor in this range (≈ ÷100)."""
 
 Sandbox = Callable[[str, pl.Series], SandboxResult]
 
@@ -201,11 +242,65 @@ class _Run:
     """Set when a node's final attempt failed: no new node starts and the file is quarantined."""
     unavailable: bool = False
     cap: str | None = None
+    current: dict[str | None, Activity] = field(default_factory=dict)
+    """The latest announced phase per node id (``None``: run-wide), re-announced after a wait."""
 
     def emit[E: EventModel](self, event: E) -> E:
         stamped = self.log.emit(event)
         self.emitted.append(stamped)
         return stamped
+
+    def activity(
+        self,
+        phase: ActivityPhase,
+        message: str,
+        *,
+        node_id: str | None = None,
+        tier: ModelTier | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        """Announce that ``phase`` starts (``case.on_activity``); a no-op without a sink.
+
+        Activity is live-only status: it is not in :attr:`log` or ``meta["events"]``.
+        """
+        sink = self.case.on_activity
+        if sink is None:
+            return
+        event = Activity(
+            node_id=node_id,
+            phase=phase,
+            message=clip(message, ACTIVITY_MESSAGE_MAX_CHARS),
+            tier=tier,
+            attempt=attempt,
+        )
+        self.current[node_id] = event
+        sink(event)
+
+    def backoff_hook(self, node_id: str | None, attempt: int | None) -> BackoffHook:
+        """An ``LLM.on_backoff`` hook: ``waiting`` before a rate-limit wait, then the
+        interrupted phase again once the wait is over."""
+
+        def hook(wait: Backoff) -> None:
+            sink = self.case.on_activity
+            if sink is None:
+                return
+            if not wait.done:
+                seconds = math.ceil(wait.wait_s)
+                message = f"Rate limit reached on the {wait.tier} model — retrying in {seconds} s"
+                sink(
+                    Activity(
+                        node_id=node_id,
+                        phase="waiting",
+                        message=message,
+                        tier=wait.tier,
+                        attempt=attempt,
+                        retry_in_s=seconds,
+                    )
+                )
+            elif (resumed := self.current.get(node_id)) is not None:
+                sink(resumed)
+
+        return hook
 
     @property
     def records(self) -> list[CallRecord]:
@@ -288,10 +383,20 @@ async def _pipeline(run: _Run) -> SystemOutput:
         )
     )
 
+    known = known_contracts(contract.version)
+    if (mismatch := table_mismatch(list(raw.columns), contract, known)) is not None:
+        # Ruling H5: clearly another known table's file. Stop before any model call.
+        empty = RuleResult(pl.DataFrame(), set(), set(), [])
+        run.emit(Profiled(issues=_issues(profile(raw, contract), empty, {}, None)))
+        actions = [f"file quarantined: {mismatch}"]
+        run.emit(RulesApplied(actions=actions))
+        return _quarantine_file(run, actions, None, [], None, mismatch, summary=mismatch)
+
     mapping: ColumnMapping | None = None
     frame = raw
+    run.activity("mapping", f"Matching the file's columns to the {contract.name} contract")
     try:
-        with tracing.step_span("mapping"):
+        with tracing.step_span("mapping"), deps.llm.on_backoff(run.backoff_hook(None, None)):
             mapping, _ = await propose_mapping(raw, contract, deps.llm)
             frame = apply_mapping(raw, mapping)
     except (LLMUnavailable, LLMOutputError) as exc:
@@ -320,9 +425,23 @@ async def _pipeline(run: _Run) -> SystemOutput:
     if candidates and run.unavailable:
         run.errors.append("planning: skipped, no model route is available")
     else:
+        if candidates:
+            n = len(candidates)
+            run.activity(
+                "planning",
+                f"Asking the {planning.PLAN_TIER} model to plan repairs for {n} "
+                + ("column" if n == 1 else "columns"),
+                tier=planning.PLAN_TIER,
+            )
         try:
-            with tracing.step_span("plan"):
-                plan, _ = await planning.propose_plan(candidates, contract, deps.llm)
+            with tracing.step_span("plan"), deps.llm.on_backoff(run.backoff_hook(None, None)):
+                plan, _ = await planning.propose_plan(
+                    candidates,
+                    contract,
+                    deps.llm,
+                    issues=prof1.unit_issues,
+                    source_names=run.sources,
+                )
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
@@ -419,6 +538,7 @@ async def _run_nodes(
                         hints.get(n.column, source[n.column]),
                         candidates[n.column],
                         flagged.get(n.column, set()),
+                        prof.unit_issues.get(n.column),
                     )
                 )
         done.update(n.id for n in wave)
@@ -433,11 +553,13 @@ async def _run_node(
     shown_name: str,
     samples: list[str],
     flagged_before: set[int],
+    unit_issue: str | None,
 ) -> None:
     """Attempt one node until it is accepted, runs out of attempts, or a cap/outage stops it.
 
     ``source_name`` is the column in ``frame``; ``shown_name`` is the input file's own name for
-    it (with any unit hint), passed to the worker.
+    it (with any unit hint), passed to the worker. ``unit_issue`` is the profiler's unit finding
+    for the column (Ruling H2c: the rewrite then covers every row), else ``None``.
     """
     node = outcome.node
     contract = run.case.contract
@@ -457,12 +579,15 @@ async def _run_node(
         tier = planning.route_tier(node, attempt)
         outcome.attempts, outcome.tier = attempt, tier
         started = run.deps.clock()
-        run.emit(NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS))
+        run.emit(
+            NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS, tier=tier)
+        )
         records: list[CallRecord] = []
-        error, rewritten = await _traced_attempt(
-            run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
-            values, frame, flagged_before, records,
-        )  # fmt: skip
+        with run.deps.llm.on_backoff(run.backoff_hook(node.id, attempt)):
+            error, rewritten = await _traced_attempt(
+                run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
+                values, frame, flagged_before, records, unit_issue,
+            )  # fmt: skip
         tokens, cost = _spend(records)
         _hand_over_transform(run, outcome, attempt)
         if error is None:
@@ -531,13 +656,14 @@ async def _traced_attempt(
     frame: pl.DataFrame,
     flagged_before: set[int],
     records: list[CallRecord],
+    unit_issue: str | None,
 ) -> tuple[str | None, pl.Series | None]:
     """`_attempt` inside its ``sluice.node.attempt`` span."""
     attributes = {"sluice.node_id": outcome.node.id, "sluice.attempt": attempt, "sluice.tier": tier}
     with tracing.span("sluice.node.attempt", attributes) as current:
         error, rewritten = await _attempt(
             run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
-            values, frame, flagged_before, records,
+            values, frame, flagged_before, records, unit_issue,
         )  # fmt: skip
         current.set_attribute("sluice.outcome", "accepted" if error is None else "failed")
     return error, rewritten
@@ -557,6 +683,7 @@ async def _attempt(
     frame: pl.DataFrame,
     flagged_before: set[int],
     records: list[CallRecord],
+    unit_issue: str | None,
 ) -> tuple[str | None, pl.Series | None]:
     """One attempt: ``(None, rewritten values)`` when accepted, else ``(why, None)``.
 
@@ -564,10 +691,16 @@ async def _attempt(
     pointless (no model route, or the sandbox itself is down).
     """
     node, llm = outcome.node, run.deps.llm
+
+    def announce(phase: ActivityPhase, message: str) -> None:
+        run.activity(phase, message, node_id=node.id, tier=tier, attempt=attempt)
+
+    announce("writing", f"Asking the {tier} model to write a fix for {node.column}")
     try:
         code, record = await write_transform(
-            node, spec, shown_name, samples, prior_error, tier, llm, checked=False
-        )
+            node, spec, shown_name, samples, prior_error, tier, llm, checked=False,
+            finding=unit_issue,
+        )  # fmt: skip
     except LLMOutputError as exc:
         records.append(exc.record)
         return f"the worker's output did not match the transform schema: {exc}", None
@@ -576,37 +709,49 @@ async def _attempt(
         outcome.stop, outcome.outage = "no model route is available", True
         return f"LLMUnavailable: {exc}", None
     records.append(record)
+    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
+    # A uniformly indented module is dedented once (``prepare_code``); the record keeps the
+    # code that was actually checked and run.
+    source, reason = prepare_code(code.code)
     transform = {
         "transform_id": transform_id(run.run_id, node.id, attempt),
         "node_id": node.id,
         "attempt": attempt,
-        "code": code.code,
+        "code": source,
         "model": record.model or tier,
         "passed": False,
     }
     outcome.transforms.append(transform)
-
-    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
-    if (reason := precheck_code(code.code)) is not None:
+    if reason is not None:
         return f"precheck: {reason}", None
+    announce("sandbox", f"Running the fix in the sandbox on {values.len():,} rows")
     try:
-        result = await asyncio.to_thread(run.deps.sandbox, code.code, values)
+        result = await asyncio.to_thread(run.deps.sandbox, source, values)
     except SandboxError as exc:
         run.sandbox_error = type(exc).__name__
         outcome.stop = "the sandbox is unavailable"
         return f"sandbox unavailable ({type(exc).__name__})", None
     if not result.ok or result.values is None:
-        return f"sandbox: {result.error or 'no output'}", None
+        return f"sandbox: {sandbox_feedback(result.error or 'no output')}", None
     out = result.values
     if out.dtype == pl.Null:  # Ruling W2: an all-null output is a String column of nulls
         out = out.cast(pl.String)
     if (reason := guard_output(values, out)) is not None:
         return reason, None
-    out = only_flagged(values, out.alias(source_name), flagged_before)  # Ruling F2
+    unit = unit_issue is not None
+    # Ruling F2: only flagged cells change, except for a unit node (Ruling H2c): every value
+    # of its column is in the wrong unit, so the rewrite covers every row.
+    out = (
+        out.alias(source_name)
+        if unit
+        else only_flagged(values, out.alias(source_name), flagged_before)
+    )
 
-    effect = _effect(run.case, frame, source_name, spec, values, out, flagged_before)
+    announce("checking", "Checking the rewrite against the rules")
+    effect = _effect(run.case, frame, source_name, spec, values, out, flagged_before, unit=unit)
     if effect.error is not None:
         return effect.error, None
+    announce("verifying", "The verifier is checking the result")
     try:
         verdict, vrecord = await verify_node(node, spec, effect.pairs, effect.stats, llm)
     except LLMOutputError as exc:
@@ -635,8 +780,8 @@ def only_flagged(raw: pl.Series, out: pl.Series, flagged: set[int]) -> pl.Series
 
     A rewrite may only change the cells rules pass 1 flagged for its column: a cell the rules
     parsed keeps its raw text, so a transform cannot alter a value the rules already read
-    (whatever the verifier sees). Every whole-column repair the drift ops need (paise, IST)
-    flags every row, so nothing a valid rewrite needs is lost. O(rows).
+    (whatever the verifier sees). Paise the rules can parse are the one whole-column repair
+    that needs unflagged rows; unit nodes skip this function (Ruling H2c). O(rows).
     """
     mask = pl.Series([i in flagged for i in range(raw.len())], dtype=pl.Boolean)
     merged = pl.select(pl.when(mask).then(out).otherwise(raw)).to_series()
@@ -647,7 +792,7 @@ def only_flagged(raw: pl.Series, out: pl.Series, flagged: set[int]) -> pl.Series
 class _Effect:
     error: str | None
     pairs: list[tuple[str, str | None]]
-    stats: dict[str, float | int | None]
+    stats: dict[str, float | int | str | None]
 
 
 def _effect(
@@ -658,14 +803,19 @@ def _effect(
     raw: pl.Series,
     out: pl.Series,
     flagged_before: set[int],
+    *,
+    unit: bool = False,
 ) -> _Effect:
     """What a rewrite does to the rules' parse of its column (one extra rules pass).
 
-    Rejects a rewrite that recovers no flagged cell, or that makes the rules flag a cell they
-    parsed before. Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a
-    duplicate copy is never mistaken for a newly broken cell. Builds the verifier's evidence:
-    raw -> rewritten pairs (flagged rows first,
-    then other changed rows, at most ``MAX_VERIFY_PAIRS``) and before/after statistics.
+    Rejects a rewrite that makes the rules flag a cell they parsed before, and then, for an
+    ordinary node, one that recovers no flagged cell. For a unit node (``unit``, Ruling H2c) the
+    second check is instead :func:`_unit_error`: no cell that held a number may lose it, and the
+    median must shrink by a factor in [:data:`UNIT_FACTOR_MIN`, :data:`UNIT_FACTOR_MAX`].
+    Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a duplicate copy
+    is never mistaken for a newly broken cell. Builds the verifier's evidence: raw ->
+    rewritten pairs (flagged rows first, then other changed rows, at most
+    ``MAX_VERIFY_PAIRS``) and before/after statistics.
     """
     contract = case.contract
     rewritten = frame.with_columns(out)
@@ -674,27 +824,37 @@ def _effect(
     flagged_after = flagged_raw_rows(rewritten, contract, prof).get(spec.name, set())
     recovered = len(flagged_before - flagged_after)
     broken = sorted(flagged_after - flagged_before)
-    stats: dict[str, float | int | None] = {
-        "rows": raw.len(),
-        "flagged_before": len(flagged_before),
-        "flagged_after": len(flagged_after),
-        "recovered": recovered,
-        "newly_flagged": len(broken),
-        "changed": int((raw.ne_missing(out)).sum()),
+    stats: dict[str, float | int | str | None] = {
+        "rows_raw": raw.len(),
+        "flagged_raw_before": len(flagged_before),
+        "flagged_raw_after": len(flagged_after),
+        "recovered_raw": recovered,
+        "newly_flagged_raw": len(broken),
+        "changed_raw": int((raw.ne_missing(out)).sum()),
     }
     if broken:
         error = (
             f"the rewrite made {len(broken)} cell(s) unparseable that the rules parsed before "
-            f"(rows {broken[:5]}); leave cells you do not need to change as they are"
+            f"(rows {broken[:5]}); "
+            + (
+                "every rewritten value must be a plain decimal the rules parse"
+                if unit
+                else "leave cells you do not need to change as they are"
+            )
         )
         return _Effect(error, [], stats)
-    if recovered == 0:
+    if unit:
+        if (error := _unit_error(raw, out)) is not None:
+            return _Effect(error, [], stats)
+    elif recovered == 0:
         error = (
             f"the rewrite recovered none of the {len(flagged_before)} flagged cell(s): the rules "
             "still cannot parse its output; follow the target format exactly"
         )
         return _Effect(error, [], stats)
     stats |= _numeric_stats(after.df[spec.name], "after")
+    if spec.unit is not None:
+        stats |= _magnitude_stats(spec, raw, out)
 
     raw_list, out_list = raw.to_list(), out.to_list()
     changed = [i for i, (a, b) in enumerate(zip(raw_list, out_list, strict=True)) if a != b]
@@ -708,9 +868,64 @@ def _effect(
     return _Effect(None, pairs, stats)
 
 
-def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | None]:
-    """Non-null count and, for numeric columns, min / max / mean as floats."""
-    stats: dict[str, float | int | None] = {f"non_null_{label}": series.len() - series.null_count()}
+def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
+    """Why a unit node's rewrite (paise -> rupees, every row) is not a ÷100 rescale, or None.
+
+    Vectorised, O(rows) plus two medians. Counts are over raw rows.
+    """
+    lost = (number_mask(raw) & ~number_mask(out)).arg_true()
+    if lost.len():
+        return (
+            f"the rewrite lost the value of {lost.len()} cell(s) that held a number "
+            f"(rows {lost.head(5).to_list()}); convert every value of this column"
+        )
+    before, after = magnitude(raw), magnitude(out)
+    if before is None or after is None or after.median == 0:
+        return "the rewrite left no number to compare: convert every value of this column"
+    factor = before.median / after.median
+    if not UNIT_FACTOR_MIN <= factor <= UNIT_FACTOR_MAX:
+        return (
+            f"the values are in paise, but the rewrite changed the median by a factor of "
+            f"{factor:.2f} (from {before.median:.2f} to {after.median:.2f}); divide every value "
+            f"by 100 unconditionally, without checking the column name (expected factor "
+            f"{UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
+        )
+    return None
+
+
+def _magnitude_stats(
+    spec: ColumnSpec, raw: pl.Series, out: pl.Series
+) -> dict[str, float | int | str | None]:
+    """The contract unit and before/after size statistics of a money column (Ruling H2d).
+
+    ``median``, ``p5`` and ``p95`` (absolute values) and ``whole_share`` (share of values with no
+    fractional part) of the numbers in the raw and in the rewritten text, over raw rows: an
+    INR column still in paise shows a whole share near 1 and a median 100x too large.
+    """
+    stats: dict[str, float | int | str | None] = {"unit": spec.unit}
+    for label, series in (("before", raw), ("after", out)):
+        m = magnitude(series)
+        stats |= {
+            f"median_{label}": None if m is None else m.median,
+            f"p5_{label}": None if m is None else m.p5,
+            f"p95_{label}": None if m is None else m.p95,
+            f"whole_share_{label}": None if m is None else round(m.whole_share, 4),
+        }
+    return stats
+
+
+def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | str | None]:
+    """Counts over the deduplicated output column, plus min / max / mean for numeric columns.
+
+    ``series`` is a column of :func:`apply_rules`' output, so its counts are on the
+    deduplicated base (``rows_after_dedupe`` = ``non_null_<label>`` + ``null_<label>``), never on
+    the raw rows the ``*_raw`` counts use (Ruling H1).
+    """
+    stats: dict[str, float | int | str | None] = {
+        "rows_after_dedupe": series.len(),
+        f"non_null_{label}": series.len() - series.null_count(),
+        f"null_{label}": series.null_count(),
+    }
     if series.dtype.is_numeric() and series.null_count() < series.len():
         as_float = series.cast(pl.Float64)
         for name, value in (
@@ -788,6 +1003,10 @@ def _issues(
     ]
     issues += [
         Issue(column=c, kind="extra_column", detail="not in the contract") for c in prof.extra
+    ]
+    issues += [
+        Issue(column=c, kind="unit", detail=detail[:MAX_ISSUE_DETAIL_CHARS])
+        for c, detail in prof.unit_issues.items()
     ]
     counts: dict[str, int] = {}
     for _, column in result.flags:
@@ -890,13 +1109,17 @@ def _quarantine_file(
     outcomes: list[_NodeOutcome],
     mapping: ColumnMapping | None,
     reason: str,
+    *,
+    summary: str | None = None,
 ) -> SystemOutput:
     """Hold the whole input back, as the rules-only system does: empty output, no flags.
 
-    Used when the primary key cannot be found, and on the contract's failure path (a node's
-    final attempt failed). No ``verified``; ``run_finished`` has status ``quarantined``.
+    Used when the primary key cannot be found, on the contract's failure path (a node's
+    final attempt failed), and for a file of another known table (Ruling H5, which passes its
+    own plain ``summary``). No ``verified``; ``run_finished`` has status ``quarantined``.
     """
-    status, summary = _status_and_summary(run, None, outcomes, quarantine=reason)
+    status, default = _status_and_summary(run, None, outcomes, quarantine=reason)
+    summary = default if summary is None else summary
     _run_finished(run, status, summary)
     meta = _meta(run, actions, plan, outcomes, mapping, {})
     meta["file_quarantine_reason"] = reason

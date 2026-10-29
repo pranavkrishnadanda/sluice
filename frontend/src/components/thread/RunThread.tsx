@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { useApi } from "@/components/api/ApiProvider";
 import { DemoBadge } from "@/components/shell/DemoBadge";
 import type { RunStatus } from "@/lib/api/types";
+import { isAutoTable } from "@/lib/auto-table";
 import { formatCount, formatMs, formatUsd } from "@/lib/format";
 import type { RunViewState } from "@/lib/run-state";
 import { FileChip } from "./FileChip";
@@ -24,10 +25,13 @@ function UserBubble({
   state,
   connection,
   sample,
+  auto,
 }: {
   state: RunViewState;
   connection: RunStream["connection"];
   sample: boolean;
+  /** The run was started with the table on Auto. */
+  auto: boolean;
 }) {
   if (!state.fileName && (connection === "error" || connection === "lost")) {
     // The stream gave up before `run_started`: stop the placeholder pulsing.
@@ -63,9 +67,20 @@ function UserBubble({
         }
         className="mb-1.5"
       />
-      <p className="text-[0.9375rem] leading-6">
-        Load this into the {state.table} table.
-      </p>
+      {auto ? (
+        <>
+          <p className="text-[0.9375rem] leading-6">
+            Load this into the table it matches.
+          </p>
+          <p className="mt-0.5 text-muted text-xs leading-5">
+            {`Matched the ${state.table} table`}
+          </p>
+        </>
+      ) : (
+        <p className="text-[0.9375rem] leading-6">
+          Load this into the {state.table} table.
+        </p>
+      )}
     </div>
   );
 }
@@ -195,6 +210,7 @@ function Thread({ stream }: { stream: RunStream }) {
   const api = useApi();
   const { state, connection, notFound, retry } = stream;
   const sample = api.isSampleReplay?.(stream.runId) ?? false;
+  const auto = isAutoTable(stream.runId);
   const live = connection === "live";
   const steps = useMemo(() => buildSteps(state, live), [state, live]);
   const announcement = announceLatest(state, steps);
@@ -204,7 +220,12 @@ function Thread({ stream }: { stream: RunStream }) {
       <h1 id="run-title" className="sr-only">
         Run {state.fileName ?? stream.runId}
       </h1>
-      <UserBubble state={state} connection={connection} sample={sample} />
+      <UserBubble
+        state={state}
+        connection={connection}
+        sample={sample}
+        auto={auto}
+      />
       {sample && <SampleReplayNote />}
       {steps.length > 0 && <StepList state={state} steps={steps} />}
       {state.finished && <RunSummary state={state} />}

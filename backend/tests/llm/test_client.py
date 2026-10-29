@@ -806,3 +806,60 @@ def test_proxy_cooldown_with_retry_after_is_paced_like_a_429() -> None:
 
     assert route.call_count == 2
     assert fake.sleeps == [3.0]
+
+
+# ---------------------------------------------------------------- back-off hook (round 2)
+
+
+def test_backoff_hook_hears_each_wait_before_and_after_it() -> None:
+    from sluice.llm.client import Backoff
+
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    router.post(f"{BASE_URL}/v1/chat/completions").mock(side_effect=[_rate_limited("7"), _ok()])
+    llm = _paced_llm(router, fake)
+    heard: list[tuple[Backoff, list[float]]] = []
+
+    async def call() -> None:
+        with llm.on_backoff(lambda b: heard.append((b, list(fake.sleeps)))):
+            await llm.run("worker", "small", "s", "p", Answer)
+
+    run(call())
+
+    assert heard == [
+        (Backoff(role="worker", tier="small", wait_s=7.0, done=False), []),
+        (Backoff(role="worker", tier="small", wait_s=7.0, done=True), [7.0]),
+    ]
+
+
+def test_backoff_hook_is_not_called_without_a_wait() -> None:
+    router = respx.Router(assert_all_called=False)
+    router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+    llm = proxy_llm(router)
+    heard: list[object] = []
+
+    async def call() -> None:
+        with llm.on_backoff(heard.append):
+            await llm.run("worker", "small", "s", "p", Answer)
+
+    run(call())
+
+    assert heard == []
+
+
+def test_backoff_hook_is_scoped_to_its_block() -> None:
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    router.post(f"{BASE_URL}/v1/chat/completions").mock(side_effect=[_rate_limited("1"), _ok()])
+    llm = _paced_llm(router, fake)
+    heard: list[object] = []
+
+    async def call() -> None:
+        with llm.on_backoff(heard.append):
+            pass
+        await llm.run("worker", "small", "s", "p", Answer)
+
+    run(call())
+
+    assert heard == []
+    assert fake.sleeps == [2.0]  # the minimum wait still applies

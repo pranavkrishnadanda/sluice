@@ -17,7 +17,7 @@ const DIST_DIR = ".next-e2e";
 export default defineConfig({
   testDir: "./e2e",
   // Real-backend run: its own config (playwright.live.config.ts).
-  testIgnore: "live-backend.spec.ts",
+  testIgnore: /live-.*\.spec\.ts$/,
   outputDir: "./test-results",
   fullyParallel: true,
   forbidOnly: CI,

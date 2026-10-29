@@ -8,7 +8,9 @@ from pydantic import ValidationError
 
 from sluice.agent import caps
 from sluice.agent.events import (
+    ACTIVITY_MESSAGE_MAX_CHARS,
     PIPELINE_EVENT_ADAPTER,
+    Activity,
     AttemptFailed,
     EventLog,
     Issue,
@@ -37,7 +39,7 @@ def _one_of_each() -> list:
                 )
             ]
         ),
-        NodeStarted(node_id="n1", attempt=1, max_attempts=3),
+        NodeStarted(node_id="n1", attempt=1, max_attempts=3, tier="small"),
         AttemptFailed(
             node_id="n1", attempt=1, max_attempts=3, error="boom", tokens=120, cost_usd=0.001
         ),
@@ -53,6 +55,14 @@ def _one_of_each() -> list:
         Verified(checks_passed=9, checks_total=9),
         Loaded(rows_loaded=100, rows_quarantined=0, snapshot_id="snap-1"),
         RunFinished(status="succeeded", summary="ok", cost_usd=0.003, tokens=420),
+        Activity(
+            node_id="n1",
+            phase="waiting",
+            message="Rate limit reached on the small model — retrying in 14 s",
+            tier="small",
+            attempt=1,
+            retry_in_s=14,
+        ),
     ]
 
 
@@ -62,7 +72,7 @@ CONTRACT_KEYS = {
     "profiled": {"seq", "at", "type", "issues"},
     "rules_applied": {"seq", "at", "type", "actions"},
     "plan_created": {"seq", "at", "type", "nodes"},
-    "node_started": {"seq", "at", "type", "nodeId", "attempt", "maxAttempts"},
+    "node_started": {"seq", "at", "type", "nodeId", "attempt", "maxAttempts", "tier"},
     "attempt_failed": {
         "seq", "at", "type", "nodeId", "attempt", "maxAttempts", "error", "tokens", "costUsd",
     },
@@ -73,6 +83,9 @@ CONTRACT_KEYS = {
     "verified": {"seq", "at", "type", "checksPassed", "checksTotal"},
     "loaded": {"seq", "at", "type", "rowsLoaded", "rowsQuarantined", "snapshotId"},
     "run_finished": {"seq", "at", "type", "status", "summary", "costUsd", "tokens"},
+    "activity": {
+        "seq", "at", "type", "nodeId", "phase", "message", "tier", "attempt", "retryInS",
+    },
 }  # fmt: skip
 
 
@@ -86,7 +99,7 @@ def _emitted() -> list[dict]:
 def test_caps_values_match_the_plan() -> None:
     assert caps.MAX_ATTEMPTS == 3
     assert caps.MAX_TOKENS_PER_FILE == 60_000
-    assert caps.MAX_WALL_S_PER_FILE == 180
+    assert caps.MAX_WALL_S_PER_FILE == 300
     assert caps.SANDBOX_TIMEOUT_S == 20
     assert caps.SANDBOX_MEM_MB == 512
     assert caps.SANDBOX_PIDS == 64
@@ -126,7 +139,7 @@ def test_event_log_seq_strictly_increasing_from_one() -> None:
     log = EventLog()
     for event in _one_of_each():
         log.emit(event)
-    assert [e.seq for e in log.events] == list(range(1, 11))
+    assert [e.seq for e in log.events] == list(range(1, len(CONTRACT_KEYS) + 1))
 
 
 def test_event_log_seq_is_per_log() -> None:
@@ -201,7 +214,7 @@ def test_attempt_failed_error_truncated_when_validated_from_json() -> None:
     assert len(event.error) == caps.MAX_ERROR_CHARS
 
 
-@pytest.mark.parametrize("index", range(10))
+@pytest.mark.parametrize("index", range(len(CONTRACT_KEYS)))
 def test_union_round_trips_every_variant(index: int) -> None:
     log = EventLog()
     for event in _one_of_each():
@@ -252,6 +265,15 @@ def test_events_are_frozen() -> None:
         lambda: Issue(column="c", kind="vibes", detail=""),
         lambda: Verified(checks_passed=1, checks_total=1, extra_field=1),
         lambda: NodeStarted(node_id="n1", attempt="1", max_attempts=3),
+        lambda: NodeStarted(node_id="n1", attempt=1, max_attempts=3, tier="huge"),
+        lambda: Activity(node_id=None, phase="dreaming", message="m"),
+        lambda: Activity(node_id=None, phase="mapping", message=""),
+        lambda: Activity(
+            node_id=None, phase="mapping", message="m" * (ACTIVITY_MESSAGE_MAX_CHARS + 1)
+        ),
+        lambda: Activity(node_id="bad id!", phase="writing", message="m"),
+        lambda: Activity(node_id=None, phase="waiting", message="m", retry_in_s=-1),
+        lambda: Activity(node_id=None, phase="writing", message="m", attempt=0),
     ],
 )  # fmt: skip
 def test_events_reject_invalid_input(build) -> None:
@@ -277,3 +299,41 @@ def test_event_log_on_emit_runs_outside_the_lock() -> None:
 
     log = EventLog(on_emit=reenter)
     log.emit(Verified(checks_passed=1, checks_total=1))
+
+
+# --- round 2: activity and node_started.tier ------------------------------------------------
+
+
+def test_activity_wire_shape_is_camel_case_with_nullable_fields() -> None:
+    event = EventLog().emit(Activity(node_id=None, phase="mapping", message="Mapping columns"))
+
+    assert json.loads(event.to_json()) == {
+        "seq": 1,
+        "at": event.at,
+        "type": "activity",
+        "nodeId": None,
+        "phase": "mapping",
+        "message": "Mapping columns",
+        "tier": None,
+        "attempt": None,
+        "retryInS": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["mapping", "planning", "writing", "sandbox", "checking", "verifying", "waiting", "loading",
+     "previewing"],
+)  # fmt: skip
+def test_activity_accepts_every_contract_phase(phase: str) -> None:
+    assert Activity(node_id=None, phase=phase, message="m").phase == phase  # type: ignore[arg-type]
+
+
+def test_node_started_without_tier_still_parses_for_stored_events() -> None:
+    payload = {"seq": 3, "at": "x", "type": "node_started", "nodeId": "n1", "attempt": 1,
+               "maxAttempts": 3}  # fmt: skip
+
+    event = PIPELINE_EVENT_ADAPTER.validate_python(payload)
+
+    assert isinstance(event, NodeStarted)
+    assert event.tier is None

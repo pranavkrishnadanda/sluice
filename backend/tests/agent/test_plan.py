@@ -28,6 +28,7 @@ from sluice.agent.plan import (
     PlanError,
     PlanNode,
     candidate_columns,
+    difficulty_floor,
     propose_plan,
     route_tier,
     validate_plan,
@@ -363,3 +364,97 @@ def test_route_tier_rejects_non_positive_attempt(attempt: int) -> None:
 
     with pytest.raises(ValueError, match="attempt"):
         route_tier(n, attempt)
+
+
+# ---------------------------------------------------------------- H2b: unit issues
+
+
+def _paise_texts(n: int) -> list[str | None]:
+    return [f"{100_000 + 1_237 * i}.00" for i in range(n)]  # parsed, in range
+
+
+def test_candidates_include_a_unit_issue_column_without_flags(orders: Contract) -> None:
+    raw = frame(60, o_totalprice=_paise_texts(60))
+    result = rules(raw, orders)
+    assert not any(col == "o_totalprice" for _, col in result.flags)
+
+    got = candidate_columns(raw, result, orders)
+
+    assert list(got) == ["o_totalprice"]
+    assert got["o_totalprice"] == sorted(set(_paise_texts(60)))[:MAX_SAMPLES]  # all rows
+
+
+def test_candidates_unit_issue_samples_skip_destroyed_tokens(orders: Contract) -> None:
+    raw = frame(64, o_totalprice=["N/A", "", None, "-1", *_paise_texts(60)])
+    got = candidate_columns(raw, rules(raw, orders), orders)
+    assert not {"N/A", "", "-1"} & set(got["o_totalprice"])
+
+
+def test_propose_plan_prompt_carries_the_profiler_issue(orders: Contract) -> None:
+    script = Scripted({"nodes": [node("n1", "o_totalprice")]})
+    issues = {"o_totalprice": "values look like paise: 100% whole numbers, median 1036492"}
+
+    run(propose_plan(CANDS, orders, script.llm(), issues=issues))
+
+    (prompt,) = script.prompts
+    assert json.dumps(issues["o_totalprice"]) in prompt
+    data = json.loads(prompt.split("\n", 1)[1].split("\n\n")[0])
+    by_column = {c["column"]: c for c in data["candidates"]}
+    assert by_column["o_totalprice"]["profiler_issue"] == issues["o_totalprice"]
+    assert by_column["o_orderdate"]["profiler_issue"] is None
+
+
+# ---------------------------------------------------------------- H4: difficulty floor
+
+
+def test_difficulty_floor_unit_issue_is_hard(orders: Contract) -> None:
+    spec = orders.column("o_totalprice")
+    assert difficulty_floor(spec, ["12450050"], unit_issue=True) == "hard"
+
+
+def test_difficulty_floor_two_date_formats_is_hard(orders: Contract) -> None:
+    spec = orders.column("o_orderdate")
+    assert difficulty_floor(spec, ["02 Jan 1996", "1996/01/02"], unit_issue=False) == "hard"
+    assert difficulty_floor(spec, ["02 Jan 1996", "Jan 5, 1996"], unit_issue=False) == "hard"
+
+
+def test_difficulty_floor_one_date_format_is_easy(orders: Contract) -> None:
+    spec = orders.column("o_orderdate")
+    samples = ["02 Jan 1996", "17 Mar 1994", "5 Dec 1998"]
+    assert difficulty_floor(spec, samples, unit_issue=False) == "easy"
+
+
+def test_difficulty_floor_separators_and_rescaling_is_hard(orders: Contract) -> None:
+    spec = orders.column("o_totalprice")
+    grouped = ["1,24,50,050", "3,10,000"]
+    assert difficulty_floor(spec, grouped, unit_issue=False, source_name="amt_paise") == "hard"
+    assert difficulty_floor(spec, grouped, unit_issue=False, source_name="amt") == "easy"
+    assert difficulty_floor(spec, ["12450050"], unit_issue=False, source_name="amt_paise") == (
+        "easy"
+    )
+
+
+def test_propose_plan_raises_an_easy_node_to_the_floor(orders: Contract) -> None:
+    script = Scripted({"nodes": [node("n1", "o_totalprice"), node("n2", "o_orderdate")]})
+    cands = {"o_totalprice": ["1,24,50,050"], "o_orderdate": ["02 Jan 1996"]}
+    issues = {"o_totalprice": "values look like paise: 100% whole numbers, median 1036492"}
+
+    plan, _ = run(propose_plan(cands, orders, script.llm(), issues=issues))
+
+    assert [n.difficulty for n in plan.nodes] == ["hard", "easy"]
+    assert route_tier(plan.nodes[0], 1) == "strong"
+
+
+def test_propose_plan_floor_never_lowers_the_orchestrators_difficulty(orders: Contract) -> None:
+    script = Scripted({"nodes": [node("n1", "o_orderdate", difficulty="hard")]})
+    plan, _ = run(propose_plan({"o_orderdate": ["02 Jan 1996"]}, orders, script.llm()))
+    assert plan.nodes[0].difficulty == "hard"
+
+
+def test_propose_plan_floor_uses_the_source_column_name(orders: Contract) -> None:
+    script = Scripted({"nodes": [node("n1", "o_totalprice")]})
+    cands = {"o_totalprice": ["1,24,50,050"]}
+    plan, _ = run(
+        propose_plan(cands, orders, script.llm(), source_names={"o_totalprice": "price_paise"})
+    )
+    assert plan.nodes[0].difficulty == "hard"

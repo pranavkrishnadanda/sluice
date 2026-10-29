@@ -6,6 +6,7 @@ Generated code is only ever parsed with `ast` here, never executed (Global Const
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,10 +22,15 @@ from sluice.agent import caps
 from sluice.agent.worker import (
     DESTROYED_TOKENS,
     MAX_PROMPT_SAMPLES,
+    POLARS_REFERENCE,
     WORKER_SYSTEM_PROMPT,
     TransformCode,
+    build_worker_prompt,
     guard_output,
     precheck_code,
+    prepare_code,
+    sandbox_feedback,
+    sandbox_hint,
     write_transform,
 )
 from sluice.contracts.model import ColumnSpec
@@ -393,3 +399,191 @@ def test_write_transform_code_invalid_twice_raises_output_error() -> None:
     cap = Capture(bad, bad)
     with pytest.raises(LLMOutputError):
         _write(cap)
+
+
+def test_worker_prompt_carries_a_unit_finding_only_when_given() -> None:
+    finding = "values look like paise: 100% whole numbers, median 1036492"
+    with_finding = build_worker_prompt(NODE, SPEC, "amount", ["1,24,500"], None, finding)
+    assert json.dumps(finding) in with_finding
+    assert "divide by 100" in with_finding
+    assert "Profiler finding" not in build_worker_prompt(NODE, SPEC, "amount", ["1"], None)
+
+
+# ---------------------------------------------------------------- H3: Polars 2.1 API
+
+
+def test_worker_prompt_has_the_polars_2_1_reference() -> None:
+    for needle in (
+        "Polars 2.1",
+        ".str.strip_chars()",
+        ".str.replace_all(",
+        ".str.to_date(",
+        ".str.strptime(pl.Date, format=",
+        "strict=False",
+        "pl.when(",
+        "pl.coalesce(",
+        ".cast(pl.String)",
+    ):
+        assert needle in WORKER_SYSTEM_PROMPT, needle
+
+
+def test_worker_polars_reference_names_exist_in_the_installed_polars() -> None:
+    assert pl.__version__.startswith("2.1.")  # the sandbox image pins the lockfile's polars
+    strings = pl.Series([], dtype=pl.String).str
+    dates = pl.Series([], dtype=pl.Date).dt
+    series = pl.Series([], dtype=pl.String)
+    str_names = set(re.findall(r"\.str\.(\w+)\(", POLARS_REFERENCE))
+    dt_names = set(re.findall(r"\.dt\.(\w+)\(", POLARS_REFERENCE))
+    pl_names = set(re.findall(r"\bpl\.(\w+)\b", POLARS_REFERENCE))
+    series_names = set(re.findall(r"values\.(\w+)\(", POLARS_REFERENCE)) - {"str", "dt"}
+    assert {"strip_chars", "replace_all", "to_date", "strptime"} <= str_names
+    assert all(hasattr(strings, n) for n in str_names), str_names
+    assert all(hasattr(dates, n) for n in dt_names), dt_names
+    assert all(hasattr(pl, n) for n in pl_names), pl_names
+    assert all(hasattr(series, n) for n in series_names), series_names
+    for removed in ("strip", "lstrip", "rstrip", "lengths"):
+        assert not hasattr(strings, removed)
+    assert not hasattr(series, "apply")
+    for pandas_name in ("mask", "where", "fillna", "astype"):
+        assert not hasattr(series, pandas_name)
+    assert hasattr(series, "fill_null") and hasattr(series, "cast")
+
+
+@pytest.mark.parametrize(
+    ("error", "bad", "good"),
+    [
+        (
+            "Traceback (most recent call last):\n  File ...\nAttributeError: "
+            "'ExprStringNameSpace' object has no attribute 'strip'. Did you ",
+            "strip",
+            "strip_chars",
+        ),
+        (
+            "Traceback (most recent call last):\n  File ...\nTypeError: "
+            "StringNameSpace.strptime() got an unexpected keyword argument 'fmt'",
+            "fmt",
+            "format=",
+        ),
+        (
+            "TypeError: Series.replace() got an unexpected keyword argument 'regex'",
+            "regex",
+            "str.replace_all",
+        ),
+        ("AttributeError: 'Series' object has no attribute 'apply'", "apply", "map_elements"),
+    ],
+)
+def test_sandbox_hint_names_the_bad_and_the_correct_api(error: str, bad: str, good: str) -> None:
+    hint = sandbox_hint(error)
+    assert hint is not None
+    assert bad in hint and good in hint
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "ValueError: boom (line 5)",
+        "AttributeError: 'StringNameSpace' object has no attribute 'frobnicate'",
+        "TypeError: unsupported operand type(s) for +: 'int' and 'str'",
+    ],
+)
+def test_sandbox_hint_is_none_for_errors_outside_the_renames_table(error: str) -> None:
+    assert sandbox_hint(error) is None
+
+
+def test_sandbox_feedback_puts_hint_and_last_line_before_a_long_traceback() -> None:
+    error = (
+        "Traceback (most recent call last):\n"
+        + "  frame\n" * 400
+        + ("AttributeError: 'ExprStringNameSpace' object has no attribute 'strip'. Did you")
+    )
+    feedback = sandbox_feedback(error)
+    head = feedback[:300]
+    assert "strip_chars" in head
+    assert "has no attribute 'strip'" in head
+    assert sandbox_feedback("ValueError: boom (line 5)").startswith("ValueError: boom")
+
+
+@pytest.mark.parametrize(
+    ("error", "good"),
+    [
+        ("AttributeError: 'Series' object has no attribute 'replace_all'", ".str.replace_all"),
+        ("AttributeError: 'Expr' object has no attribute 'strip_chars'", ".str.strip_chars"),
+        ("AttributeError: 'Series' object has no attribute 'mask'", "pl.when("),
+        ("AttributeError: 'Series' object has no attribute 'where'", "pl.when("),
+    ],
+)
+def test_sandbox_hint_for_string_methods_called_off_the_str_namespace(
+    error: str, good: str
+) -> None:
+    hint = sandbox_hint(error)
+    assert hint is not None and good in hint
+
+
+def test_worker_unit_finding_says_divide_unconditionally_not_by_column_name() -> None:
+    finding = "values look like paise: 100% whole numbers, median 3427380"
+    prompt = build_worker_prompt(NODE, SPEC, "amount", ["3,42,73,80"], None, finding)
+    assert "unconditionally" in prompt
+    assert "values.name" in prompt
+    assert "never branch on `values.name`" in WORKER_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------- prepare_code (dedent once)
+
+INDENTED_CODE = "".join(f"    {line}\n" if line else "\n" for line in GOOD_CODE.splitlines())
+
+
+def test_prepare_code_leaves_well_formed_code_unchanged() -> None:
+    assert prepare_code(GOOD_CODE) == (GOOD_CODE, None)
+
+
+def test_prepare_code_dedents_a_uniformly_indented_module() -> None:
+    code, reason = prepare_code(INDENTED_CODE)
+
+    assert reason is None
+    assert code.startswith("import polars as pl\n")
+    assert precheck_code(code) is None
+
+
+def test_prepare_code_dedents_code_after_leading_blank_lines() -> None:
+    code, reason = prepare_code("\n\n" + INDENTED_CODE)
+
+    assert reason is None
+    assert precheck_code(code) is None
+
+
+def test_prepare_code_unfixable_indentation_gets_a_column_zero_hint() -> None:
+    broken = "import polars as pl\n  def transform(values):\n    return values\n"
+
+    code, reason = prepare_code(broken)
+
+    assert code == broken
+    assert reason is not None
+    assert "unexpected indent" in reason
+    assert "start every top-level line at column 0" in reason
+
+
+def test_precheck_code_indentation_error_carries_the_column_zero_hint() -> None:
+    reason = precheck_code(INDENTED_CODE)
+
+    assert reason is not None
+    assert "start every top-level line at column 0" in reason
+
+
+def test_prepare_code_other_syntax_errors_get_no_indent_hint() -> None:
+    code, reason = prepare_code("def transform(values:\n")
+
+    assert reason is not None and "syntax" in reason
+    assert "column 0" not in reason
+
+
+def test_prepare_code_dedented_code_still_runs_every_other_check() -> None:
+    code, reason = prepare_code("    import os\n" + INDENTED_CODE)
+
+    assert reason is not None
+    assert "os" in reason
+
+
+def test_transform_code_schema_stores_the_dedented_code() -> None:
+    parsed = TransformCode(code=INDENTED_CODE, explanation="strips commas")
+
+    assert parsed.code == prepare_code(INDENTED_CODE)[0]

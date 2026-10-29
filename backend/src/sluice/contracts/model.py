@@ -137,3 +137,19 @@ def load_contract(name: str, version: str = "v1", contracts_dir: Path | None = N
     if (contract.name, contract.version) != (name, version):
         raise ValueError(f"contract file {path.name} declares {contract.name}.{contract.version}")
     return contract
+
+
+def known_contracts(version: str = "v1", contracts_dir: Path | None = None) -> list[Contract]:
+    """Every contract of ``version`` in ``contracts_dir`` (default ``backend/contracts``), by name.
+
+    Used to tell a file of one known table from another (Ruling H5). O(contract files).
+
+    Raises:
+        ValueError: If ``version`` is not ``[a-z0-9_]+`` or a contract file is inconsistent.
+    """
+    if not _SAFE_PART.fullmatch(version):
+        raise ValueError(f"invalid contract version: {version!r}")
+    root = contracts_dir or CONTRACTS_DIR
+    suffix = f".{version}.yaml"
+    names = sorted(p.name[: -len(suffix)] for p in root.glob(f"*{suffix}"))
+    return [load_contract(name, version, root) for name in names if _SAFE_PART.fullmatch(name)]

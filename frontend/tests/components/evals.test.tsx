@@ -100,6 +100,7 @@ function stubClient(getEvalSummary: () => Promise<EvalSummary>): ApiClient {
     streamEvents: never,
     getTransforms: never,
     getPreview: never,
+    getInput: never,
     getEvalSummary,
   };
 }

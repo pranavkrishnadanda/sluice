@@ -51,6 +51,7 @@ function liveClient(overrides: Partial<ApiClient> = {}): ApiClient {
     streamEvents: (id, on, s) => base.streamEvents(id, on, s),
     getTransforms: (id) => base.getTransforms(id),
     getPreview: (...args) => base.getPreview(...args),
+    getInput: (...args) => base.getInput(...args),
     getEvalSummary: () => base.getEvalSummary(),
     ...overrides,
   };

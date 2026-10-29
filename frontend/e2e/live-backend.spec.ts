@@ -275,7 +275,7 @@ test.describe("live backend", () => {
       ]);
       await details.getByRole("tab", { name: "Data" }).click();
       await expect(
-        details.getByText("No preview — this run didn’t load any data."),
+        details.getByRole("heading", { name: "Uploaded file (not loaded)" }),
       ).toBeVisible();
       expect((await scan(page)).blocking, "axe: run thread").toEqual([]);
     } else {
@@ -364,7 +364,7 @@ test.describe("live backend", () => {
         }
       } else {
         await expect(
-          details.getByText("No preview — this run didn’t load any data."),
+          details.getByRole("heading", { name: "Uploaded file (not loaded)" }),
         ).toBeVisible();
       }
       expect((await scan(page)).blocking, "axe: Data tab").toEqual([]);

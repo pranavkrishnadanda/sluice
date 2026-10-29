@@ -22,12 +22,17 @@ from pipeline_fakes import (
     ALL_NULL,
     CANNED,
     CRASH,
+    DIVIDE_100,
+    DIVIDE_100_LOSSY,
     DOWN,
     FILL_ZERO,
     ISO_DATES,
     NO_TRANSFORM,
     NOOP,
+    OLD_STRIP,
     STRIP_COMMAS,
+    THROTTLE_WAIT_S,
+    THROTTLED,
     TOKENS_PER_CALL,
     FakeSandbox,
     Script,
@@ -86,10 +91,16 @@ def run(
     run_id: str | None = None,
     on_emit: Callable[[EventModel], None] | None = None,
     on_transform: Callable[[dict[str, Any]], None] | None = None,
+    on_activity: Callable[[EventModel], None] | None = None,
+    sleeps: list[float] | None = None,
 ) -> Result:
+    async def sleep(seconds: float) -> None:  # rate-limit back-off without waiting
+        if sleeps is not None:
+            sleeps.append(seconds)
+
     async def go() -> Result:
         model = FunctionModel(script.respond, model_name="script-model")
-        async with LLM("http://litellm.test", "k", model_override=model) as llm:
+        async with LLM("http://litellm.test", "k", model_override=model, sleep=sleep) as llm:
             log = EventLog(on_emit=on_emit)
             deps = PipelineDeps(llm=llm, sandbox=sandbox or FakeSandbox(), clock=clock)
             case_input = CaseInput(
@@ -97,6 +108,7 @@ def run(
                 contract or load_contract(case.table),
                 reference or {},
                 on_transform=on_transform,
+                on_activity=on_activity,
             )
             out = await run_pipeline(case_input, deps, log, run_id=run_id)
             return Result(out, log, llm)
@@ -391,6 +403,20 @@ def test_pipeline_precheck_failure_feeds_its_reason_to_the_next_attempt(indian: 
     assert done.attempt == 2  # type: ignore[attr-defined]
 
 
+def test_pipeline_runs_a_uniformly_indented_transform_dedented(indian: Case) -> None:
+    sandbox = FakeSandbox()
+    indented = "".join(f"    {line}\n" if line else "\n" for line in STRIP_COMMAS.splitlines())
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [indented]})
+
+    result = run(indian, script, sandbox=sandbox)
+
+    assert sandbox.calls == [STRIP_COMMAS]  # the dedented module ran; no attempt was spent
+    assert result.events("attempt_failed") == []
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    assert result.out.meta["transforms"][0]["code"] == STRIP_COMMAS
+
+
 def test_pipeline_schema_invalid_worker_output_is_a_failed_attempt(indian: Case) -> None:
     sandbox = FakeSandbox()
     # Attempt 1: empty code fails the schema twice (client repair retry) -> LLMOutputError.
@@ -409,7 +435,7 @@ def test_pipeline_explicit_precheck_rejection_skips_sandbox(
     indian: Case, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     answers = iter(["code is not allowed", None])
-    monkeypatch.setattr(pipeline, "precheck_code", lambda code: next(answers))
+    monkeypatch.setattr(pipeline, "prepare_code", lambda code: (code, next(answers)))
     sandbox = FakeSandbox()
     script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
     result = run(indian, script, sandbox=sandbox)
@@ -1102,3 +1128,366 @@ def test_pipeline_on_transform_not_called_for_an_attempt_without_code(indian: Ca
     hooked = [p["attempt"] for kind, p in trail if kind == "transform"]
     assert hooked == [2]
     assert [e.attempt for e in result.events("attempt_failed")] == [1]  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- H1: verifier stats
+
+
+DUPES = ("duplicate_rows", {"frac": 0.25})
+
+
+def verifier_stats(script: Script, call: int = 0) -> dict[str, Any]:
+    prompt = script.roles("verifier")[call]
+    return json.loads(prompt.rsplit("Statistics: ", 1)[1])
+
+
+def test_pipeline_verifier_stats_never_mix_raw_and_deduplicated_row_counts(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _build(cases_dir, orders_df, "dev-0101", [INDIAN, DUPES])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    result = run(case, script)
+
+    stats = verifier_stats(script)
+    assert "rows" not in stats  # the old ambiguous key mixed bases
+    assert stats["rows_raw"] == 50  # 40 rows + 10 duplicate copies
+    assert stats["rows_after_dedupe"] == 40
+    assert stats["non_null_after"] + stats["null_after"] == stats["rows_after_dedupe"]
+    assert stats["non_null_after"] == 40
+    assert stats["flagged_raw_after"] == 0
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    assert price_flags(result.out) == 0
+
+
+# --------------------------------------------------------------------------- H2: unit drift
+
+
+PAISE = ("unit_paise", {"column": "o_totalprice", "hinted": False})
+
+
+def _paise_case(cases_dir: Path, orders_df: pl.DataFrame, case_id: str, ops: list[Any]) -> Case:
+    return _build(cases_dir, orders_df, case_id, ops, n=80)
+
+
+def test_pipeline_profiled_reports_the_unit_issue(cases_dir: Path, orders_df: pl.DataFrame) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0201", [PAISE, INDIAN])
+    script = Script()
+    result = run(case, script)
+    (profiled,) = result.events("profiled")
+    units = [i for i in profiled.issues if i.kind == "unit"]  # type: ignore[attr-defined]
+    assert [i.column for i in units] == ["o_totalprice"]
+    assert units[0].detail.startswith("values look like paise: 100% whole numbers")
+    (plan_prompt,) = script.roles("orchestrator")
+    assert json.dumps(units[0].detail) in plan_prompt
+
+
+def _lineitem_paise_case(cases_dir: Path, lineitem_df: pl.DataFrame, case_id: str) -> Case:
+    """Unhinted paise rendered with a ``.00`` suffix: the rules parse every value (no flags)."""
+    ops: list[Any] = [("unit_paise", {"column": "l_extendedprice", "hinted": False})]
+    recipe = Recipe("lineitem", "medium", ops, "csv", "utf-8", 80)
+    case = build_case(case_id, "dev", recipe, {"lineitem": lineitem_df}, 7, cases_dir)
+    raw = pl.read_csv(case.input_path, infer_schema=False)
+    raw = raw.with_columns(pl.col("l_extendedprice") + ".00")
+    raw.write_csv(case.input_path)
+    return case
+
+
+LINE_PLAN = {"nodes": [node("n1", "l_extendedprice")]}
+
+
+def test_pipeline_repairs_paise_the_rules_parse_in_every_row(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0202")
+    rules_out = rules_only(case)
+    assert not any(col == "l_extendedprice" for _, col in rules_out.flags)  # parsed, 100x off
+
+    script = Script(plan=LINE_PLAN, workers={"l_extendedprice": [DIVIDE_100]})
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    assert "values look like paise" in script.roles("worker")[0]  # the finding reaches the worker
+    agent_grade = grade(case, result.out, {})
+    assert agent_grade.cell_accuracy == 1.0
+    assert agent_grade.fabrication_rate in (None, 0.0)
+    assert grade(case, rules_out, {}).cell_accuracy < 1.0  # type: ignore[operator]
+
+
+def test_pipeline_repairs_indian_grouped_paise_to_rupees(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0203", [PAISE, INDIAN, DESTROY])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100]})
+    result = run(case, script)
+
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    agent_grade = grade(case, result.out, {})
+    assert agent_grade.cell_accuracy == 1.0
+    assert agent_grade.fabrication_rate in (None, 0.0)
+
+
+def test_pipeline_rejects_a_paise_rewrite_that_only_strips_commas(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0204", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS, DIVIDE_100]})
+    result = run(case, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert "median" in failed.error and "factor" in failed.error  # type: ignore[attr-defined]
+    assert len(script.roles("verifier")) == 1  # the code rejected attempt 1 before the verifier
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]
+    assert grade(case, result.out, {}).cell_accuracy == 1.0
+
+
+def test_pipeline_rejects_a_paise_rewrite_that_drops_values(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0205", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100_LOSSY, DIVIDE_100]})
+    result = run(case, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert "lost" in failed.error  # type: ignore[attr-defined]
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]
+
+
+def test_pipeline_paise_rewrite_still_meets_the_fabrication_guard(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0206", [PAISE, INDIAN, DESTROY])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [FILL_ZERO, DIVIDE_100]})
+    result = run(case, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert "fabrication" in failed.error  # type: ignore[attr-defined]
+    assert grade(case, result.out, {}).fabrication_rate in (None, 0.0)
+
+
+def test_pipeline_verifier_sees_magnitude_stats_and_unit_for_a_money_column(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0207", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100]})
+    run(case, script)
+
+    stats = verifier_stats(script)
+    assert stats["unit"] == "INR"
+    assert stats["whole_share_before"] == 1.0
+    assert stats["whole_share_after"] < 0.5
+    assert stats["median_before"] / stats["median_after"] == pytest.approx(100, rel=0.01)
+    for key in ("p5_before", "p95_before", "p5_after", "p95_after"):
+        assert isinstance(stats[key], float)
+
+
+def test_pipeline_verifier_gets_no_magnitude_stats_for_a_date_column(two_columns: Case) -> None:
+    plan = {"nodes": [node("n2", "o_orderdate")]}
+    script = Script(plan=plan, workers={"o_orderdate": [ISO_DATES]})
+    run(two_columns, script)
+    assert "median_before" not in verifier_stats(script)
+
+
+# --------------------------------------------------------------------------- H3: API hints
+
+
+def test_pipeline_feeds_a_polars_rename_hint_first_after_a_sandbox_attribute_error(
+    indian: Case,
+) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [OLD_STRIP, STRIP_COMMAS]})
+    result = run(indian, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert failed.error.startswith("sandbox: ")  # type: ignore[attr-defined]
+    prompt = script.roles("worker")[1]
+    previous = prompt.split("Previous attempt error: ", 1)[1][:400]
+    assert "strip_chars" in previous and "has no attribute 'strip'" in previous
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- H4: tier floor
+
+
+def test_pipeline_routes_an_easy_rated_unit_node_to_the_strong_tier(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0208", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100]})  # rated easy
+    result = run(case, script)
+
+    (plan_created,) = result.events("plan_created")
+    assert plan_created.nodes[0].tier == "strong"  # type: ignore[attr-defined]
+    assert [r.tier for r in result.llm.records if r.role == "worker"] == ["strong"]
+    assert result.out.meta["nodes"][0]["difficulty"] == "hard"
+
+
+# --------------------------------------------------------------------------- H5: wrong table
+
+
+def test_pipeline_quarantines_an_orders_file_sent_to_lineitem_without_a_model_call(
+    medium: Case,
+) -> None:
+    script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN)
+    result = run(medium, script, contract=load_contract("lineitem"))
+
+    assert script.calls == []  # no LLM call at all
+    types = [e.type for e in result.log.events]  # type: ignore[attr-defined]
+    assert types == ["run_started", "profiled", "rules_applied", "run_finished"]
+    (finished,) = result.events("run_finished")
+    assert finished.status == "quarantined"  # type: ignore[attr-defined]
+    summary = "this looks like an orders file, not lineitem; nothing loaded"
+    assert finished.summary == summary  # type: ignore[attr-defined]
+    assert result.out.file_quarantined
+    assert result.out.df.is_empty()
+    assert result.out.meta["file_quarantine_reason"] == summary
+
+
+def test_pipeline_quarantines_a_lineitem_file_sent_to_orders(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    recipe = Recipe("lineitem", "easy", [], "csv", "utf-8", 40)
+    case = build_case("dev-0301", "dev", recipe, {"lineitem": lineitem_df}, 7, cases_dir)
+    script = Script()
+    result = run(case, script, contract=load_contract("orders"))
+
+    assert script.calls == []
+    (finished,) = result.events("run_finished")
+    assert finished.summary == "this looks like a lineitem file, not orders; nothing loaded"  # type: ignore[attr-defined]
+    assert result.out.file_quarantined
+
+
+def test_pipeline_does_not_flag_a_renamed_file_of_the_right_table(medium: Case) -> None:
+    script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    result = run(medium, script)
+    assert not result.out.file_quarantined
+    assert script.roles("mapper")
+
+
+def test_pipeline_paise_factor_error_tells_the_worker_to_divide_unconditionally(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0209", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS, DIVIDE_100]})
+    result = run(case, script)
+    (failed,) = result.events("attempt_failed")
+    assert "unconditionally" in failed.error  # type: ignore[attr-defined]
+
+
+# --- round 2: node_started.tier ---------------------------------------------------------------
+
+
+def test_pipeline_node_started_carries_the_attempts_tier(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+
+    result = run(indian, script)
+
+    tiers = [(e.attempt, e.tier) for e in result.events("node_started")]  # type: ignore[attr-defined]
+    assert tiers == [(1, "small"), (2, "strong")]  # an easy node escalates on its retry
+
+
+# --- round 2: activity ----------------------------------------------------------------------
+
+
+def _activity(event: EventModel) -> tuple[Any, ...]:
+    a: Any = event
+    return (a.phase, a.node_id, a.tier, a.attempt, a.retry_in_s)
+
+
+def test_pipeline_announces_each_phase_once_when_it_starts(indian: Case) -> None:
+    seen: list[EventModel] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    run(indian, script, on_activity=seen.append)
+
+    assert [_activity(e) for e in seen] == [
+        ("mapping", None, None, None, None),
+        ("planning", None, "strong", None, None),
+        ("writing", "n1", "small", 1, None),
+        ("sandbox", "n1", "small", 1, None),
+        ("checking", "n1", "small", 1, None),
+        ("verifying", "n1", "small", 1, None),
+    ]
+    assert all(e.type == "activity" for e in seen)  # type: ignore[attr-defined]
+
+
+def test_pipeline_activity_interleaves_with_the_milestone_events(indian: Case) -> None:
+    both: list[str] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+
+    def note(event: EventModel) -> None:
+        a: Any = event
+        both.append(a.type if a.type != "activity" else f"activity:{a.phase}")
+
+    run(indian, script, on_emit=note, on_activity=note)
+
+    assert both == [
+        "run_started",
+        "activity:mapping",
+        "profiled",
+        "rules_applied",
+        "activity:planning",
+        "plan_created",
+        "node_started",
+        "activity:writing",
+        "activity:sandbox",
+        "attempt_failed",
+        "node_started",
+        "activity:writing",
+        "activity:sandbox",
+        "activity:checking",
+        "activity:verifying",
+        "node_finished",
+        "verified",
+        "run_finished",
+    ]
+
+
+def test_pipeline_activity_copy_names_the_tier_column_and_rows(indian: Case) -> None:
+    seen: list[EventModel] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    result = run(indian, script, on_activity=seen.append)
+
+    messages = {e.phase: e.message for e in seen}  # type: ignore[attr-defined]
+    rows = result.events("run_started")[0].rows  # type: ignore[attr-defined]
+    assert messages["writing"] == "Asking the small model to write a fix for o_totalprice"
+    assert messages["sandbox"] == f"Running the fix in the sandbox on {rows:,} rows"
+    assert messages["checking"] == "Checking the rewrite against the rules"
+    assert messages["verifying"] == "The verifier is checking the result"
+    assert messages["planning"] == "Asking the strong model to plan repairs for 1 column"
+
+
+def test_pipeline_rate_limit_wait_is_announced_then_the_phase_resumes(indian: Case) -> None:
+    seen: list[EventModel] = []
+    sleeps: list[float] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [THROTTLED, STRIP_COMMAS]})
+
+    result = run(indian, script, on_activity=seen.append, sleeps=sleeps)
+
+    phases = [_activity(e) for e in seen if e.node_id == "n1"]  # type: ignore[attr-defined]
+    assert phases[:3] == [
+        ("writing", "n1", "small", 1, None),
+        ("waiting", "n1", "small", 1, THROTTLE_WAIT_S),
+        ("writing", "n1", "small", 1, None),
+    ]
+    (waiting,) = [e for e in seen if e.phase == "waiting"]  # type: ignore[attr-defined]
+    assert waiting.message == (  # type: ignore[attr-defined]
+        f"Rate limit reached on the small model — retrying in {THROTTLE_WAIT_S} s"
+    )
+    assert sleeps == [float(THROTTLE_WAIT_S)]
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]  # a wait is not a failed attempt
+
+
+def test_pipeline_without_an_activity_sink_is_unchanged(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    result = run(indian, script)
+
+    assert "activity" not in [e.type for e in result.log.events]  # type: ignore[attr-defined]
+    assert "activity" not in [e["type"] for e in result.out.meta["events"]]

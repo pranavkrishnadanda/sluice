@@ -71,31 +71,32 @@ schema in the prompt (``prompted``), or Pydantic AI's required output tool (``to
 
 DEFAULT_OUTPUT_MODE: Final[OutputMode] = "native"
 
-REQUEST_TIMEOUT_S: Final = 120.0
+REQUEST_TIMEOUT_S: Final = 180.0
 """Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
 
 Nested between the proxy's timeout-only worst case and the per-file wall cap, so a hung
 deployment still reaches its last fallback and one hung call cannot by itself exceed a file's
-wall time. From ``backend/litellm/config.yaml`` (per-attempt timeout 30 s on every deployment; a
-timeout is not retried, it goes to the next group of the chain), the path where every attempt
-*times out* is:
+wall time. From ``backend/litellm/config.yaml`` (per-attempt timeout 60 s on the strong chain's
+own deployments, 30 s on the small ones; a timeout is not retried, it goes to the next group of
+the chain), the path where every attempt *times out* is:
 
-* strong: gpt-oss-120b 30 + Gemini 30 + qwen 30 = 90 s
+* strong: gpt-oss-120b 60 + Gemini 60 + qwen 30 = 150 s
 * small:  gpt-oss-20b 30 + qwen 30 = 60 s
 
-so 90 s < 120 s (this) < 180 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
+so 150 s < 180 s (this) < 300 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
 overhead and *fast-failing* 429/5xx retries. ``tests/llm/test_litellm_config.py`` asserts the
 nesting from the config itself.
 
 This does not bound *slow* errors: LiteLLM retries a 429/500/503 twice on the same group, so a
-group can take up to 3 attempts x 30 s (`SLOW_ERROR_WORST_CASE_S`). Such a call hits this
+group can take up to 3 attempts x its timeout (`SLOW_ERROR_WORST_CASE_S`). Such a call hits this
 timeout first and surfaces as `LLMUnavailable`: the file degrades to rules-only output for that
 step, never to wrong output. The numbers are left as they are, since a client timeout above the
 slow-error bound would exceed the per-file wall cap."""
 
-SLOW_ERROR_WORST_CASE_S: Final[dict[str, float]] = {"strong": 270.0, "small": 180.0}
+SLOW_ERROR_WORST_CASE_S: Final[dict[str, float]] = {"strong": 450.0, "small": 180.0}
 """Proxy time if every attempt of every group in the chain fails slowly with a retried error:
-attempts per group (1 + 2 retries) x groups x 30 s. strong = 3 x 3 x 30, small = 3 x 2 x 30.
+attempts per group (1 + 2 retries) x each group's timeout. strong = 3 x (60 + 60 + 30),
+small = 3 x (30 + 30).
 Above `REQUEST_TIMEOUT_S` on purpose (see there); the config test recomputes it from the YAML."""
 
 CONNECT_TIMEOUT_S: Final = 5.0
@@ -200,6 +201,25 @@ class LLMUnavailable(LLMError):
         super().__init__(message)
         self.status_code = status_code
 
+
+@dataclass(frozen=True, slots=True)
+class Backoff:
+    """A rate-limit wait of one `LLM.run` call, as told to an `LLM.on_backoff` hook.
+
+    The hook hears each wait twice: ``done=False`` just before the client sleeps ``wait_s``
+    seconds, ``done=True`` once it has. Only the role, tier and wait: no provider text.
+    """
+
+    role: str
+    tier: Tier
+    wait_s: float
+    done: bool
+
+
+BackoffHook = Callable[[Backoff], None]
+
+_backoff_hook: ContextVar[BackoffHook | None] = ContextVar("sluice_llm_backoff", default=None)
+"""Told about every rate-limit wait of the `run` calls in its `LLM.on_backoff` block."""
 
 _deadline: ContextVar[float | None] = ContextVar("sluice_llm_deadline", default=None)
 """Absolute time (the client's clock) by which rate-limit back-off must end; see `wall_budget`.
@@ -320,6 +340,20 @@ class LLM:
         finally:
             _deadline.reset(token)
 
+    @contextlib.contextmanager
+    def on_backoff(self, hook: BackoffHook) -> Iterator[None]:
+        """Call ``hook`` around every rate-limit wait of the `run` calls inside this block.
+
+        Context-local like `wall_budget`: asyncio tasks started inside the block inherit it, and
+        an inner block replaces it until it ends. The hook runs on the event loop, synchronously;
+        its exceptions propagate out of `run`.
+        """
+        token = _backoff_hook.set(hook)
+        try:
+            yield
+        finally:
+            _backoff_hook.reset(token)
+
     async def run[T](
         self, role: str, tier: Tier, system: str, prompt: str, output_type: type[T]
     ) -> tuple[T, CallRecord]:
@@ -392,7 +426,12 @@ class LLM:
                     wait = _backoff_s(throttled, attempt.retry_after)
                     if self._clock() + wait <= deadline:
                         throttled += 1
+                        hook = _backoff_hook.get()
+                        if hook is not None:
+                            hook(Backoff(role=role, tier=tier, wait_s=wait, done=False))
                         await self._sleep(wait)
+                        if hook is not None:
+                            hook(Backoff(role=role, tier=tier, wait_s=wait, done=True))
                         continue
                 if attempt.kind == "invalid":
                     raise LLMOutputError(

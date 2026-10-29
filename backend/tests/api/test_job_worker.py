@@ -641,6 +641,50 @@ def test_worker_loaded_run_stores_a_preview_and_its_key(
     assert {"pk", "quarantined", "reason", "cells"} <= set(preview.columns)
 
 
+def _forwarding_execute(run_fn: Any, loads: _Loads) -> ExecuteFn:
+    """Like `_real_execute`, but passes the worker's activity flag and on_loaded hook on."""
+
+    def execute(path: Path, table: str, *, run_id: str, emit: Any, **kw: Any) -> RunOutcome:
+        return execute_run(
+            path,
+            table,
+            run_id=run_id,
+            emit=emit,
+            on_transform=kw.get("on_transform"),
+            activity=kw["activity"],
+            on_loaded=kw["on_loaded"],
+            run_fn=run_fn,
+            load_fn=loads,
+            loaded_fn=lambda *_a, **_k: None,
+            settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+            reference_fn=lambda _t: {},
+        )
+
+    return execute
+
+
+def test_worker_builds_the_preview_before_run_finished_and_announces_it(
+    blobs: LocalBlobStore, orders_df: pl.DataFrame, tmp_path: Path
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    csv = tmp_path / "orders.csv"
+    orders_df.head(20).write_csv(csv)
+    _upload(blobs, "r1", csv.read_bytes())
+    execute = _forwarding_execute(RulesOnlySystem().run, _Loads())
+
+    _run(lambda: _drive(store, blobs, execute, "r1"))
+
+    events = store.events["r1"]
+    phases = [getattr(e, "phase", None) for e in events]
+    assert store.types("r1")[-4:] == ["activity", "loaded", "activity", "run_finished"]
+    assert phases[-4] == "loading" and phases[-2] == "previewing"
+    assert events[-2].node_id is None  # type: ignore[attr-defined]
+    assert [e.seq for e in events] == list(range(1, len(events) + 1))
+    assert store.artefacts["r1"].preview_key == "runs/r1/preview.parquet"
+    assert pl.read_parquet(blobs.get_bytes("runs/r1/preview.parquet")).height == 20
+
+
 def test_worker_run_without_loaded_has_no_preview(blobs: LocalBlobStore) -> None:
     store = FakeStore()
     store.add("r1")

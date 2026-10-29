@@ -50,6 +50,10 @@ class CaseInput:
             final, **before** that attempt's ``node_finished``/``attempt_failed`` event, by a
             system that has transforms (the agent pipeline). The API worker persists them so a
             ``node_finished.transformId`` is resolvable as soon as it is delivered.
+        on_activity: Live sink for ``activity`` events (what the run is busy with now), called
+            when each phase starts by a system that has phases (the agent pipeline). They are
+            live-only status: never in ``meta["events"]`` and unnumbered (the caller stamps
+            them into its own log). ``None`` (evals, ``sluice run``): none are built.
     """
 
     path: Path
@@ -58,6 +62,7 @@ class CaseInput:
     run_id: str | None = None
     on_event: Callable[[EventModel], None] | None = None
     on_transform: Callable[[dict[str, Any]], None] | None = None
+    on_activity: Callable[[EventModel], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)

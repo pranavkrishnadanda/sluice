@@ -31,6 +31,7 @@ from sluice.api.routes_runs import (
     MAX_FIELD_BYTES,
     MAX_PART_HEADER_BYTES,
     PREVIEW_SAVE_GRACE_S,
+    TABLE_UNKNOWN_DETAIL,
     TOO_LARGE_DETAIL,
     sanitise_file_name,
     too_large_detail,
@@ -231,13 +232,49 @@ def test_post_runs_unknown_table_is_422_unknown_table(
     _assert_nothing_kept(store, blobs)
 
 
-def test_post_runs_missing_table_is_422_invalid_request(
+def test_post_runs_missing_table_means_auto_and_a_weak_match_is_422_table_unknown(
     client: TestClient, store: RouteStore, blobs: LocalBlobStore
 ) -> None:
-    res = _post(client, table=None)
+    res = _post(client, table=None)  # CSV has 2 of 10 orders columns: not clearly any table
     assert res.status_code == 422
-    assert res.json()["code"] == "invalid_request"
+    assert res.json() == {"detail": TABLE_UNKNOWN_DETAIL, "code": "table_unknown"}
     _assert_nothing_kept(store, blobs)
+
+
+def _table_csv(table: str) -> bytes:
+    names = [c.name for c in load_contract(table).columns]
+    return (",".join(names) + "\n" + ",".join("1" for _ in names) + "\n").encode()
+
+
+@pytest.mark.parametrize("table", ["orders", "lineitem"])
+@pytest.mark.parametrize("field", ["auto", None])
+def test_post_runs_auto_table_resolves_from_the_columns(
+    client: TestClient, store: RouteStore, table: str, field: str | None
+) -> None:
+    res = _post(client, name="upload.csv", data=_table_csv(table), table=field)
+    assert res.status_code == 201
+    assert res.json()["table"] == table
+    assert store.runs[res.json()["id"]].table == table
+
+
+def test_post_runs_auto_table_close_call_is_422_table_unknown(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore
+) -> None:
+    orders, lineitem = (_table_csv(t).decode().splitlines() for t in ("orders", "lineitem"))
+    both = f"{orders[0]},{lineitem[0]}\n{orders[1]},{lineitem[1]}\n".encode()
+    res = _post(client, data=both, table="auto")
+    assert res.status_code == 422
+    assert res.json()["code"] == "table_unknown"
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_named_table_is_kept_even_when_the_file_looks_like_another(
+    client: TestClient, store: RouteStore
+) -> None:
+    # The user insisted: the run is created, and the pipeline quarantines it (Ruling H5).
+    res = _post(client, data=_table_csv("lineitem"), table="orders")
+    assert res.status_code == 201
+    assert res.json()["table"] == "orders"
 
 
 def test_post_runs_missing_file_is_422_invalid_request(
@@ -934,3 +971,92 @@ def test_get_preview_bad_paging_is_422(
     res = client.get("/runs/r1/preview", params=query)
     assert res.status_code == 422
     assert res.json()["code"] == "invalid_request"
+
+
+# --------------------------------------------------------------------------------------------
+# GET /runs/{id}/input (round 2): the uploaded file's raw rows, from creation
+# --------------------------------------------------------------------------------------------
+
+INPUT_KEYS = {"columns", "rows", "totalRows", "nextOffset"}
+
+
+def test_get_input_unknown_run_is_404(client: TestClient) -> None:
+    res = client.get("/runs/nope/input")
+    assert res.status_code == 404
+    assert res.json()["code"] == "not_found"
+
+
+def test_get_input_of_a_queued_run_returns_the_raw_csv_rows_as_text(client: TestClient) -> None:
+    run_id = _post(client).json()["id"]
+
+    res = client.get(f"/runs/{run_id}/input")
+
+    assert res.status_code == 200
+    assert res.json() == {
+        "columns": ["o_orderkey", "o_custkey"],
+        "rows": [["1", "10"], ["2", "20"]],
+        "totalRows": 2,
+        "nextOffset": None,
+    }
+
+
+def test_get_input_pages_with_offset_and_limit(client: TestClient) -> None:
+    data = b"a,b\n" + b"".join(f"{i},x{i}\n".encode() for i in range(5))
+    run_id = _post(client, data=data).json()["id"]
+
+    first = client.get(f"/runs/{run_id}/input", params={"offset": 0, "limit": 2}).json()
+    last = client.get(f"/runs/{run_id}/input", params={"offset": 4, "limit": 2}).json()
+    past = client.get(f"/runs/{run_id}/input", params={"offset": 9, "limit": 2}).json()
+
+    assert set(first) == INPUT_KEYS
+    assert first["rows"] == [["0", "x0"], ["1", "x1"]]
+    assert first["nextOffset"] == 2 and first["totalRows"] == 5
+    assert last["rows"] == [["4", "x4"]] and last["nextOffset"] is None
+    assert past["rows"] == [] and past["nextOffset"] is None
+
+
+def test_get_input_empty_cells_are_null(client: TestClient) -> None:
+    run_id = _post(client, data=b"a,b\n1,\n,2\n").json()["id"]
+    assert client.get(f"/runs/{run_id}/input").json()["rows"] == [["1", None], [None, "2"]]
+
+
+def test_get_input_limit_is_capped_at_the_preview_maximum(client: TestClient) -> None:
+    from sluice.runs.preview import PREVIEW_MAX_LIMIT
+
+    rows = PREVIEW_MAX_LIMIT + 5
+    data = b"a\n" + b"".join(f"{i}\n".encode() for i in range(rows))
+    run_id = _post(client, data=data).json()["id"]
+
+    page = client.get(f"/runs/{run_id}/input", params={"limit": 5_000}).json()
+
+    assert len(page["rows"]) == PREVIEW_MAX_LIMIT
+    assert page["nextOffset"] == PREVIEW_MAX_LIMIT and page["totalRows"] == rows
+
+
+@pytest.mark.parametrize("params", [{"offset": -1}, {"limit": 0}, {"offset": "x"}])
+def test_get_input_bad_paging_is_422(client: TestClient, params: dict[str, Any]) -> None:
+    run_id = _post(client).json()["id"]
+    assert client.get(f"/runs/{run_id}/input", params=params).status_code == 422
+
+
+def test_get_input_parquet_values_are_rendered_as_text(client: TestClient) -> None:
+    buffer = io.BytesIO()
+    frame = pl.DataFrame({"k": [1, 2, 3], "price": [1.5, None, 3.25], "flag": [True, False, None]})
+    frame.write_parquet(buffer)
+    run_id = _post(client, name="o.parquet", data=buffer.getvalue(), table="orders").json()["id"]
+
+    page = client.get(f"/runs/{run_id}/input", params={"offset": 1, "limit": 2}).json()
+
+    assert page["columns"] == ["k", "price", "flag"]
+    assert page["rows"] == [["2", None, "false"], ["3", "3.25", None]]
+    assert page["totalRows"] == 3 and page["nextOffset"] is None
+
+
+def test_get_input_json_nested_fields_are_flattened(client: TestClient) -> None:
+    data = b'[{"o_orderkey": 1, "who": {"name": "a"}}]'
+    run_id = _post(client, name="o.json", data=data, table="orders").json()["id"]
+
+    page = client.get(f"/runs/{run_id}/input").json()
+
+    assert page["columns"] == ["o_orderkey", "who.name"]
+    assert page["rows"] == [["1", "a"]]

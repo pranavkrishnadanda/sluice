@@ -11,6 +11,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import polars as pl
@@ -51,8 +52,19 @@ NOOP = _module("    return values")
 ISO_DATES = _module(
     "    return values.str.to_date('%d %b %Y', strict=False).dt.strftime('%Y-%m-%d')"
 )
+DIVIDE_100 = _module("    return values  # canned: paise -> rupees (see _paise_to_rupees)")
+DIVIDE_100_LOSSY = _module("    return values  # canned: paise -> rupees, every 2nd value dropped")
+OLD_STRIP = _module("    return values.str.strip()  # Polars 0.x name: fails in 2.1")
+OLD_STRIP_ERROR = (
+    "Traceback (most recent call last):\n"
+    + '  File "/usr/local/lib/python3.14/site-packages/polars/series/utils.py", line 95\n' * 40
+    + "AttributeError: 'ExprStringNameSpace' object has no attribute 'strip'. Did you mean: "
+    "'strip_chars'?"
+)
 NO_TRANSFORM = "import polars as pl\n\nx = 1\n"  # fails precheck: no `def transform`
 DOWN = "<provider outage>"  # a worker queue entry that makes that call fail with HTTP 503
+THROTTLED = "<rate limited>"  # a worker queue entry answered with HTTP 429, Retry-After 14 s
+THROTTLE_WAIT_S = 14
 
 _ROLE_BY_PROMPT = {
     MAPPER_PROMPT: "mapper",
@@ -73,9 +85,26 @@ def _strip_commas(values: pl.Series) -> pl.Series:
     return pl.select(pl.when(gone).then(None).otherwise(stripped)).to_series()
 
 
+def _paise_to_rupees(values: pl.Series, *, lossy: bool = False) -> pl.Series:
+    out: list[str | None] = []
+    for i, value in enumerate(values.to_list()):
+        text = None if value is None else value.strip().replace(",", "")
+        if text is None or text in {"N/A", "", "-1", "###"} or (lossy and i % 2):
+            out.append(None)
+            continue
+        try:
+            out.append(format((Decimal(text) / 100).quantize(Decimal("0.01")), "f"))
+        except InvalidOperation:
+            out.append(None)
+    return pl.Series(values.name, out, dtype=pl.String)
+
+
 CANNED: dict[str, Callable[[pl.Series], SandboxResult]] = {
+    DIVIDE_100: lambda v: SandboxResult(True, _paise_to_rupees(v), None, 3),
+    DIVIDE_100_LOSSY: lambda v: SandboxResult(True, _paise_to_rupees(v, lossy=True), None, 3),
     STRIP_COMMAS: lambda v: SandboxResult(True, _strip_commas(v), None, 3),
     CRASH: lambda v: SandboxResult(False, None, "ValueError: boom (line 5)", 3),
+    OLD_STRIP: lambda v: SandboxResult(False, None, OLD_STRIP_ERROR, 3),
     FILL_ZERO: lambda v: SandboxResult(True, pl.Series(["0.00"] * v.len()), None, 3),
     ALL_NULL: lambda v: SandboxResult(True, pl.Series([None] * v.len()), None, 3),
     NOOP: lambda v: SandboxResult(True, v, None, 3),
@@ -141,6 +170,9 @@ class Script:
             code = queue.pop(0) if len(queue) > 1 else queue[0]
             if code == DOWN:
                 raise ModelHTTPError(503, "script")
+            if code == THROTTLED:
+                headers = {"retry-after": str(THROTTLE_WAIT_S)}
+                raise ModelHTTPError(429, "script", headers=headers)
             out = {"code": code, "explanation": "fix"}
         else:
             accept = self.verdicts.pop(0) if self.verdicts else True

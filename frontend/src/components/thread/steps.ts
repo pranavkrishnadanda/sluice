@@ -1,5 +1,10 @@
 import { formatCount, formatMs, formatUsd } from "@/lib/format";
-import type { NodeViewState, RunViewState } from "@/lib/run-state";
+import {
+  type ActivityView,
+  latestActivity,
+  type NodeViewState,
+  type RunViewState,
+} from "@/lib/run-state";
 
 /**
  * How a step row reads. `active` is the in-flight step (pulsing dot);
@@ -23,6 +28,8 @@ export interface Step {
   note?: string;
   /** Right-aligned chip: model tier or "rules · $0". */
   chip?: string;
+  /** What this in-flight step is doing right now (live runs only). */
+  activity?: ActivityView;
 }
 
 /** Screen-reader status prefix for each row (status is never icon-only). */
@@ -47,17 +54,25 @@ function nodeStep(node: NodeViewState): Step {
     case "pending":
       return { ...base, status: "pending" };
     case "running":
-      return {
-        ...base,
-        status: "active",
-        meta: `Writing a transform… · attempt ${node.attempt}${of}`,
-      };
+      return node.activity
+        ? {
+            ...base,
+            status: "active",
+            meta: `attempt ${node.attempt}${of}`,
+            activity: node.activity,
+          }
+        : {
+            ...base,
+            status: "active",
+            meta: `Writing a transform… · attempt ${node.attempt}${of}`,
+          };
     case "retrying":
       return {
         ...base,
         status: "retrying",
         meta: `attempt ${node.attempt}${of}`,
         note: node.lastError ?? undefined,
+        activity: node.activity ?? undefined,
       };
     case "failed":
       return {
@@ -90,6 +105,33 @@ function nodeStep(node: NodeViewState): Step {
  * progress between events. Pure: derived from {@link RunViewState} only.
  */
 export function buildSteps(state: RunViewState, live: boolean): Step[] {
+  const steps = collectSteps(state, live);
+  if (!live || state.finished) {
+    // A stopped stream: nothing is being performed that we can vouch for.
+    return steps.map((s) => (s.activity ? { ...s, activity: undefined } : s));
+  }
+  if (state.activity && steps.length > 0) {
+    // Run-wide work rides on the in-flight milestone (e.g. "Planning
+    // repairs…"), else on the last in-flight step without its own line.
+    const host =
+      steps.findLast(
+        (s) => s.status === "active" && !s.id.startsWith("node-"),
+      ) ?? steps.findLast((s) => s.status === "active" && !s.activity);
+    if (host) host.activity = state.activity;
+    // Work after the last milestone (e.g. building the preview).
+    else {
+      steps.push({
+        id: "finishing",
+        status: "active",
+        label: "Finishing up…",
+        activity: state.activity,
+      });
+    }
+  }
+  return steps;
+}
+
+function collectSteps(state: RunViewState, live: boolean): Step[] {
   if (!state.runId) return [];
   const steps: Step[] = [];
   const next = (step: Omit<Step, "status">) => {
@@ -187,9 +229,14 @@ export function announceLatest(state: RunViewState, steps: Step[]): string {
   const latest = steps.findLast(
     (s) => s.status !== "active" && s.status !== "pending",
   );
-  if (!latest) return state.runId ? "Run started." : "";
+  // The current phase, by its message only: the ticking clock is never
+  // announced, so the region changes once per phase, not every second.
+  const shown = steps.some((s) => s.activity);
+  const activity = shown ? latestActivity(state) : null;
+  const now = activity ? ` Now: ${activity.message.replace(/\.$/, "")}.` : "";
+  if (!latest) return state.runId ? `Run started.${now}` : "";
   const parts = [latest.label, latest.detail, latest.meta, latest.note].filter(
     Boolean,
   );
-  return `${STEP_STATUS_TEXT[latest.status]}: ${parts.join(", ")}.`;
+  return `${STEP_STATUS_TEXT[latest.status]}: ${parts.join(", ")}.${now}`;
 }

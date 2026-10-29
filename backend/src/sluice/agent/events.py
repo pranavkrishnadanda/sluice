@@ -11,7 +11,7 @@ Build an event without ``seq``/``at`` and hand it to :meth:`EventLog.emit`, whic
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -26,6 +26,15 @@ IssueKind = Literal[
     "whitespace", "case", "destroyed", "duplicates", "foreign_key",
     "missing_column", "extra_column",
 ]  # fmt: skip
+
+ActivityPhase = Literal[
+    "mapping", "planning", "writing", "sandbox", "checking", "verifying", "waiting", "loading",
+    "previewing",
+]  # fmt: skip
+"""What a run is busy with right now (``activity.phase``)."""
+
+ACTIVITY_MESSAGE_MAX_CHARS: Final = 200
+"""Longest ``activity.message``: one short line of user-facing copy."""
 
 OpaqueId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
 """Run, node, transform and snapshot ids: opaque, ``[A-Za-z0-9_-]{1,64}``."""
@@ -119,6 +128,9 @@ class NodeStarted(_Attempted):
     node_id: OpaqueId
     attempt: Attempt
     max_attempts: Attempt
+    tier: ModelTier | None = None
+    """The tier this attempt uses (a retry may escalate); ``None`` only on events stored before
+    the field existed."""
 
 
 class AttemptFailed(_Attempted):
@@ -179,9 +191,27 @@ class RunFinished(EventModel):
     """Run total, failed attempts included."""
 
 
+class Activity(EventModel):
+    """What the run is doing now, emitted when a phase **starts** (never as a heartbeat).
+
+    ``node_id`` is the plan node the phase belongs to, ``None`` for run-wide phases (mapping,
+    planning, loading, previewing). ``message`` is short, user-facing copy built from counts,
+    column names and tiers only: never prompts, model output, data values, paths or secrets.
+    ``retry_in_s`` is set for ``waiting`` (a rate-limit back-off), else ``None``.
+    """
+
+    type: Literal["activity"] = "activity"
+    node_id: OpaqueId | None
+    phase: ActivityPhase
+    message: Annotated[str, Field(min_length=1, max_length=ACTIVITY_MESSAGE_MAX_CHARS)]
+    tier: ModelTier | None = None
+    attempt: Attempt | None = None
+    retry_in_s: Count | None = None
+
+
 PipelineEvent = Annotated[
     RunStarted | Profiled | RulesApplied | PlanCreated | NodeStarted | AttemptFailed
-    | NodeFinished | Verified | Loaded | RunFinished,
+    | NodeFinished | Verified | Loaded | RunFinished | Activity,
     Field(discriminator="type"),
 ]  # fmt: skip
 """Any contract event, discriminated on ``type``."""

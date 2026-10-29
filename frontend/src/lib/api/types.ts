@@ -11,6 +11,11 @@ export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 export const MAX_ATTEMPT_ERROR_CHARS = 2_000;
 
 export type TableName = "orders" | "lineitem";
+/**
+ * `POST /runs` `table` field: a table, or `"auto"` to let the server pick it
+ * from the file's column names (422 `table_unknown` when that is unclear).
+ */
+export type TableChoice = TableName | "auto";
 export type RunStatus =
   | "queued"
   | "running"
@@ -33,6 +38,19 @@ export type IssueKind =
   | "foreign_key"
   | "missing_column"
   | "extra_column";
+/** What a run is busy with right now (`activity.phase`). */
+export type ActivityPhase =
+  | "mapping"
+  | "planning"
+  | "writing"
+  | "sandbox"
+  | "checking"
+  | "verifying"
+  | "waiting"
+  | "loading"
+  | "previewing";
+/** `activity.message` is at most this many characters. */
+export const MAX_ACTIVITY_MESSAGE_CHARS = 200;
 
 export interface RunSummary {
   id: string;
@@ -79,6 +97,11 @@ export type RunEvent = EventBase &
         attempt: number;
         /** Attempt budget for this node, known from its first attempt. */
         maxAttempts: number;
+        /**
+         * The tier this attempt runs on (a retry may escalate). Absent or
+         * `null` on runs stored before the field existed: use the planned tier.
+         */
+        tier?: ModelTier | null;
       }
     | {
         type: "attempt_failed";
@@ -115,6 +138,19 @@ export type RunEvent = EventBase &
         costUsd: number;
         tokens: number;
       }
+    | {
+        /** Emitted when a phase starts; never a periodic heartbeat. */
+        type: "activity";
+        /** The plan node, or `null` for run-wide phases. */
+        nodeId: string | null;
+        phase: ActivityPhase;
+        /** Short user-facing copy; never data values, prompts or paths. */
+        message: string;
+        tier: ModelTier | null;
+        attempt: number | null;
+        /** Rate-limit wait in whole seconds, set only for `waiting`. */
+        retryInS: number | null;
+      }
   );
 export interface Transform {
   id: string;
@@ -143,6 +179,17 @@ export interface DataPreview {
   /** Target contract columns, in contract order. */
   columns: string[];
   rows: PreviewRow[];
+  /** Rows in the uploaded file. */
+  totalRows: number;
+  /** `offset` for the next page; `null` after the last page. */
+  nextOffset: number | null;
+}
+/** One page of `GET /runs/{id}/input`: the uploaded file's raw rows. */
+export interface RawInput {
+  /** The file's own column names (nested JSON flattened), not the contract's. */
+  columns: string[];
+  /** One array per row, in `columns` order; `null` for an empty cell. */
+  rows: (string | null)[][];
   /** Rows in the uploaded file. */
   totalRows: number;
   /** `offset` for the next page; `null` after the last page. */
@@ -190,7 +237,7 @@ export interface EvalSummary {
 export interface ApiClient {
   readonly isDemo: boolean;
   listRuns(): Promise<RunSummary[]>;
-  createRun(file: File, table: TableName): Promise<RunSummary>;
+  createRun(file: File, table: TableChoice): Promise<RunSummary>;
   streamEvents(
     runId: string,
     onEvent: (e: RunEvent) => void,
@@ -198,6 +245,8 @@ export interface ApiClient {
   ): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
+  /** The uploaded file's raw rows (`GET /runs/{id}/input`), from creation. */
+  getInput(runId: string, page: PreviewPage): Promise<RawInput>;
   getEvalSummary(): Promise<EvalSummary>;
   /**
    * Demo only, never part of the HTTP API: `true` when `runId` was created

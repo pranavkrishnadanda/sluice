@@ -28,7 +28,7 @@ model_list:
     litellm_params:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
-      timeout: 30  # per attempt; see "Timeouts" under router_settings
+      timeout: 60  # per attempt (large files need it); see "Timeouts" under router_settings
       # Groq free plan, owner's console (2026-10-29): 30 RPM, 8K TPM; daily 1K RPD, 200K TPD
       # (not enforced here, they surface as provider 429s).
       rpm: 30
@@ -45,7 +45,7 @@ model_list:
     litellm_params:
       model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY
-      timeout: 30  # per attempt; see "Timeouts" under router_settings
+      timeout: 60  # per attempt (large files need it); see "Timeouts" under router_settings
       # Limits from the owner's AI Studio console (Rate limits page, checked 2026-10-29):
       # 1K RPM, 2M TPM, 10K requests/day for gemini-3.8-flash. The daily cap isn't enforced here.
       rpm: 1000
@@ -131,15 +131,17 @@ router_settings:
   redis_port: 6379
   # Timeouts (nested so a hung deployment still reaches its last fallback). Each deployment sets
   # its own per-attempt `timeout` in litellm_params (LiteLLM v1.106.5 router._get_timeout: request
-  # kwarg > deployment litellm_params.timeout > this router default): 30 s everywhere. A timeout is
-  # not retried on the same group (TimeoutErrorRetries: 0), so it moves straight to the next group
-  # in the chain. Worst case, every attempt hanging:
-  #   strong: 30 (120b) + 30 (Gemini) + 30 (qwen) = 90 s
-  #   small:  30 (20b)  + 30 (qwen)               = 60 s
-  # sluice.llm.client.REQUEST_TIMEOUT_S (120 s) must exceed both, and caps.MAX_WALL_S_PER_FILE
-  # (180 s) must exceed the client timeout; tests/llm/test_litellm_config.py asserts this.
-  # That is the timeout-only bound. Slow retried errors (429/500/503 that each take the full 30 s,
-  # 3 attempts per group) can reach 270 s (strong) / 180 s (small),
+  # kwarg > deployment litellm_params.timeout > this router default): 60 s on the strong
+  # chain's own deployments (120b, Gemini: a strong call on a large file took over 30 s on the
+  # Groq free tier and timed out, owner test 2026-10-29), 30 s on the small ones (20b, qwen).
+  # A timeout is not retried on the same group (TimeoutErrorRetries: 0), so it moves straight
+  # to the next group in the chain. Worst case, every attempt hanging:
+  #   strong: 60 (120b) + 60 (Gemini) + 30 (qwen) = 150 s
+  #   small:  30 (20b)  + 30 (qwen)               =  60 s
+  # sluice.llm.client.REQUEST_TIMEOUT_S (180 s) must exceed both, and caps.MAX_WALL_S_PER_FILE
+  # (300 s) must exceed the client timeout; tests/llm/test_litellm_config.py asserts this.
+  # That is the timeout-only bound. Slow retried errors (429/500/503 that each take the full
+  # per-attempt timeout, 3 attempts per group) can reach 450 s (strong) / 180 s (small),
   # sluice.llm.client.SLOW_ERROR_WORST_CASE_S. Such a call ends at the client timeout as
   # LLMUnavailable, so the file degrades to rules-only output for that step and is never wrong.
   timeout: 30

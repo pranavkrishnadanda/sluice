@@ -1,7 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 /**
- * Playwright against the real backend: `e2e/live-backend.spec.ts` only.
+ * Playwright against the real backend: the `e2e/live-*.spec.ts` specs only.
  *
  * Opt-in and never part of `bun run e2e` or CI. It needs the services and
  * the API running (`make up && make api`) and makes real model calls:
@@ -20,7 +20,7 @@ const DIST_DIR = ".next-e2e-live";
 
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: "live-backend.spec.ts",
+  testMatch: /live-.*\.spec\.ts$/,
   outputDir: "./test-results/live",
   // One real run at a time: it shares the backend's worker and model quota.
   workers: 1,

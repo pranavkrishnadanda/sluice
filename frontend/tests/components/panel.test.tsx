@@ -71,6 +71,7 @@ function withPreview(preview: DataPreview): ApiClient {
     streamEvents: (id, on, signal) => base.streamEvents(id, on, signal),
     getTransforms: (id) => base.getTransforms(id),
     getPreview: async () => preview,
+    getInput: (id, p) => base.getInput(id, p),
     getEvalSummary: () => base.getEvalSummary(),
   };
 }
@@ -342,12 +343,12 @@ describe("data tab", () => {
       client,
     );
     expect(
-      screen.getByText(/preview appears once the data has loaded/i),
+      await screen.findByText(/preview appears once the data has loaded/i),
     ).toBeInTheDocument();
     expect(getPreview).not.toHaveBeenCalled();
   });
 
-  test("a run that finished without loading has no preview", () => {
+  test("a run that finished without loading has no preview", async () => {
     const getPreview = vi.fn<ApiClient["getPreview"]>();
     const client = { ...withPreview(bigPreview(1)), getPreview };
     const failed = stateOf([
@@ -363,7 +364,9 @@ describe("data tab", () => {
       },
     ]);
     renderPanel("run-repaired", failed, client);
-    expect(screen.getByText(/didn.t load any data/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/didn.t load any data/i),
+    ).toBeInTheDocument();
     expect(getPreview).not.toHaveBeenCalled();
   });
 

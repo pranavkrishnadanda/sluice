@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable
 from difflib import SequenceMatcher
 from typing import Final
 
@@ -55,6 +56,11 @@ DTYPE_FIT_BONUS: Final = 0.5
 MIN_FIT_SHARE: Final = 0.5
 """A model mapping onto a non-string or enum column is rejected when fewer than this share of
 the source's informative samples (not destroyed tokens) fit the target's dtype or enum."""
+
+TABLE_OTHER_MIN_SHARE: Final = 0.6
+"""Ruling H5: another table's contract columns an input must match (exactly or normalised)..."""
+TABLE_CHOSEN_MAX_SHARE: Final = 0.3
+"""... while matching fewer than this share of the chosen table's, to be called that table."""
 
 _INT = re.compile(r"[+-]?\d[\d,]*")
 _NUMBER = re.compile(r"[+-]?(\d[\d,]*(\.\d*)?|\.\d+)")
@@ -139,6 +145,61 @@ class MappingError(ValueError):
         super().__init__("; ".join(problems))
         self.problems = problems
         self.partial = partial
+
+
+def match_share(columns: list[str], contract: Contract) -> float:
+    """Share of ``contract``'s columns some input column matches deterministically.
+
+    Uses :func:`sluice.rules.profile.match_columns` (exact, normalised or one-level nested
+    leaf), so no model is involved. O(columns).
+    """
+    return len(set(match_columns(columns, contract).values())) / len(contract.columns)
+
+
+def table_mismatch(columns: list[str], contract: Contract, known: Iterable[Contract]) -> str | None:
+    """Why the input looks like another known table's file, or ``None`` (Ruling H5).
+
+    The input is called the other table's when its column names match at least
+    :data:`TABLE_OTHER_MIN_SHARE` of that table's contract columns and fewer than
+    :data:`TABLE_CHOSEN_MAX_SHARE` of ``contract``'s. Only clear cases are caught, so a
+    heavily renamed file of the right table is never turned away. O(tables x columns).
+    """
+    if match_share(columns, contract) >= TABLE_CHOSEN_MAX_SHARE:
+        return None
+    best: tuple[float, str] | None = None
+    for other in known:
+        if other.name == contract.name:
+            continue
+        share = match_share(columns, other)
+        if share >= TABLE_OTHER_MIN_SHARE and (best is None or share > best[0]):
+            best = (share, other.name)
+    if best is None:
+        return None
+    article = "an" if best[1][:1].lower() in "aeiou" else "a"
+    return f"this looks like {article} {best[1]} file, not {contract.name}; nothing loaded"
+
+
+TABLE_AUTO_MIN_MARGIN: Final = 0.2
+"""``resolve_table``: the best table's share must beat every other table's by this much."""
+
+
+def resolve_table(columns: list[str], known: Iterable[Contract]) -> str | None:
+    """The table whose contract ``columns`` match best, or ``None`` when that is not clear.
+
+    For ``POST /runs`` with ``table=auto``. Uses :func:`match_share` (deterministic name
+    matching, no model): the best table must match at least :data:`TABLE_CHOSEN_MAX_SHARE` of
+    its contract columns (below that Ruling H5 would not call the file that table either) and
+    beat every other table by :data:`TABLE_AUTO_MIN_MARGIN`. A tie, a close call or a weak
+    match is ``None``: the user picks. O(tables x columns).
+    """
+    shares = sorted(((match_share(columns, c), c.name) for c in known), reverse=True)
+    if not shares:
+        return None
+    best_share, best = shares[0]
+    runner_up = shares[1][0] if len(shares) > 1 else 0.0
+    if best_share < TABLE_CHOSEN_MAX_SHARE or best_share - runner_up < TABLE_AUTO_MIN_MARGIN:
+        return None
+    return best
 
 
 def _q(name: str) -> str:

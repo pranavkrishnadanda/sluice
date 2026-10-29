@@ -4,6 +4,7 @@ import {
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
+  useEffect,
   useId,
   useRef,
   useState,
@@ -14,11 +15,16 @@ import {
   CrossIcon,
   PaperclipIcon,
 } from "@/components/shell/icons";
-import type { TableName } from "@/lib/api/types";
+import type { TableChoice } from "@/lib/api/types";
 import { FileChip } from "./FileChip";
 
 export const ACCEPTED_EXTENSIONS = [".csv", ".json", ".parquet"] as const;
-const TABLES: readonly TableName[] = ["orders", "lineitem"];
+/** Auto first and by default: the server matches the file to a table. */
+const TABLES: ReadonlyArray<{ value: TableChoice; label: string }> = [
+  { value: "auto", label: "Auto" },
+  { value: "orders", label: "orders" },
+  { value: "lineitem", label: "lineitem" },
+];
 
 const TYPE_ERROR = "Only .csv, .json or .parquet files can be loaded.";
 const MISSING_ERROR = "Choose a file to load first.";
@@ -29,7 +35,7 @@ export function isAcceptedFile(file: File): boolean {
 }
 
 export interface ComposerProps {
-  onSubmit: (file: File, table: TableName) => void | Promise<void>;
+  onSubmit: (file: File, table: TableChoice) => void | Promise<void>;
   /** A submit is in flight: the send button reports busy and ignores clicks. */
   busy?: boolean;
   /** Error from the last submit (e.g. the API refused the run). */
@@ -37,6 +43,14 @@ export interface ComposerProps {
   placeholder?: string;
   /** A new valid file was chosen (e.g. to clear a stale `submitError`). */
   onFileChange?: () => void;
+  /**
+   * The server couldn't tell which table the file is for (422
+   * `table_unknown`): this copy is shown on the table picker, which takes
+   * focus, and Auto is not sent again until a table is picked.
+   */
+  tableError?: string | null;
+  /** The table choice changed (e.g. to clear `tableError`). */
+  onTableChange?: (table: TableChoice) => void;
 }
 
 /**
@@ -50,15 +64,25 @@ export function Composer({
   submitError = null,
   placeholder = "Drop a CSV, JSON or Parquet file, or browse",
   onFileChange,
+  tableError = null,
+  onTableChange,
 }: ComposerProps) {
   const [file, setFile] = useState<File | null>(null);
-  const [table, setTable] = useState<TableName>("orders");
+  const [table, setTable] = useState<TableChoice>("auto");
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const picker = useRef<HTMLSelectElement>(null);
   const errorId = useId();
 
-  const shownError = error ?? submitError;
+  // Only Auto was refused: a named table is the user's answer.
+  const pickTable = tableError != null && table === "auto";
+  const shownError = error ?? submitError ?? (pickTable ? tableError : null);
+  const fileError = shownError != null && !pickTable;
+
+  useEffect(() => {
+    if (pickTable) picker.current?.focus();
+  }, [pickTable]);
 
   const take = (picked: File | undefined) => {
     if (!picked) return;
@@ -105,6 +129,10 @@ export function Composer({
       input.current?.focus();
       return;
     }
+    if (pickTable) {
+      picker.current?.focus();
+      return;
+    }
     void onSubmit(file, table);
   };
 
@@ -138,8 +166,8 @@ export function Composer({
             type="file"
             accept={ACCEPTED_EXTENSIONS.join(",")}
             aria-label="Attach a file"
-            aria-invalid={shownError ? true : undefined}
-            aria-describedby={shownError ? errorId : undefined}
+            aria-invalid={fileError ? true : undefined}
+            aria-describedby={fileError ? errorId : undefined}
             onChange={onPick}
             className="sr-only"
           />
@@ -173,14 +201,22 @@ export function Composer({
 
         <span className="relative shrink-0">
           <select
+            ref={picker}
             aria-label="Target table"
+            aria-invalid={pickTable || undefined}
+            aria-describedby={pickTable ? errorId : undefined}
             value={table}
-            onChange={(e) => setTable(e.target.value as TableName)}
-            className="h-11 cursor-pointer appearance-none rounded-full bg-chip pr-8 pl-3.5 font-medium text-fg text-sm transition-colors duration-150 hover:bg-raised"
+            onChange={(e) => {
+              const next =
+                TABLES.find((t) => t.value === e.target.value)?.value ?? "auto";
+              setTable(next);
+              onTableChange?.(next);
+            }}
+            className={`h-11 cursor-pointer appearance-none rounded-full bg-chip pr-8 pl-3.5 font-medium text-fg text-sm transition-colors duration-150 hover:bg-raised ${pickTable ? "outline-2 outline-warn outline-offset-1" : ""}`}
           >
             {TABLES.map((t) => (
-              <option key={t} value={t}>
-                {t}
+              <option key={t.value} value={t.value}>
+                {t.label}
               </option>
             ))}
           </select>
