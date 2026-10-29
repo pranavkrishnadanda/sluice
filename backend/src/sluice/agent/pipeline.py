@@ -340,7 +340,11 @@ async def _pipeline(run: _Run) -> SystemOutput:
         try:
             with tracing.step_span("plan"):
                 plan, _ = await planning.propose_plan(
-                    candidates, contract, deps.llm, issues=prof1.unit_issues
+                    candidates,
+                    contract,
+                    deps.llm,
+                    issues=prof1.unit_issues,
+                    source_names=run.sources,
                 )
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)

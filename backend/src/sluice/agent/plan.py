@@ -8,7 +8,9 @@
   recoverable, validates the plan in code, re-asks once with the validation error, then raises
   :class:`~sluice.llm.client.LLMOutputError` (the pipeline falls back to rules-only output).
 * :func:`route_tier` is the only place a tier is chosen: the orchestrator states a difficulty,
-  never a model (spec §11 item 1).
+  never a model (spec §11 item 1). :func:`difficulty_floor` (Ruling H4) is a code-side lower
+  bound on that difficulty: the orchestrator can raise a node to ``hard`` but never lower it
+  below the floor.
 
 Raw sample text is untrusted input: it is passed to the model only as JSON-encoded data, each
 sample truncated to :data:`PROMPT_SAMPLE_CHARS`.
@@ -17,6 +19,7 @@ sample truncated to :data:`PROMPT_SAMPLE_CHARS`.
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from collections.abc import Mapping
 from typing import Final, Literal, TypeGuard
@@ -25,7 +28,7 @@ import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
 
 from sluice.agent.events import OpaqueId
-from sluice.contracts.model import Contract
+from sluice.contracts.model import ColumnSpec, Contract
 from sluice.llm.client import LLM, CallRecord, LLMOutputError, Tier
 from sluice.rules.fixers import SENTINEL_TOKENS, RuleResult, cell_texts, kept_raw_rows
 from sluice.rules.profile import contract_sources, profile
@@ -47,6 +50,24 @@ ROLE: Final = "orchestrator"
 PLAN_TIER: Final[Tier] = "strong"
 
 Difficulty = Literal["easy", "hard"]
+
+DATE_SHAPES: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (name, re.compile(pattern, re.ASCII))
+    for name, pattern in (
+        ("iso", r"\d{4}-\d{1,2}-\d{1,2}"),
+        ("ymd_slash", r"\d{4}/\d{1,2}/\d{1,2}"),
+        ("dmy_slash", r"\d{1,2}/\d{1,2}/\d{2,4}"),
+        ("dmy_dash", r"\d{1,2}-\d{1,2}-\d{2,4}"),
+        ("dmy_dot", r"\d{1,2}\.\d{1,2}\.\d{2,4}"),
+        ("d_mon_y", r"\d{1,2}[ -][A-Za-z]{3,9}\.?[ -]\d{2,4}"),
+        ("mon_d_y", r"[A-Za-z]{3,9}\.? \d{1,2},? \d{2,4}"),
+        ("compact", r"\d{8}"),
+    )
+)
+"""Date layouts the difficulty floor tells apart (matched at the start of a stripped sample)."""
+
+_GROUPED = re.compile(r"\d,\d", re.ASCII)
+_RESCALE_HINT = re.compile(r"(?:^|_)(?:paise|cents|k)$", re.IGNORECASE)
 
 SYSTEM_PROMPT: Final = """\
 You plan repairs for a data-cleaning pipeline. Deterministic rules already parsed what they could;
@@ -140,6 +161,61 @@ def candidate_columns(
     return out
 
 
+# ---------------------------------------------------------------- difficulty floor
+
+
+def date_shapes(samples: list[str]) -> set[str]:
+    """The :data:`DATE_SHAPES` the samples match (the first matching shape per sample)."""
+    found: set[str] = set()
+    for sample in samples:
+        text = sample.strip()
+        for name, pattern in DATE_SHAPES:
+            if pattern.match(text):
+                found.add(name)
+                break
+    return found
+
+
+def difficulty_floor(
+    spec: ColumnSpec, samples: list[str], *, unit_issue: bool, source_name: str | None = None
+) -> Difficulty:
+    """The least difficulty a node for ``spec`` may have (Ruling H4; the router uses it).
+
+    ``hard`` when the column has a profiler unit issue, when its samples show two or more
+    distinct date layouts (date and timestamp columns), or when it needs both separator
+    removal (digit grouping such as ``1,24,500``) and rescaling (a unit issue, or a source
+    column name ending in ``_paise``, ``_cents`` or ``_k``). Otherwise ``easy``.
+    O(samples x shapes); every pattern is linear.
+    """
+    if unit_issue:
+        return "hard"
+    if spec.dtype in ("date", "timestamp_utc") and len(date_shapes(samples)) >= 2:
+        return "hard"
+    grouped = any(_GROUPED.search(s) for s in samples)
+    rescale = source_name is not None and _RESCALE_HINT.search(source_name) is not None
+    return "hard" if grouped and rescale else "easy"
+
+
+def _with_floor(
+    plan: Plan,
+    candidates: dict[str, list[str]],
+    contract: Contract,
+    issues: Mapping[str, str],
+    source_names: Mapping[str, str | None],
+) -> Plan:
+    """``plan`` with every node raised to its :func:`difficulty_floor` (never lowered)."""
+    nodes = []
+    for n in plan.nodes:
+        floor = difficulty_floor(
+            contract.column(n.column),
+            candidates[n.column],
+            unit_issue=n.column in issues,
+            source_name=source_names.get(n.column),
+        )
+        nodes.append(n.model_copy(update={"difficulty": "hard"}) if floor == "hard" else n)
+    return Plan(nodes=nodes)
+
+
 # ---------------------------------------------------------------- validation
 
 
@@ -218,11 +294,14 @@ async def propose_plan(
     llm: LLM,
     *,
     issues: Mapping[str, str] | None = None,
+    source_names: Mapping[str, str | None] | None = None,
 ) -> tuple[Plan, list[CallRecord]]:
     """Ask the orchestrator for a validated repair plan over ``candidates``.
 
     ``issues`` maps a candidate column to a deterministic profiler finding (the unit issue of
     Ruling H2b); it is shown to the orchestrator as that column's ``profiler_issue``.
+    ``source_names`` maps a contract column to the input column it is read from. Both feed
+    :func:`difficulty_floor`: the returned plan's difficulties are at least their floor.
 
     Empty ``candidates`` returns ``Plan(nodes=[])`` without calling a model. A failed attempt
     (the client's schema repair failed, or :func:`validate_plan` rejected the plan) is
@@ -251,7 +330,10 @@ async def propose_plan(
         records.append(record)
         if plan is not None:
             try:
-                return validate_plan(plan, candidates), records
+                valid = validate_plan(plan, candidates)
+                return _with_floor(
+                    valid, candidates, contract, issues or {}, source_names or {}
+                ), records
             except PlanError as exc:
                 error = str(exc)
         error = error[:PLAN_FEEDBACK_CHARS]

@@ -1285,3 +1285,19 @@ def test_pipeline_feeds_a_polars_rename_hint_first_after_a_sandbox_attribute_err
     assert "strip_chars" in previous and "has no attribute 'strip'" in previous
     (done,) = result.events("node_finished")
     assert done.attempt == 2  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- H4: tier floor
+
+
+def test_pipeline_routes_an_easy_rated_unit_node_to_the_strong_tier(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0208", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100]})  # rated easy
+    result = run(case, script)
+
+    (plan_created,) = result.events("plan_created")
+    assert plan_created.nodes[0].tier == "strong"  # type: ignore[attr-defined]
+    assert [r.tier for r in result.llm.records if r.role == "worker"] == ["strong"]
+    assert result.out.meta["nodes"][0]["difficulty"] == "hard"
