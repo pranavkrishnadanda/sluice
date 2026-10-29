@@ -251,6 +251,10 @@ class Worker:
                 )
                 artefacts = self._artefacts(row, state, path, outcome)
         except RunClosed:
+            # Refused after the run was closed: by its own run_finished (finish it with that)
+            # or by the cancelling coroutine (already finished; RunNotActive is ignored).
+            if state.finished is not None:
+                self._finish(row.id, state.finished)
             return
         except Exception as exc:
             _log.warning("run %s raised %s", row.id, _type_name(exc))
@@ -314,7 +318,10 @@ class Worker:
         """Store and publish ``run_finished(failed)`` at the next ``seq`` (caller holds lock).
 
         A :class:`DuplicateEvent` means an earlier append committed although it reported an
-        error: resync ``seq`` from the store (adopting a stored ``run_finished``) and retry once.
+        error: resync ``seq`` from the store and retry once. The resynced events were stored
+        but never published (``state.seq`` only advances after a publish), so they are
+        published now, in order, each exactly once; a stored ``run_finished`` among them is
+        adopted as the run's terminal event.
         """
         for _ in range(2):
             terminal = RunFinished(
@@ -333,6 +340,8 @@ class Worker:
                 except Exception as exc:
                     _log.error("run %s: resync failed: %s", run_id, _type_name(exc))
                     return None
+                for event in tail:
+                    self._hub.publish(run_id, event)
                 if tail:
                     state.seq = tail[-1].seq
                 stored = [e for e in tail if isinstance(e, RunFinished)]

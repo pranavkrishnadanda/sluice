@@ -35,6 +35,8 @@ class FakeStore:
         self.progress: list[tuple[str, int | None, float | None]] = []
         self.finished: list[tuple[str, str, float]] = []
         self.fail_append: Callable[[EventModel], bool] = lambda _e: False
+        self.commit_then_fail: Callable[[EventModel], bool] = lambda _e: False
+        """Store the event, then raise as if the connection dropped before the commit ack."""
 
     def add(self, run_id: str, *, status: str = "queued", cost: float = 0.0) -> None:
         self.runs[run_id] = RunRow(
@@ -75,6 +77,8 @@ class FakeStore:
             if any(e.seq == event.seq for e in self.events[run_id]):
                 raise DuplicateEvent(run_id)
             self.events[run_id].append(event)
+            if self.commit_then_fail(event):
+                raise ConnectionError("connection lost after commit")
 
     def events_after(self, run_id: str, after_seq: int) -> list[EventModel]:
         with self.lock:
