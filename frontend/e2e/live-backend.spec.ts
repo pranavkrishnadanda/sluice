@@ -88,6 +88,13 @@ function eventsOf<T extends RunEvent["type"]>(
   return events.filter((e): e is RunEventOf<T> => e.type === type);
 }
 
+/** When each milestone first appeared, in `performance.now()` ms. */
+interface Timeline {
+  planAt: number | null;
+  summaryAt: number | null;
+  codeAt: number | null;
+}
+
 /**
  * Records, from page load, when the thread first shows the plan (a row
  * past "Rules" other than "Planning repairs…") and when the run summary
@@ -95,12 +102,6 @@ function eventsOf<T extends RunEvent["type"]>(
  * from a history that arrived all at once. Also records when the details
  * panel first lists an attempt as passed (the Code tab's accepted transform).
  */
-interface Timeline {
-  planAt: number | null;
-  summaryAt: number | null;
-  codeAt: number | null;
-}
-
 async function recordThreadTimeline(page: Page) {
   await page.addInitScript(() => {
     const timeline: Timeline = { planAt: null, summaryAt: null, codeAt: null };
@@ -304,6 +305,12 @@ test.describe("live backend", () => {
             (timeline.codeAt ?? 0) - (timeline.summaryAt ?? 0),
           )} ms relative to the run summary`,
         });
+        // Regression guard for live transforms: the accepted transform was
+        // served while the run was in flight, before its summary appeared.
+        expect(
+          timeline.codeAt ?? Number.POSITIVE_INFINITY,
+          "accepted transform shown before the run summary",
+        ).toBeLessThan(timeline.summaryAt ?? 0);
         const transforms = await getTransforms(runId);
         for (const done of accepted) {
           const transform = transforms.find((t) => t.id === done.transformId);
