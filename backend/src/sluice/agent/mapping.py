@@ -182,6 +182,9 @@ def table_mismatch(columns: list[str], contract: Contract, known: Iterable[Contr
 TABLE_AUTO_MIN_MARGIN: Final = 0.2
 """``resolve_table``: the best table's share must beat every other table's by this much."""
 
+SHARE_EPSILON: Final = 1e-9
+"""Slack for comparing shares: ``0.7 - 0.5`` is ``0.19999999999999996`` in floats."""
+
 
 def resolve_table(columns: list[str], known: Iterable[Contract]) -> str | None:
     """The table whose contract ``columns`` match best, or ``None`` when that is not clear.
@@ -190,14 +193,17 @@ def resolve_table(columns: list[str], known: Iterable[Contract]) -> str | None:
     matching, no model): the best table must match at least :data:`TABLE_CHOSEN_MAX_SHARE` of
     its contract columns (below that Ruling H5 would not call the file that table either) and
     beat every other table by :data:`TABLE_AUTO_MIN_MARGIN`. A tie, a close call or a weak
-    match is ``None``: the user picks. O(tables x columns).
+    match is ``None``: the user picks. Shares are compared with :data:`SHARE_EPSILON` of slack
+    so a margin of exactly 20 points is not lost to float error. O(tables x columns).
     """
     shares = sorted(((match_share(columns, c), c.name) for c in known), reverse=True)
     if not shares:
         return None
     best_share, best = shares[0]
     runner_up = shares[1][0] if len(shares) > 1 else 0.0
-    if best_share < TABLE_CHOSEN_MAX_SHARE or best_share - runner_up < TABLE_AUTO_MIN_MARGIN:
+    weak = best_share < TABLE_CHOSEN_MAX_SHARE - SHARE_EPSILON
+    close = best_share - runner_up < TABLE_AUTO_MIN_MARGIN - SHARE_EPSILON
+    if weak or close:
         return None
     return best
 
