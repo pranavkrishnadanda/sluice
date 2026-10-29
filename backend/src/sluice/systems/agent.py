@@ -53,10 +53,16 @@ class AgentSystem:
         self._clock = clock
 
     def run(self, case: CaseInput) -> SystemOutput:
-        """Run the pipeline over ``case.path`` and return its output (events in ``meta``)."""
+        """Run the pipeline over ``case.path`` and return its output (events in ``meta``).
+
+        ``case.run_id`` becomes the pipeline's run id, and each event is passed to
+        ``case.on_event`` as it is emitted (both optional; see :class:`CaseInput`). The sink
+        is called from the thread running this method.
+        """
         return asyncio.run(self._run(case))
 
     async def _run(self, case: CaseInput) -> SystemOutput:
         async with self._llm_factory() as llm:
             deps = PipelineDeps(llm=llm, sandbox=self._sandbox, clock=self._clock)
-            return await run_pipeline(case, deps, EventLog())
+            log = EventLog(on_emit=case.on_event)
+            return await run_pipeline(case, deps, log, run_id=case.run_id)

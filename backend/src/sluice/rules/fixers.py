@@ -402,6 +402,27 @@ def kept_raw_rows(df: pl.DataFrame, contract: Contract, prof: Profile) -> dict[P
     }
 
 
+def raw_row_keys(df: pl.DataFrame, contract: Contract, prof: Profile) -> list[PK | None]:
+    """The clean primary key of every raw ``df`` row, in row order; ``None`` where it fails.
+
+    Parsed with the same per-cell repair as :func:`apply_rules` (rules 1-9), so a key equals
+    the one the row has in the output (or in ``quarantined``). Before the unkeyed-row drop and
+    dedupe: every copy of a duplicate row gets the key. Used to align a raw row with its output
+    row (``sluice.runs.preview``).
+
+    Complexity: O(rows x columns), one cell-repair pass.
+
+    Raises:
+        UnkeyableInputError: A primary-key column has no matching input column.
+    """
+    _require_keys(contract, prof)
+    frame = _repair_frame(_select_matched(df, prof, []), contract, [])
+    return [
+        None if any(part is None for part in key) else key
+        for key in frame.select(contract.primary_key).rows()
+    ]
+
+
 def flagged_raw_rows(df: pl.DataFrame, contract: Contract, prof: Profile) -> dict[str, set[int]]:
     """Matched contract column -> indices of the raw ``df`` rows whose own cell rules 3-9 flag.
 

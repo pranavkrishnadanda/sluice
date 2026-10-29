@@ -1,6 +1,5 @@
 """Command-line entry point for Sluice."""
 
-import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -16,20 +15,14 @@ import pydantic_ai
 import typer
 from sqlalchemy.exc import SQLAlchemyError
 
-from sluice.agent.events import (
-    PIPELINE_EVENT_ADAPTER,
-    EventLog,
-    EventModel,
-    Loaded,
-    RulesApplied,
-    RunFinished,
-    RunStarted,
-)
-from sluice.contracts.model import Contract, load_contract
+from sluice.agent.events import EventModel, RunFinished
 from sluice.drift.cases import build_split, load_reference, load_split, split_hash, unexpected_files
 from sluice.evals.runner import SYSTEMS, format_ci, latest_summaries, render_results, run_eval
 from sluice.evals.types import CaseInput, SystemOutput
 from sluice.load.iceberg import LoadError, LoadResult, find_load, load_output
+from sluice.runs import execute
+from sluice.runs.execute import LoadedFn, LoadFn, RunFn
+from sluice.runs.execute import file_sha256 as file_sha256  # re-exported: `sluice run` callers
 from sluice.settings import Settings, get_settings
 
 # The CLI owns its terminal output (eval tables, JSON): no Pydantic AI first-run banner.
@@ -45,13 +38,6 @@ RESULTS_MD = EVALS_DIR / "RESULTS.md"
 LOCK_FILE = "LOCK.json"
 DEFAULT_SEED = 2026
 DEFAULT_N = 300
-HASH_CHUNK_BYTES = 1 << 20
-# Events the `run` command emits itself; the same types in a pipeline's meta are not replayed.
-_CLI_EVENTS = frozenset({"run_started", "loaded", "run_finished"})
-
-RunFn = Callable[[CaseInput], SystemOutput]
-LoadFn = Callable[..., LoadResult]
-LoadedFn = Callable[..., LoadResult | None]
 
 
 class SplitName(StrEnum):
@@ -240,60 +226,17 @@ class TableName(StrEnum):
     lineitem = "lineitem"
 
 
-def file_sha256(path: Path) -> str:
-    """SHA-256 of ``path``'s bytes, read in 1 MiB chunks (memory O(1) in the file size)."""
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(HASH_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def resolve_run_fn(note: Callable[[str], Any]) -> RunFn:
     """The agent system's ``run``, looked up at call time; the rules system until it exists.
 
     The agent keeps LiteLLM's response cache (``cache=True``): a repeat ``sluice run`` should
     cost nothing, unlike an eval trial (Ruling F3).
     """
-    factory = SYSTEMS.get("agent")
-    if factory is None:
-        note("note: the agent system is not registered yet; running the rules-only system")
-        return SYSTEMS["rules"]().run
-    return factory(cache=True).run  # type: ignore[call-arg]
+    return execute.resolve_run_fn(note, SYSTEMS)
 
 
 class RunFailedError(Exception):
     """The pipeline finished ``failed``: nothing was loaded and no idempotency key was claimed."""
-
-
-def _replayed(out: SystemOutput) -> tuple[list[EventModel], RunFinished | None]:
-    """The pipeline's events to print (CLI-owned types dropped) and its own ``run_finished``."""
-    raw = out.meta.get("events")
-    if not raw:
-        return [RulesApplied(actions=[str(a) for a in out.meta.get("actions", [])])], None
-    events: list[EventModel] = []
-    final: RunFinished | None = None
-    for item in raw:
-        if isinstance(item, EventModel):
-            event = item
-        else:
-            event = PIPELINE_EVENT_ADAPTER.validate_python(item)
-        if isinstance(event, RunFinished):
-            final = event
-        elif event.type not in _CLI_EVENTS:  # type: ignore[attr-defined]
-            events.append(event)
-    return events, final
-
-
-def _output_status(out: SystemOutput, final: RunFinished | None) -> str:
-    """The run's status: the pipeline's own, else derived from the output (rules-only system)."""
-    if final is not None:
-        return final.status
-    return "quarantined" if out.file_quarantined or out.quarantined else "succeeded"
-
-
-def _skip_summary(result: LoadResult) -> str:
-    return f"file already loaded (snapshot {result.snapshot_id}); nothing written"
 
 
 def run_file(
@@ -310,93 +253,41 @@ def run_file(
 ) -> LoadResult:
     """Run the pipeline over ``path``, print its events as JSON lines, and load the output.
 
-    ``run_fn`` defaults to :func:`resolve_run_fn` (agent, else rules). Before the pipeline runs,
-    ``loaded_fn`` looks up the idempotency key; a file already loaded into this table is
-    reported as skipped without running (or paying for) the pipeline. ``load_fn`` re-checks the
-    key under its locks, so a concurrent duplicate is still caught.
+    A thin wrapper over :func:`sluice.runs.execute.execute_run` (see there for the event order
+    and the load semantics, Rulings F1/L1/C1-C4c) with a fresh run id and each event printed as
+    one JSON line as it happens. ``run_fn`` defaults to :func:`resolve_run_fn` (agent, else
+    rules), resolved only once the file is known not to be loaded already.
 
-    The pipeline's own final ``run_finished`` (in ``meta["events"]``) decides the outcome
-    (Ruling F1): ``failed`` (a cap, an outage, the sandbox, or a crash) loads nothing and
-    claims no key, prints ``run_finished(failed)`` with the pipeline's summary, tokens and
-    cost, and raises :class:`RunFailedError`; any other status is passed to ``load_fn`` and
-    printed as the final status. A whole-file quarantine is passed too: the loader records the
-    run but writes no data and claims no key, so the file can be retried. On an exception a
-    ``run_finished`` event with status ``failed`` is printed and the exception re-raised.
+    Raises:
+        RunFailedError: The pipeline finished ``failed`` (``run_finished(failed)`` printed with
+            its summary, tokens and cost; nothing loaded, no key claimed).
+        Exception: Whatever the pipeline or the load raised, after ``run_finished(failed)``.
     """
-    contract: Contract = load_contract(table, contract_version)
-    run_id = uuid.uuid4().hex
-    log = EventLog()
+    last: list[EventModel] = []
 
     def emit(event: EventModel) -> None:
-        echo(log.emit(event).to_json())
+        last[:] = [event]
+        echo(event.to_json())
 
-    emit(RunStarted(run_id=run_id, file_name=path.name, table=table, rows=None))  # type: ignore[arg-type]
-    cost, tokens = 0.0, 0
-    try:
-        sha = file_sha256(path)
-        settings = settings_fn()
-        prior = loaded_fn(contract, sha, settings=settings)
-        if prior is not None:
-            emit(
-                RunFinished(
-                    status="succeeded",
-                    summary=_skip_summary(prior),
-                    cost_usd=0.0,
-                    tokens=0,
-                )
-            )
-            return prior
-        fn = run_fn or resolve_run_fn(note=lambda m: typer.echo(m, err=True))
-        out = fn(CaseInput(path, contract, reference_fn(table)))
-        cost = max(out.cost_usd, 0.0)
-        tokens = max(int(out.meta.get("tokens", 0)), 0)
-        events, final = _replayed(out)
-        for event in events:
-            emit(event)
-        status = _output_status(out, final)
-        if status == "failed":
-            summary = final.summary if final is not None else "the run failed"
-        else:
-            result = load_fn(
-                out, contract, run_id=run_id, file_sha256=sha, settings=settings, status=status
-            )
-    except Exception as exc:
-        emit(
-            RunFinished(
-                status="failed", summary=f"{type(exc).__name__}", cost_usd=cost, tokens=tokens
-            )
-        )
-        raise
-    if status == "failed":
-        emit(RunFinished(status="failed", summary=summary, cost_usd=cost, tokens=tokens))
-        raise RunFailedError(summary)
-    if not result.skipped and result.snapshot_id is not None:
-        emit(
-            Loaded(
-                rows_loaded=result.rows_loaded,
-                rows_quarantined=result.rows_quarantined,
-                snapshot_id=result.snapshot_id,
-            )
-        )
-    if result.skipped:
-        summary = _skip_summary(result)
-    elif out.file_quarantined:
-        summary = "nothing loaded; the file can be retried"
-    else:
-        summary = f"loaded {result.rows_loaded} row(s), quarantined {result.rows_quarantined}" + (
-            " (recovered an earlier commit)" if result.recovered else ""
-        )
-    if final is not None and not result.skipped:
-        summary = f"{final.summary}; {summary}"
-    emit(
-        RunFinished(
-            status="succeeded" if result.skipped else status,  # type: ignore[arg-type]
-            summary=summary,
-            cost_usd=cost,
-            tokens=tokens,
-        )
+    def resolved(case: CaseInput) -> SystemOutput:
+        return resolve_run_fn(note=lambda m: typer.echo(m, err=True))(case)
+
+    outcome = execute.execute_run(
+        path,
+        table,
+        run_id=uuid.uuid4().hex,
+        emit=emit,
+        contract_version=contract_version,
+        run_fn=run_fn or resolved,
+        load_fn=load_fn,
+        loaded_fn=loaded_fn,
+        settings_fn=settings_fn,
+        reference_fn=reference_fn,
     )
-    return result
+    if outcome.status == "failed" or outcome.result is None:
+        final = last[0] if last else None
+        raise RunFailedError(final.summary if isinstance(final, RunFinished) else "the run failed")
+    return outcome.result
 
 
 @app.command("run")

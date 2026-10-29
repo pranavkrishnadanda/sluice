@@ -243,7 +243,12 @@ def test_transform_record_code_cap_is_the_workers() -> None:
     assert MAX_CODE_CHARS == worker.MAX_CODE_CHARS
     with pytest.raises(ValidationError):
         TransformRecord(
-            node_id="n1", attempt=1, code="x" * (worker.MAX_CODE_CHARS + 1), model="m", passed=False
+            node_id="n1",
+            attempt=1,
+            code="x" * (worker.MAX_CODE_CHARS + 1),
+            model="m",
+            passed=False,
+            transform_id="t1",
         )
 
 
@@ -253,3 +258,16 @@ def test_pk_text_is_shared_by_pipeline_and_loader() -> None:
 
     assert iceberg.pk_text is types.pk_text
     assert types.pk_text((7, "a")) == '[7,"a"]'
+
+
+def test_transform_record_requires_an_opaque_transform_id() -> None:
+    from pydantic import ValidationError
+
+    from sluice.load.iceberg import TransformRecord
+
+    base = {"node_id": "n1", "attempt": 1, "code": "x", "model": "m", "passed": True}
+    assert TransformRecord.model_validate({**base, "transform_id": "t0a"}).transform_id == "t0a"
+    with pytest.raises(ValidationError):
+        TransformRecord.model_validate(base)
+    with pytest.raises(ValidationError):
+        TransformRecord.model_validate({**base, "transform_id": "bad id!"})

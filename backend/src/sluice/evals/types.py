@@ -7,13 +7,17 @@ system's output (for quarantined rows: as it appeared in the input, after cleani
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import polars as pl
 
 from sluice.contracts.model import Contract
+
+if TYPE_CHECKING:
+    from sluice.agent.events import EventModel
 
 PK = tuple[Any, ...]
 
@@ -35,11 +39,19 @@ class CaseInput:
         path: The drifted input file (CSV, JSON or Parquet).
         contract: The table contract the output must satisfy.
         reference: Parent key sets keyed ``"<table>.<column>"`` (``{}`` when there are no FKs).
+        run_id: The caller's run id (``sluice.runs.execute``), used as the run's own id by a
+            system that has one (the agent pipeline: events, ``meta["run_id"]``, transform
+            ids). ``None`` (evals): the system makes one up.
+        on_event: Live sink for the run's events, called with each event as it is emitted by a
+            system that can stream them (the agent pipeline). Systems that cannot ignore it;
+            their events (if any) are only in ``meta["events"]``.
     """
 
     path: Path
     contract: Contract
     reference: dict[str, set[Any]]
+    run_id: str | None = None
+    on_event: Callable[[EventModel], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
