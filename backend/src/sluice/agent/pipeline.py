@@ -166,6 +166,7 @@ from sluice.rules.fixers import (
 )
 from sluice.rules.profile import (
     Profile,
+    approx,
     contract_sources,
     magnitude,
     number_mask,
@@ -919,7 +920,8 @@ def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
     if not UNIT_FACTOR_MIN <= factor <= UNIT_FACTOR_MAX:
         return (
             f"the values are in paise, but the rewrite changed the median by a factor of "
-            f"{factor:.2f} (from {before.median:.2f} to {after.median:.2f}); divide every value "
+            f"{factor:.2f} (from {approx(before.median)} to {approx(after.median)}); divide "
+            "every value "
             f"by 100 unconditionally, without checking the column name (expected factor "
             f"{UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
         )

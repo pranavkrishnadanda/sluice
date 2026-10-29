@@ -1179,7 +1179,7 @@ def test_pipeline_profiled_reports_the_unit_issue(cases_dir: Path, orders_df: pl
     assert [i.column for i in units] == ["o_totalprice"]
     assert units[0].detail.startswith("values look like paise: 100% whole numbers")
     plan_prompt = script.roles("orchestrator")[0]  # re-asked: the empty plan omits the unit column
-    assert json.dumps(units[0].detail) in plan_prompt
+    assert json.dumps(units[0].detail, ensure_ascii=False) in plan_prompt
 
 
 def _lineitem_paise_case(cases_dir: Path, lineitem_df: pl.DataFrame, case_id: str) -> Case:
@@ -1594,3 +1594,12 @@ def test_unit_error_accepts_a_correct_rewrite_rounded_to_two_decimals() -> None:
     out = [f"{float(r) / 100:.2f}" for r in raw]
 
     assert pipeline._unit_error(pl.Series("p", raw), pl.Series("p", out)) is None
+
+
+def test_unit_error_median_message_shows_rounded_magnitudes_only() -> None:
+    raw = [str(1_000_000 + 1_371 * i) for i in range(101)]
+    error = pipeline._unit_error(pl.Series("p", raw), pl.Series("p", raw))  # nothing divided
+
+    assert error is not None and "factor" in error
+    assert "≈ 1.1 million" in error
+    assert not any(v in error for v in raw)

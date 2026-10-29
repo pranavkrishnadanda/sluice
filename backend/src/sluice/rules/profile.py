@@ -20,6 +20,7 @@ Complexity: O(rows x columns) for the null/distinct statistics, O(columns) for m
 vectorised O(rows) pass (and an O(rows log rows) median/quantile) per INR column.
 """
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Final
@@ -179,6 +180,24 @@ def magnitude(series: pl.Series) -> Magnitude | None:
     )
 
 
+_SCALES: Final = ((1e12, "trillion"), (1e9, "billion"), (1e6, "million"), (1e3, "thousand"))
+
+
+def approx(value: float) -> str:
+    """``value`` as a rough magnitude, e.g. ``"≈ 3.5 million"`` (two significant figures).
+
+    Used for data-derived numbers in user-facing text (``profiled`` issue details, worker
+    feedback), so no exact cell value can be read back from them.
+    """
+    if not math.isfinite(value):
+        return "≈ ?"
+    rounded = float(f"{value:.2g}")
+    for scale, name in _SCALES:
+        if abs(rounded) >= scale:
+            return f"≈ {rounded / scale:g} {name}"
+    return f"≈ {rounded:g}"
+
+
 def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
     """Why ``series`` looks like whole paise for an INR decimal column, else ``None``.
 
@@ -193,7 +212,7 @@ def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
         return None
     share = int(stats.whole_share * 100)  # floored: never shows 98% for 97.9%
     return (
-        f"values look like paise: {share}% whole numbers, median {stats.median:.0f}; "
+        f"values look like paise: {share}% whole numbers, median {approx(stats.median)}; "
         "expected INR with paise as decimals"
     )
 
