@@ -1102,3 +1102,33 @@ def test_pipeline_on_transform_not_called_for_an_attempt_without_code(indian: Ca
     hooked = [p["attempt"] for kind, p in trail if kind == "transform"]
     assert hooked == [2]
     assert [e.attempt for e in result.events("attempt_failed")] == [1]  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- H1: verifier stats
+
+
+DUPES = ("duplicate_rows", {"frac": 0.25})
+
+
+def verifier_stats(script: Script, call: int = 0) -> dict[str, Any]:
+    prompt = script.roles("verifier")[call]
+    return json.loads(prompt.rsplit("Statistics: ", 1)[1])
+
+
+def test_pipeline_verifier_stats_never_mix_raw_and_deduplicated_row_counts(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _build(cases_dir, orders_df, "dev-0101", [INDIAN, DUPES])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    result = run(case, script)
+
+    stats = verifier_stats(script)
+    assert "rows" not in stats  # the old ambiguous key mixed bases
+    assert stats["rows_raw"] == 50  # 40 rows + 10 duplicate copies
+    assert stats["rows_after_dedupe"] == 40
+    assert stats["non_null_after"] + stats["null_after"] == stats["rows_after_dedupe"]
+    assert stats["non_null_after"] == 40
+    assert stats["flagged_raw_after"] == 0
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    assert price_flags(result.out) == 0

@@ -647,7 +647,7 @@ def only_flagged(raw: pl.Series, out: pl.Series, flagged: set[int]) -> pl.Series
 class _Effect:
     error: str | None
     pairs: list[tuple[str, str | None]]
-    stats: dict[str, float | int | None]
+    stats: dict[str, float | int | str | None]
 
 
 def _effect(
@@ -674,13 +674,13 @@ def _effect(
     flagged_after = flagged_raw_rows(rewritten, contract, prof).get(spec.name, set())
     recovered = len(flagged_before - flagged_after)
     broken = sorted(flagged_after - flagged_before)
-    stats: dict[str, float | int | None] = {
-        "rows": raw.len(),
-        "flagged_before": len(flagged_before),
-        "flagged_after": len(flagged_after),
-        "recovered": recovered,
-        "newly_flagged": len(broken),
-        "changed": int((raw.ne_missing(out)).sum()),
+    stats: dict[str, float | int | str | None] = {
+        "rows_raw": raw.len(),
+        "flagged_raw_before": len(flagged_before),
+        "flagged_raw_after": len(flagged_after),
+        "recovered_raw": recovered,
+        "newly_flagged_raw": len(broken),
+        "changed_raw": int((raw.ne_missing(out)).sum()),
     }
     if broken:
         error = (
@@ -708,9 +708,18 @@ def _effect(
     return _Effect(None, pairs, stats)
 
 
-def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | None]:
-    """Non-null count and, for numeric columns, min / max / mean as floats."""
-    stats: dict[str, float | int | None] = {f"non_null_{label}": series.len() - series.null_count()}
+def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | str | None]:
+    """Counts over the deduplicated output column, plus min / max / mean for numeric columns.
+
+    ``series`` is a column of :func:`apply_rules`' output, so its counts are on the
+    deduplicated base (``rows_after_dedupe`` = ``non_null_<label>`` + ``null_<label>``), never on
+    the raw rows the ``*_raw`` counts use (Ruling H1).
+    """
+    stats: dict[str, float | int | str | None] = {
+        "rows_after_dedupe": series.len(),
+        f"non_null_{label}": series.len() - series.null_count(),
+        f"null_{label}": series.null_count(),
+    }
     if series.dtype.is_numeric() and series.null_count() < series.len():
         as_float = series.cast(pl.Float64)
         for name, value in (

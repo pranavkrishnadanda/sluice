@@ -147,3 +147,9 @@ def test_verify_node_prompt_contains_enum_and_omits_unset_fields() -> None:
     assert '"unit"' not in text
     assert '"min"' not in text
     assert '"max"' not in text
+
+
+def test_verifier_prompt_explains_each_row_count_base() -> None:
+    for key in ("rows_raw", "rows_after_dedupe", "non_null_after", "null_after"):
+        assert key in VERIFIER_SYSTEM_PROMPT
+    assert "duplicate" in VERIFIER_SYSTEM_PROMPT
