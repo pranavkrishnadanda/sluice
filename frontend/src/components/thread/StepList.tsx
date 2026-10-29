@@ -1,5 +1,6 @@
 import { CheckIcon, CrossIcon, RetryIcon } from "@/components/shell/icons";
 import type { RunViewState } from "@/lib/run-state";
+import { ActivityLine } from "./ActivityLine";
 import {
   buildSteps,
   STEP_STATUS_TEXT,
@@ -75,6 +76,10 @@ function StepRow({ step }: { step: Step }) {
               </span>
             )}
           </p>
+        )}
+        {step.activity && (
+          // Keyed by phase so each new phase rises in and restarts its clock.
+          <ActivityLine key={step.activity.seq} activity={step.activity} />
         )}
       </div>
       {step.chip && (
