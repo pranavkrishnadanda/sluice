@@ -95,6 +95,8 @@ AttributeError/TypeError: str.strip, str.lstrip, str.rstrip, str.lengths, Series
   .then(None).otherwise(values)).to_series()
 - per-cell Python: values.map_elements(fn, return_dtype=pl.String) (fn gets non-null cells)
 - end with String: .cast(pl.String); return pl.Series(values.name, cells, dtype=pl.String)
+- this is not pandas: there is no .mask/.where/.fillna/.astype and no string method directly on
+  a Series (always values.str.<method>); use pl.when, .fill_null() and .cast()
 """
 """Exact Polars 2.1 names for the worker (every name is checked against the installed polars)."""
 
@@ -129,6 +131,8 @@ POLARS_RENAMES: Final[dict[str, str]] = {
     "ljust": ".str.pad_end()",
     "rjust": ".str.pad_start()",
     "apply": ".map_elements(fn, return_dtype=pl.String)",
+    "mask": "pl.select(pl.when(cond).then(None).otherwise(values)).to_series()",
+    "where": "pl.select(pl.when(cond).then(values).otherwise(None)).to_series()",
 }
 """Attributes older Polars had -> their Polars 2.1 replacement (AttributeError hints)."""
 
@@ -142,19 +146,27 @@ POLARS_KEYWORDS: Final[dict[str, str]] = {
 }
 """Keywords older Polars accepted -> the Polars 2.1 spelling (TypeError hints)."""
 
-_NO_ATTRIBUTE = re.compile(r"AttributeError: .*? has no attribute '(\w+)'")
+_NO_ATTRIBUTE = re.compile(r"AttributeError: '(\w+)' object has no attribute '(\w+)'")
+_STR_METHODS: Final[frozenset[str]] = frozenset(
+    name for name in dir(pl.Series([], dtype=pl.String).str) if not name.startswith("_")
+)
+"""Public methods of the Polars string namespace (``.str``) of the installed polars."""
 _BAD_KEYWORD = re.compile(r"TypeError: .*?unexpected keyword argument '(\w+)'")
 
 
 def sandbox_hint(error: str) -> str | None:
     """A short fix for an AttributeError/TypeError from a renamed Polars API, else ``None``.
 
-    Only names in :data:`POLARS_RENAMES` / :data:`POLARS_KEYWORDS` get a hint: an unknown name
-    is not guessed at. O(len(error)); both patterns are linear (no nested quantifiers).
+    Only names in :data:`POLARS_RENAMES` / :data:`POLARS_KEYWORDS`, and string methods called on
+    a Series or Expr instead of its ``.str`` namespace, get a hint: an unknown name is not
+    guessed at. O(len(error)); both patterns are linear (no nested quantifiers).
     """
-    if (m := _NO_ATTRIBUTE.search(error)) is not None and m.group(1) in POLARS_RENAMES:
-        name = m.group(1)
-        return f"Polars 2.1 has no `.{name}`: use {POLARS_RENAMES[name]}"
+    if (m := _NO_ATTRIBUTE.search(error)) is not None:
+        owner, name = m.groups()
+        if name in POLARS_RENAMES:
+            return f"Polars 2.1 has no `.{name}`: use {POLARS_RENAMES[name]}"
+        if owner in ("Series", "Expr") and name in _STR_METHODS:
+            return f"`.{name}` is a string method: call it as `.str.{name}(...)`"
     if (m := _BAD_KEYWORD.search(error)) is not None and m.group(1) in POLARS_KEYWORDS:
         name = m.group(1)
         return f"Polars 2.1 has no `{name}=` keyword here: use {POLARS_KEYWORDS[name]}"

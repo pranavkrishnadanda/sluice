@@ -443,6 +443,9 @@ def test_worker_polars_reference_names_exist_in_the_installed_polars() -> None:
     for removed in ("strip", "lstrip", "rstrip", "lengths"):
         assert not hasattr(strings, removed)
     assert not hasattr(series, "apply")
+    for pandas_name in ("mask", "where", "fillna", "astype"):
+        assert not hasattr(series, pandas_name)
+    assert hasattr(series, "fill_null") and hasattr(series, "cast")
 
 
 @pytest.mark.parametrize(
@@ -497,3 +500,19 @@ def test_sandbox_feedback_puts_hint_and_last_line_before_a_long_traceback() -> N
     assert "strip_chars" in head
     assert "has no attribute 'strip'" in head
     assert sandbox_feedback("ValueError: boom (line 5)").startswith("ValueError: boom")
+
+
+@pytest.mark.parametrize(
+    ("error", "good"),
+    [
+        ("AttributeError: 'Series' object has no attribute 'replace_all'", ".str.replace_all"),
+        ("AttributeError: 'Expr' object has no attribute 'strip_chars'", ".str.strip_chars"),
+        ("AttributeError: 'Series' object has no attribute 'mask'", "pl.when("),
+        ("AttributeError: 'Series' object has no attribute 'where'", "pl.when("),
+    ],
+)
+def test_sandbox_hint_for_string_methods_called_off_the_str_namespace(
+    error: str, good: str
+) -> None:
+    hint = sandbox_hint(error)
+    assert hint is not None and good in hint
