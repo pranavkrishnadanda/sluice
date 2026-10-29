@@ -49,7 +49,11 @@ KEEPALIVE: Final = ": keep-alive\n\n"
 SSE_HEADERS: Final = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 """No caching, and no response buffering by nginx-style proxies."""
 MAX_SEQ: Final = 2**63 - 1
-"""Largest resume point (Postgres ``bigint``); larger ``Last-Event-ID`` values are ignored."""
+"""Largest resume point; larger ``Last-Event-ID`` values are ignored (replay from the start).
+
+``run_events.seq`` is a Postgres ``integer``; this bound only keeps the parsed value a 64-bit
+int (psycopg compares it with the column fine). A resume point above every stored ``seq`` just
+replays nothing."""
 _DIGITS: Final = re.compile(r"[0-9]{1,19}")
 
 router = APIRouter()
