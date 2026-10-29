@@ -6,7 +6,9 @@ States, in order (each one emits the contract event named after it, see ``docs/a
 1. **read** the file; ``run_started`` (with the row count).
 2. **map** (``propose_mapping`` -> ``apply_mapping``): the model renames source columns the
    deterministic matcher left over. No event of its own; its renames are listed in
-   ``rules_applied.actions``.
+   ``rules_applied.actions``. Before it, ``table_mismatch`` (Ruling H5) ends a run whose
+   column names clearly belong to another known table's contract: ``profiled``,
+   ``rules_applied``, then ``run_finished`` (``quarantined``, a plain summary), no model call.
 3. **rules pass 1** (``profile`` + ``apply_rules``); ``profiled``, ``rules_applied``. A file whose
    primary key cannot be found is quarantined whole here, exactly as the rules-only system does.
 4. **plan** (``candidate_columns`` -> ``propose_plan``); ``plan_created``. No candidates means no
@@ -111,7 +113,7 @@ from sluice.agent.events import (
     Verified,
 )
 from sluice.agent.events import PlanNode as EventPlanNode
-from sluice.agent.mapping import ColumnMapping, apply_mapping, propose_mapping
+from sluice.agent.mapping import ColumnMapping, apply_mapping, propose_mapping, table_mismatch
 from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
 from sluice.agent.worker import (
     clip,
@@ -120,7 +122,7 @@ from sluice.agent.worker import (
     sandbox_feedback,
     write_transform,
 )
-from sluice.contracts.model import ColumnSpec, Contract
+from sluice.contracts.model import ColumnSpec, Contract, known_contracts
 from sluice.contracts.validate import validate
 from sluice.evals.types import CaseInput, SystemOutput, pk_text
 from sluice.io import read_input
@@ -304,6 +306,15 @@ async def _pipeline(run: _Run) -> SystemOutput:
             rows=raw.height,
         )
     )
+
+    known = known_contracts(contract.version)
+    if (mismatch := table_mismatch(list(raw.columns), contract, known)) is not None:
+        # Ruling H5: clearly another known table's file. Stop before any model call.
+        empty = RuleResult(pl.DataFrame(), set(), set(), [])
+        run.emit(Profiled(issues=_issues(profile(raw, contract), empty, {}, None)))
+        actions = [f"file quarantined: {mismatch}"]
+        run.emit(RulesApplied(actions=actions))
+        return _quarantine_file(run, actions, None, [], None, mismatch, summary=mismatch)
 
     mapping: ColumnMapping | None = None
     frame = raw
@@ -999,13 +1010,17 @@ def _quarantine_file(
     outcomes: list[_NodeOutcome],
     mapping: ColumnMapping | None,
     reason: str,
+    *,
+    summary: str | None = None,
 ) -> SystemOutput:
     """Hold the whole input back, as the rules-only system does: empty output, no flags.
 
-    Used when the primary key cannot be found, and on the contract's failure path (a node's
-    final attempt failed). No ``verified``; ``run_finished`` has status ``quarantined``.
+    Used when the primary key cannot be found, on the contract's failure path (a node's
+    final attempt failed), and for a file of another known table (Ruling H5, which passes its
+    own plain ``summary``). No ``verified``; ``run_finished`` has status ``quarantined``.
     """
-    status, summary = _status_and_summary(run, None, outcomes, quarantine=reason)
+    status, default = _status_and_summary(run, None, outcomes, quarantine=reason)
+    summary = default if summary is None else summary
     _run_finished(run, status, summary)
     meta = _meta(run, actions, plan, outcomes, mapping, {})
     meta["file_quarantine_reason"] = reason

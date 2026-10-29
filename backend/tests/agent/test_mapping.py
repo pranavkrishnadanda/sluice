@@ -28,9 +28,10 @@ from sluice.agent.mapping import (
     apply_mapping,
     build_prompt,
     propose_mapping,
+    table_mismatch,
     validate_mapping,
 )
-from sluice.contracts.model import load_contract
+from sluice.contracts.model import known_contracts, load_contract
 from sluice.llm.client import LLM, LLMUnavailable
 from sluice.rules.profile import match_columns
 
@@ -446,3 +447,53 @@ def test_validate_mapping_string_target_has_no_fit_gate() -> None:
     df = orders_frame(o_comment="note").with_columns(pl.Series("note", ["1", "2"]))
 
     assert validate(df, ("note", "o_comment")).pairs["note"] == "o_comment"
+
+
+# ---------------------------------------------------------------- H5: table mismatch
+
+
+ORDERS_COLUMNS = [
+    "o_orderkey", "Custkey", "o_orderstatus", "amt", "o_orderdate", "o_ordertime",
+    "o_orderpriority", "o_clerk", "o_shippriority", "o_comment", "ingest_batch",
+]  # fmt: skip
+LINEITEM_COLUMNS = [
+    "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "Qty", "amount", "l_discount",
+    "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate",
+    "l_shipinstruct", "ship_mode", "l_comment", "batch_id",
+]  # fmt: skip
+
+
+def test_table_mismatch_orders_file_sent_to_lineitem() -> None:
+    lineitem, orders = load_contract("lineitem"), load_contract("orders")
+    reason = table_mismatch(ORDERS_COLUMNS, lineitem, [lineitem, orders])
+    assert reason == "this looks like an orders file, not lineitem; nothing loaded"
+
+
+def test_table_mismatch_lineitem_file_sent_to_orders() -> None:
+    lineitem, orders = load_contract("lineitem"), load_contract("orders")
+    reason = table_mismatch(LINEITEM_COLUMNS, orders, [lineitem, orders])
+    assert reason == "this looks like a lineitem file, not orders; nothing loaded"
+
+
+@pytest.mark.parametrize(
+    ("columns", "table"), [(ORDERS_COLUMNS, "orders"), (LINEITEM_COLUMNS, "lineitem")]
+)
+def test_table_mismatch_none_for_the_right_table(columns: list[str], table: str) -> None:
+    contracts = [load_contract("lineitem"), load_contract("orders")]
+    assert table_mismatch(columns, load_contract(table), contracts) is None
+
+
+def test_table_mismatch_none_when_the_chosen_table_still_matches_enough() -> None:
+    lineitem, orders = load_contract("lineitem"), load_contract("orders")
+    # 5 of 16 lineitem columns (31%) next to every orders column: not clearly the other table.
+    mixed = [*ORDERS_COLUMNS, "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_tax"]
+    assert table_mismatch(mixed, lineitem, [lineitem, orders]) is None
+
+
+def test_table_mismatch_none_when_no_other_table_matches_well() -> None:
+    lineitem, orders = load_contract("lineitem"), load_contract("orders")
+    assert table_mismatch(["a", "b", "o_orderkey"], lineitem, [lineitem, orders]) is None
+
+
+def test_known_contracts_lists_every_table_of_a_version() -> None:
+    assert sorted(c.name for c in known_contracts("v1")) == ["lineitem", "orders"]

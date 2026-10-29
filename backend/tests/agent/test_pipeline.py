@@ -1301,3 +1301,45 @@ def test_pipeline_routes_an_easy_rated_unit_node_to_the_strong_tier(
     assert plan_created.nodes[0].tier == "strong"  # type: ignore[attr-defined]
     assert [r.tier for r in result.llm.records if r.role == "worker"] == ["strong"]
     assert result.out.meta["nodes"][0]["difficulty"] == "hard"
+
+
+# --------------------------------------------------------------------------- H5: wrong table
+
+
+def test_pipeline_quarantines_an_orders_file_sent_to_lineitem_without_a_model_call(
+    medium: Case,
+) -> None:
+    script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN)
+    result = run(medium, script, contract=load_contract("lineitem"))
+
+    assert script.calls == []  # no LLM call at all
+    types = [e.type for e in result.log.events]  # type: ignore[attr-defined]
+    assert types == ["run_started", "profiled", "rules_applied", "run_finished"]
+    (finished,) = result.events("run_finished")
+    assert finished.status == "quarantined"  # type: ignore[attr-defined]
+    summary = "this looks like an orders file, not lineitem; nothing loaded"
+    assert finished.summary == summary  # type: ignore[attr-defined]
+    assert result.out.file_quarantined
+    assert result.out.df.is_empty()
+    assert result.out.meta["file_quarantine_reason"] == summary
+
+
+def test_pipeline_quarantines_a_lineitem_file_sent_to_orders(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    recipe = Recipe("lineitem", "easy", [], "csv", "utf-8", 40)
+    case = build_case("dev-0301", "dev", recipe, {"lineitem": lineitem_df}, 7, cases_dir)
+    script = Script()
+    result = run(case, script, contract=load_contract("orders"))
+
+    assert script.calls == []
+    (finished,) = result.events("run_finished")
+    assert finished.summary == "this looks like a lineitem file, not orders; nothing loaded"  # type: ignore[attr-defined]
+    assert result.out.file_quarantined
+
+
+def test_pipeline_does_not_flag_a_renamed_file_of_the_right_table(medium: Case) -> None:
+    script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    result = run(medium, script)
+    assert not result.out.file_quarantined
+    assert script.roles("mapper")
