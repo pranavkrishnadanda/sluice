@@ -6,8 +6,9 @@ import { expect, type Page } from "@playwright/test";
  * and the summary card that only renders once the run is finished.
  */
 export async function waitForFinishedRun(page: Page) {
+  // A created run's replay holds each activity phase so it can be read.
   await expect(page.getByText(/^Loaded [\d,]+ rows/)).toBeVisible({
-    timeout: 20_000,
+    timeout: 45_000,
   });
   await expect(page.getByText(/^Total cost /)).toBeVisible();
 }

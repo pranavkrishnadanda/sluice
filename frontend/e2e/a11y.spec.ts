@@ -42,6 +42,7 @@ async function afterLoad(page: Page, mode: Mode) {
  */
 const INCOMPLETE_LIMIT: Record<string, number> = {
   "Data tab": 1,
+  "Live run": 1,
   "Code tab, diff": 2,
   "Plan tab": 8,
   Evals: 1,
@@ -93,6 +94,30 @@ for (const colorScheme of ["light", "dark"] as const) {
           details.getByRole("list", { name: "Plan steps" }),
         ).toBeAttached();
         expectClean(await scan(page), mode, "Plan tab");
+      });
+
+      test(`${mode} glass: a live run's activity line and raw upload pass axe`, async ({
+        page,
+      }) => {
+        await beforeLoad(page, mode);
+        await page.goto("/runs");
+        const composer = page.getByRole("form", { name: "New pipeline run" });
+        await composer.getByLabel("Attach a file").setInputFiles({
+          name: "orders.csv",
+          mimeType: "text/csv",
+          buffer: Buffer.from("o_orderkey,o_totalprice\n1,10.00\n"),
+        });
+        await composer.getByRole("button", { name: "Start run" }).click();
+        await expect(page.getByTestId("activity-line")).toBeVisible({
+          timeout: 15_000,
+        });
+        await expect(
+          page
+            .getByRole("complementary", { name: "Details" })
+            .getByRole("table", { name: "Uploaded file" }),
+        ).toBeVisible();
+        await afterLoad(page, mode);
+        expectClean(await scan(page), mode, "Live run");
       });
 
       test(`${mode} glass: evals page passes axe`, async ({ page }) => {

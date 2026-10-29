@@ -28,9 +28,33 @@ test("a new upload streams to completion and exposes its code and plan", async (
 
   // The mock numbers created runs from 1 and replays the repaired fixture.
   await expect(page).toHaveURL(/\/runs\/run-1$/);
-  await waitForFinishedRun(page);
-
   const details = page.getByRole("complementary", { name: "Details" });
+
+  // The table was left on Auto: the thread says which one was matched.
+  await expect(page.getByText("Matched the orders table")).toBeVisible();
+
+  // Before the load, the Data tab shows the raw upload.
+  await expect(
+    details.getByRole("heading", { name: "Uploaded file (not loaded)" }),
+  ).toBeVisible();
+  await expect(
+    details.getByRole("table", { name: "Uploaded file" }),
+  ).toBeVisible();
+
+  // A live activity line says what is happening, and its clock ticks.
+  const activity = page.getByTestId("activity-line");
+  await expect(activity).toBeVisible({ timeout: 15_000 });
+  await expect(activity).toHaveText(/ · [1-9]\d* s$|retrying (in \d+ s|now)$/, {
+    timeout: 15_000,
+  });
+  // The rate-limit back-off counts down on the retrying step.
+  await expect(activity).toHaveText(/retrying in \d+ s$/, { timeout: 20_000 });
+
+  await waitForFinishedRun(page);
+  await expect(activity).toHaveCount(0);
+  await expect(
+    details.getByRole("table", { name: "Before and after values" }),
+  ).toBeVisible();
 
   await details.getByRole("tab", { name: "Code" }).click();
   const diff = details.getByRole("switch", {
