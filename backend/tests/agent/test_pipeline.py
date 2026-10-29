@@ -1554,3 +1554,43 @@ def test_pipeline_without_an_activity_sink_is_unchanged(indian: Case) -> None:
 
     assert "activity" not in [e.type for e in result.log.events]  # type: ignore[attr-defined]
     assert "activity" not in [e["type"] for e in result.out.meta["events"]]
+
+
+# --- U2: per-row ÷100 check for a unit node ---------------------------------------------------
+
+_PAISE_RAW = [str(1_000_000 + 1_371 * i) for i in range(100)]
+
+
+def _rupees(paise: str, divisor: int = 100) -> str:
+    return f"{int(paise) / divisor:.2f}"
+
+
+def _unit_error(out: list[str]) -> str | None:
+    return pipeline._unit_error(pl.Series("p", _PAISE_RAW), pl.Series("p", out))
+
+
+def test_unit_error_rejects_a_rewrite_that_leaves_a_fifth_of_the_rows_in_paise() -> None:
+    out = [p if i % 5 == 0 else _rupees(p) for i, p in enumerate(_PAISE_RAW)]
+
+    error = _unit_error(out)
+
+    assert error is not None
+    assert "20 row(s)" in error
+    assert "[0, 5, 10, 15, 20]" in error
+    assert not any(v in error for v in _PAISE_RAW)  # row indices only, never values
+
+
+def test_unit_error_rejects_a_rewrite_that_divides_some_rows_by_ten() -> None:
+    out = [_rupees(p, 10) if i % 10 < 3 else _rupees(p) for i, p in enumerate(_PAISE_RAW)]
+
+    error = _unit_error(out)
+
+    assert error is not None
+    assert "30 row(s)" in error
+
+
+def test_unit_error_accepts_a_correct_rewrite_rounded_to_two_decimals() -> None:
+    raw = [f"{p}.6" for p in _PAISE_RAW]  # fractional paise: ÷100 needs rounding
+    out = [f"{float(r) / 100:.2f}" for r in raw]
+
+    assert pipeline._unit_error(pl.Series("p", raw), pl.Series("p", out)) is None

@@ -26,8 +26,9 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    unit (the rules may parse paise rendered as ``12450050.00`` without flagging them). The
    fabrication guard still covers every row (destroyed tokens and nulls stay null), and the
    effect check instead requires that no cell becomes unparseable or loses its number and
-   that the column median shrinks by a factor in [80, 120] (≈ ÷100). Every other node keeps F2. Each
-   attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
+   that the column median shrinks by a factor in [80, 120] (≈ ÷100), and that every row which
+   is a number on both sides is raw / 100 to within 0.0051 (Ruling U2). Every other node keeps
+   F2. Each attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
    own reason). The attempt's transform record (when it produced code) goes to
    ``case.on_transform`` just before that event.
@@ -163,7 +164,14 @@ from sluice.rules.fixers import (
     cell_texts,
     flagged_raw_rows,
 )
-from sluice.rules.profile import Profile, contract_sources, magnitude, number_mask, profile
+from sluice.rules.profile import (
+    Profile,
+    contract_sources,
+    magnitude,
+    number_mask,
+    number_values,
+    profile,
+)
 from sluice.sandbox.runner import SandboxError, SandboxResult
 
 __all__ = ["MAX_TOKENS_PER_FILE", "MAX_WALL_S_PER_FILE", "PipelineDeps", "run_pipeline"]
@@ -176,6 +184,9 @@ MAX_ISSUE_DETAIL_CHARS: Final = 200
 UNIT_FACTOR_MIN: Final = 80.0
 UNIT_FACTOR_MAX: Final = 120.0
 """A unit node's rewrite must shrink the column median by a factor in this range (≈ ÷100)."""
+
+UNIT_ROW_TOLERANCE: Final = 0.0051
+"""Per row, a unit node's rewrite must be within this of raw / 100 (rounding to 2 decimals)."""
 
 Sandbox = Callable[[str, pl.Series], SandboxResult]
 
@@ -828,7 +839,9 @@ def _effect(
     Rejects a rewrite that makes the rules flag a cell they parsed before, and then, for an
     ordinary node, one that recovers no flagged cell. For a unit node (``unit``, Ruling H2c) the
     second check is instead :func:`_unit_error`: no cell that held a number may lose it, and the
-    median must shrink by a factor in [:data:`UNIT_FACTOR_MIN`, :data:`UNIT_FACTOR_MAX`].
+    median must shrink by a factor in [:data:`UNIT_FACTOR_MIN`, :data:`UNIT_FACTOR_MAX`], and
+    every row whose raw and rewritten cells are both numbers must be raw / 100 within
+    :data:`UNIT_ROW_TOLERANCE` (Ruling U2).
     Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a duplicate copy
     is never mistaken for a newly broken cell. Builds the verifier's evidence: raw ->
     rewritten pairs (flagged rows first, then other changed rows, at most
@@ -888,7 +901,10 @@ def _effect(
 def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
     """Why a unit node's rewrite (paise -> rupees, every row) is not a ÷100 rescale, or None.
 
-    Vectorised, O(rows) plus two medians. Counts are over raw rows.
+    Checks, in order: no number is lost; the median shrinks by ≈ 100 (the clearer message for
+    a rewrite that is wrong everywhere); every row where both sides are numbers is raw / 100
+    within :data:`UNIT_ROW_TOLERANCE` (Ruling U2; the error names a count and at most five row
+    indices, never values). Vectorised, O(rows) plus two medians. Counts are over raw rows.
     """
     lost = (number_mask(raw) & ~number_mask(out)).arg_true()
     if lost.len():
@@ -906,6 +922,15 @@ def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
             f"{factor:.2f} (from {before.median:.2f} to {after.median:.2f}); divide every value "
             f"by 100 unconditionally, without checking the column name (expected factor "
             f"{UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
+        )
+    # Ruling U2: the median alone lets a share of the rows stay in paise or be divided by 10.
+    # Every row where both sides are numbers must be raw / 100, give or take the rounding.
+    delta = (number_values(raw) / 100 - number_values(out)).abs()
+    bad = (delta > UNIT_ROW_TOLERANCE).fill_null(False).arg_true()
+    if bad.len():
+        return (
+            f"{bad.len()} row(s) are not the raw value divided by 100 (rows "
+            f"{bad.head(5).to_list()}); divide every value by 100 unconditionally"
         )
     return None
 

@@ -139,6 +139,12 @@ def number_mask(series: pl.Series) -> pl.Series:
     return _number_texts(series).str.contains(_NUMBER).fill_null(False)
 
 
+def number_values(series: pl.Series) -> pl.Series:
+    """Per row: the cell's number as ``Float64`` where :func:`number_mask` holds, else null."""
+    values = _number_texts(series).cast(pl.Float64, strict=False)
+    return pl.select(pl.when(number_mask(series)).then(values)).to_series()
+
+
 @dataclass(frozen=True, slots=True)
 class Magnitude:
     """Size statistics of the numbers in a column (absolute values; see :func:`magnitude`)."""
