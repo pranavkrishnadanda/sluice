@@ -91,6 +91,9 @@ export type IssueKind =
   | "rename" | "type" | "unit" | "timezone" | "date_format" | "format" | "encoding"
   | "whitespace" | "case" | "destroyed" | "duplicates" | "foreign_key"
   | "missing_column" | "extra_column";
+export type ActivityPhase =
+  | "mapping" | "planning" | "writing" | "sandbox" | "checking" | "verifying"
+  | "waiting" | "loading" | "previewing";
 
 export interface RunSummary {
   id: string; fileName: string; table: TableName;
@@ -109,7 +112,8 @@ export type RunEvent = EventBase & (
   | { type: "profiled"; issues: Issue[] }
   | { type: "rules_applied"; actions: string[] }
   | { type: "plan_created"; nodes: PlanNode[] }
-  | { type: "node_started"; nodeId: string; attempt: number; maxAttempts: number }
+  | { type: "node_started"; nodeId: string; attempt: number; maxAttempts: number;
+      tier?: ModelTier | null }                     // this attempt's tier; null/absent on old runs
   | { type: "attempt_failed"; nodeId: string; attempt: number; maxAttempts: number;
       error: string;                               // at most 2,000 characters
       tokens: number; costUsd: number }
@@ -119,6 +123,8 @@ export type RunEvent = EventBase & (
   | { type: "loaded"; rowsLoaded: number; rowsQuarantined: number; snapshotId: string }
   | { type: "run_finished"; status: Exclude<RunStatus, "queued" | "running">; summary: string;
       costUsd: number; tokens: number }
+  | { type: "activity"; nodeId: string | null; phase: ActivityPhase; message: string;
+      tier: ModelTier | null; attempt: number | null; retryInS: number | null }
 );
 export interface Transform {
   id: string; nodeId: string; attempt: number; language: "polars" | "sql"; code: string;
@@ -229,6 +235,40 @@ and no model was called.
 
 `node_started.maxAttempts` (equal to `attempt_failed.maxAttempts` for that
 node) lets the UI show "attempt 1/3" from the first attempt.
+`node_started.tier` is the tier that attempt runs on: a retry may escalate
+(`small` on attempt 1, `strong` after), so the UI shows the attempt's own
+tier rather than the planned `PlanNode.tier`. Runs stored before the field
+existed have no `tier` (or `null`); fall back to the planned tier.
+
+### Activity
+
+`activity` says what the run is busy with **right now**, so a long model or
+sandbox call never looks frozen. It is emitted once when each phase
+**starts** (never as a periodic heartbeat; the UI ticks its own timer from
+`at`), and it is stored and replayed like every other event (`seq` stays
+gapless). It may appear anywhere between `run_started` and `run_finished`
+and does not change the order of the other events.
+
+- `nodeId` is the plan node the phase belongs to, or `null` for run-wide
+  phases: `mapping` (schema mapping call), `planning` (planning call),
+  `loading` (writing to the warehouse) and `previewing` (building the
+  before/after preview).
+- Per-node phases, in the order an attempt goes through them: `writing`
+  (the worker model writes the fix), `sandbox` (the fix runs in the
+  sandbox), `checking` (the rewrite is checked against the rules),
+  `verifying` (the verifier model checks the result). `tier` and `attempt`
+  are set for these.
+- `waiting`: a rate-limit back-off before a model call is re-sent;
+  `retryInS` is the wait in whole seconds (`null` for every other phase).
+  When the wait ends, the interrupted phase is announced again.
+- `message` is short user-facing copy (at most 200 characters), e.g.
+  "Asking the strong model to write a fix for o_orderdate", "Running the
+  fix in the sandbox on 15,000 rows", "Rate limit reached on the small
+  model — retrying in 14 s", "Loading 15,000 rows into the warehouse". It
+  never contains prompts, model output, data values, paths or secrets.
+- The UI shows the latest `activity` (per node when `nodeId` is set, else
+  run-wide) until a later `activity`, a `node_finished` / `attempt_failed`
+  for that node, or a terminal event replaces it; `run_finished` clears all.
 
 Independent nodes run concurrently, so the events of different nodes may
 interleave; the order above holds per node.

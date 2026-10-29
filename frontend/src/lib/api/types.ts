@@ -33,6 +33,19 @@ export type IssueKind =
   | "foreign_key"
   | "missing_column"
   | "extra_column";
+/** What a run is busy with right now (`activity.phase`). */
+export type ActivityPhase =
+  | "mapping"
+  | "planning"
+  | "writing"
+  | "sandbox"
+  | "checking"
+  | "verifying"
+  | "waiting"
+  | "loading"
+  | "previewing";
+/** `activity.message` is at most this many characters. */
+export const MAX_ACTIVITY_MESSAGE_CHARS = 200;
 
 export interface RunSummary {
   id: string;
@@ -79,6 +92,11 @@ export type RunEvent = EventBase &
         attempt: number;
         /** Attempt budget for this node, known from its first attempt. */
         maxAttempts: number;
+        /**
+         * The tier this attempt runs on (a retry may escalate). Absent or
+         * `null` on runs stored before the field existed: use the planned tier.
+         */
+        tier?: ModelTier | null;
       }
     | {
         type: "attempt_failed";
@@ -114,6 +132,19 @@ export type RunEvent = EventBase &
         summary: string;
         costUsd: number;
         tokens: number;
+      }
+    | {
+        /** Emitted when a phase starts; never a periodic heartbeat. */
+        type: "activity";
+        /** The plan node, or `null` for run-wide phases. */
+        nodeId: string | null;
+        phase: ActivityPhase;
+        /** Short user-facing copy; never data values, prompts or paths. */
+        message: string;
+        tier: ModelTier | null;
+        attempt: number | null;
+        /** Rate-limit wait in whole seconds, set only for `waiting`. */
+        retryInS: number | null;
       }
   );
 export interface Transform {

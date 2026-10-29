@@ -494,7 +494,9 @@ async def _run_node(
         tier = planning.route_tier(node, attempt)
         outcome.attempts, outcome.tier = attempt, tier
         started = run.deps.clock()
-        run.emit(NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS))
+        run.emit(
+            NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS, tier=tier)
+        )
         records: list[CallRecord] = []
         error, rewritten = await _traced_attempt(
             run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,

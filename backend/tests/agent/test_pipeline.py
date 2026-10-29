@@ -1367,3 +1367,15 @@ def test_pipeline_paise_factor_error_tells_the_worker_to_divide_unconditionally(
     result = run(case, script)
     (failed,) = result.events("attempt_failed")
     assert "unconditionally" in failed.error  # type: ignore[attr-defined]
+
+
+# --- round 2: node_started.tier ---------------------------------------------------------------
+
+
+def test_pipeline_node_started_carries_the_attempts_tier(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+
+    result = run(indian, script)
+
+    tiers = [(e.attempt, e.tier) for e in result.events("node_started")]  # type: ignore[attr-defined]
+    assert tiers == [(1, "small"), (2, "strong")]  # an easy node escalates on its retry
