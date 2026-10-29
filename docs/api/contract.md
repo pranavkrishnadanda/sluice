@@ -328,6 +328,11 @@ is loaded: the run ends `quarantined` (no `verified`, no `loaded`) with the
 summary "values in <column> look like paise and could not be repaired;
 nothing loaded". This also takes precedence over `failed`: loading values
 that are 100 times too large is worse than loading nothing.
+The paise check only looks at the share of whole numbers (at least 98% of
+the values, with at least 50 values): a genuine INR column that is almost
+all whole-rupee amounts (`1500`, `2300`) is reported as paise as well, and
+is held back unless the agent's repair is accepted. This is a known
+limitation.
 
 **Exactly one terminal event.** Every run ends with exactly one
 `run_finished`, whatever happens: a worker crash, a model-provider outage

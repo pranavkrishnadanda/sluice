@@ -16,6 +16,11 @@ the profile also reports, in ``unit_issues``, values that look like whole paise 
 ``unit_paise``: rupees x 100 with no fractional part). It is a report only: the rules never act
 on it, so :func:`sluice.rules.fixers.apply_rules` output does not depend on it.
 
+Known limitation (deliberate, H2a): the check only sees the share of whole numbers, never the
+unit, so a genuine INR column in which at least 98% of the amounts are whole rupees (``1500``,
+``2300``) is reported as paise too. With Ruling U1 such a file is then quarantined whole unless
+a unit node is accepted. The contracts' money columns carry paise as decimals, so this is rare.
+
 Complexity: O(rows x columns) for the null/distinct statistics, O(columns) for matching, plus one
 vectorised O(rows) pass (and an O(rows log rows) median/quantile) per INR column.
 """
@@ -203,7 +208,8 @@ def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
 
     Fires when at least :data:`UNIT_MIN_VALUES` cells parse and at least
     :data:`UNIT_WHOLE_SHARE` of them are whole numbers (Ruling H2a). Genuine rupee amounts
-    carry paise as decimals, so almost none of them are whole.
+    carry paise as decimals, so almost none of them are whole. Limitation: a genuine INR column
+    of mostly whole-rupee amounts is reported too (see the module docstring).
     """
     if spec.unit != UNIT_CHECKED or spec.dtype != "decimal":
         return None

@@ -176,3 +176,11 @@ def test_profile_unit_issue_never_shows_an_exact_median(orders: Contract) -> Non
     prices = _paise(61)  # odd count: the median is an actual cell
     detail = profile(_orders_frame(prices), orders).unit_issues["o_totalprice"]
     assert not any(p in detail for p in prices)
+
+
+def test_profile_reports_a_genuine_whole_rupee_column_as_paise_known_limitation(
+    orders: Contract,
+) -> None:
+    """Pins today's behaviour: H2a cannot tell whole rupees from whole paise (documented)."""
+    whole_rupees = [str(1_500 + 50 * i) for i in range(60)]  # real INR, no paise at all
+    assert "o_totalprice" in profile(_orders_frame(whole_rupees), orders).unit_issues
