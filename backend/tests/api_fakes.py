@@ -24,6 +24,16 @@ SHA = "c" * 64
 CREATED = "2026-10-27T10:14:00.000Z"
 
 
+class FakeWorkerLock:
+    """``RunStore.try_worker_lock``'s handle: records its release."""
+
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
 class FakeStore:
     """In-memory ``RunStore``: same validation of seq uniqueness and terminal status."""
 
@@ -39,6 +49,9 @@ class FakeStore:
         """Store the event, then raise as if the connection dropped before the commit ack."""
         self.fail_transform = False
         self.fail_save = False
+        self.worker_lock_taken = False
+        """Another API process holds the worker lock (``try_worker_lock`` returns ``None``)."""
+        self.worker_locks: list[FakeWorkerLock] = []
 
     def add(self, run_id: str, *, status: str = "queued", cost: float = 0.0) -> None:
         self.runs[run_id] = RunRow(
@@ -55,6 +68,13 @@ class FakeStore:
             finished_at=None,
         )
         self.events[run_id] = []
+
+    def try_worker_lock(self) -> FakeWorkerLock | None:
+        if self.worker_lock_taken:
+            return None
+        lock = FakeWorkerLock()
+        self.worker_locks.append(lock)
+        return lock
 
     def claim_next(self) -> RunRow | None:
         with self.lock:

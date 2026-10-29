@@ -15,6 +15,9 @@ dependency; connect cost is ~1-3 ms locally). Every transaction bounds its waits
 ``sluice.load.iceberg``: transaction-local ``lock_timeout`` and ``statement_timeout``. All SQL
 is static and parameterised.
 
+The one long-lived connection is the worker lock's (:meth:`RunStore.try_worker_lock`): a
+session-level advisory lock that lets only one API process per schema recover and run jobs.
+
 Arguments are validated before any connection is opened, so bad input never reaches Postgres.
 Methods are blocking; call them from a worker thread (``asyncio.to_thread``) in async code.
 """
@@ -44,6 +47,7 @@ MAX_LIST_LIMIT: Final = 1000
 MAX_FILE_NAME_CHARS: Final = 255
 TERMINAL_STATUSES: Final = frozenset(get_args(FinalStatus))
 _DDL_LOCK: Final = advisory_key("sluice.api.store.ddl")
+WORKER_LOCK_NAME: Final = "sluice.api.worker"
 _SET_CONFIG: Final = "SELECT set_config(%s, %s, true)"
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -257,6 +261,31 @@ def _row(rec: TupleRow) -> RunRow:
 # --------------------------------------------------------------------------------------------
 
 
+class WorkerLock:
+    """A held worker lock: a session advisory lock on its own open connection.
+
+    Postgres releases it when the connection ends, so a crashed process never keeps it. If the
+    connection drops while the process runs (Postgres restarted), the lock is gone silently;
+    a second process could then take it (v1 runs one process, so this is only a safety net).
+    """
+
+    __slots__ = ("_conn", "_key")
+
+    def __init__(self, conn: psycopg.Connection, key: int) -> None:
+        self._conn = conn
+        self._key = key
+
+    def release(self) -> None:
+        """Unlock and close the connection (best effort: closing alone releases it too)."""
+        try:
+            if not self._conn.closed:
+                self._conn.execute("SELECT pg_advisory_unlock(%s)", (self._key,))
+        except psycopg.Error:
+            pass
+        finally:
+            self._conn.close()
+
+
 class RunStore:
     """Postgres-backed store of API runs. Thread-safe: no state is shared between calls."""
 
@@ -284,6 +313,27 @@ class RunStore:
         with self._tx() as conn:
             cur = conn.execute(sql, params)
             return cur.fetchall() if cur.description else []
+
+    def try_worker_lock(self) -> WorkerLock | None:
+        """Take the job-worker lock of this store's schema, or ``None`` if another holds it.
+
+        Non-blocking (``pg_try_advisory_lock``). The key is derived from
+        :data:`WORKER_LOCK_NAME` and ``current_schema()``, so isolated test schemas never
+        contend with each other or with a dev API. The returned handle keeps its connection
+        open until :meth:`WorkerLock.release`.
+        """
+        conn = psycopg.connect(self._dsn, connect_timeout=PG_CONNECT_TIMEOUT_S, autocommit=True)
+        try:
+            schema_row = conn.execute("SELECT current_schema()").fetchone()
+            key = advisory_key(WORKER_LOCK_NAME, str(schema_row[0] if schema_row else ""))
+            got = conn.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()
+        except BaseException:
+            conn.close()
+            raise
+        if not (got and got[0]):
+            conn.close()
+            return None
+        return WorkerLock(conn, key)
 
     def ensure_schema(self) -> None:
         """Create the tables and index if missing; concurrent callers are serialised."""

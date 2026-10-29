@@ -41,7 +41,7 @@ from sluice.api.errors import error_response as error_response
 from sluice.api.hub import EventHub
 from sluice.api.routes_events import router as events_router
 from sluice.api.settings import ApiSettings
-from sluice.api.store import RunStore
+from sluice.api.store import RunStore, WorkerLock
 from sluice.api.worker import ExecuteFn, Worker
 from sluice.runs.execute import execute_run
 from sluice.settings import get_settings
@@ -239,6 +239,10 @@ class OriginGuardMiddleware:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create the event hub; with the worker enabled, recover interrupted runs, then start it.
 
+    The worker first takes the store's worker lock (:meth:`RunStore.try_worker_lock`), held
+    until shutdown. If another API process holds it, this one logs an error and starts no
+    worker: recovering would close the other process's running runs.
+
     A store or blob store not injected is built from the service settings (``make api``):
     :class:`RunStore` on the stack Postgres (schema ensured) and :class:`S3BlobStore` on the
     landing bucket. Both are built in a thread: each does blocking I/O.
@@ -246,11 +250,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     state = app.state
     state.hub = EventHub()
     state.worker = None
+    lock: WorkerLock | None = None
     if state.worker_enabled:
         if state.store is None:
             store = RunStore(get_settings().postgres_dsn)
             await asyncio.to_thread(store.ensure_schema)
             state.store = store
+        lock = await asyncio.to_thread(state.store.try_worker_lock)
+    if lock is not None:
         if state.blobs is None:
             state.blobs = await asyncio.to_thread(
                 S3BlobStore.from_settings, get_settings(), state.settings.landing_bucket
@@ -265,11 +272,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await worker.recover()
         await worker.start()
         state.worker = worker
+    elif state.worker_enabled:
+        logger.error(
+            "another API process holds the worker lock: this process serves requests but "
+            "recovers and runs no jobs (run a single API process: make api, --workers 1)"
+        )
     try:
         yield
     finally:
         if state.worker is not None:
             await state.worker.stop()
+        if lock is not None:
+            await asyncio.to_thread(lock.release)
 
 
 def create_app(

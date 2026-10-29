@@ -4,9 +4,11 @@ recovered first, then queued runs are executed, and the worker stops on shutdown
 ``TestClient`` runs the lifespan in-process; nothing binds a port.
 """
 
+import logging
 import time
 from pathlib import Path
 
+import pytest
 from api_fakes import FakeStore, happy, scripted
 from fastapi.testclient import TestClient
 
@@ -58,3 +60,37 @@ def test_lifespan_recovers_interrupted_runs_then_runs_queued_ones(tmp_path: Path
     assert restart.summary == RESTART_SUMMARY
     assert [r for (r, _s, _c) in store.finished] == ["old", "new"]
     assert store.types("new") == ["run_started", "rules_applied", "run_finished"]
+
+
+def test_lifespan_takes_the_worker_lock_and_releases_it_on_shutdown(tmp_path: Path) -> None:
+    store = FakeStore()
+    app = create_app(settings=ApiSettings(), store=store, blobs=LocalBlobStore(tmp_path))  # type: ignore[arg-type]
+    with TestClient(app):
+        (lock,) = store.worker_locks
+        assert isinstance(app.state.worker, Worker)
+        assert lock.released is False
+    assert lock.released is True
+
+
+def test_lifespan_with_the_worker_lock_taken_neither_recovers_nor_starts_a_worker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A second API process must not close the first one's running runs (Minor 7)."""
+    store = FakeStore()
+    store.worker_lock_taken = True
+    store.add("theirs", status="running")
+    store.add("queued")
+    app = create_app(
+        settings=ApiSettings(),
+        store=store,  # type: ignore[arg-type]
+        blobs=LocalBlobStore(tmp_path),
+        execute=scripted(happy("queued")),
+    )
+    with caplog.at_level(logging.ERROR, logger="sluice.api.app"), TestClient(app) as client:
+        assert app.state.worker is None
+        assert client.get("/healthz").status_code == 200  # still serves requests
+        time.sleep(0.1)
+    assert store.finished == []  # "theirs" not recovered, "queued" not run here
+    assert store.runs["theirs"].status == "running"
+    assert store.runs["queued"].status == "queued"
+    assert any("worker lock" in r.getMessage() for r in caplog.records)
