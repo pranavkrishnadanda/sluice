@@ -74,6 +74,20 @@ def format_event(event: EventModel) -> str:
     return f"id: {event.seq}\ndata: {event.to_json()}\n\n"
 
 
+async def _log_missing_terminal(run_id: str, last_sent: int, store: RunStore) -> None:
+    """Closing a finished run's stream without a ``run_finished`` after ``last_sent``.
+
+    Normal when the client resumed past the end (its ``run_finished`` is stored at or before
+    ``last_sent``). A terminal status with no stored ``run_finished`` at all breaks the
+    worker's invariant (Ruling R4), so it is a warning. Rare branch: one extra read.
+    """
+    events = await asyncio.to_thread(store.events_after, run_id, 0)
+    if any(isinstance(event, RunFinished) for event in events):
+        _log.debug("run %s is finished; resumed after its run_finished (seq %d)", run_id, last_sent)
+    else:
+        _log.warning("run %s has a terminal status but no run_finished is stored", run_id)
+
+
 async def _stream(
     run_id: str, resume: int, store: RunStore, hub: EventHub, keepalive_s: float
 ) -> AsyncIterator[str]:
@@ -91,7 +105,7 @@ async def _stream(
             if row is None or row.status in TERMINAL_STATUSES:
                 # Already sent (resume past the end) or, abnormally, never stored: either way
                 # nothing more will come, so close instead of sending keep-alives forever.
-                _log.debug("run %s is finished; no run_finished after seq %d", run_id, last_sent)
+                await _log_missing_terminal(run_id, last_sent, store)
                 return
             live = aiter(sub)
             while True:

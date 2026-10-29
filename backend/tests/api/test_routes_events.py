@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -180,13 +181,14 @@ class _Stream:
 def test_events_unknown_run_returns_404_contract_body() -> None:
     async def go() -> httpx.Response:
         async with _app(FakeStore()) as app:
-            return await _get(app, "/runs/nope/events")
+            return await _get(app, "/runs/nope/events", {"Origin": UI_ORIGIN})
 
     res = _run(go)
 
     assert res.status_code == 404
     assert res.headers["content-type"].startswith("application/json")
     assert res.json() == {"detail": "Run not found.", "code": "not_found"}
+    assert res.headers["access-control-allow-origin"] == UI_ORIGIN  # error responses too
 
 
 def test_events_invalid_run_id_returns_404() -> None:
@@ -465,3 +467,38 @@ def test_events_finished_run_without_stored_terminal_closes_instead_of_hanging()
             return await _get(app, "/runs/run-a/events")
 
     assert [e["id"] for e in _events(_run(go).text)] == [1, 2]
+
+
+def test_events_terminal_status_without_run_finished_is_logged_as_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _store_with("run-a", _history("run-a")[:2], "failed")
+
+    async def go() -> httpx.Response:
+        async with _app(store) as app:
+            return await _get(app, "/runs/run-a/events")
+
+    with caplog.at_level(logging.DEBUG, logger="sluice.api.routes_events"):
+        _run(go)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "no run_finished" in warnings[0].getMessage()
+
+
+def test_events_resume_past_the_end_of_a_finished_run_is_not_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _store_with("run-a", _history("run-a"), "succeeded")
+
+    async def go() -> httpx.Response:
+        async with _app(store) as app:
+            return await _get(app, "/runs/run-a/events", {"Last-Event-ID": "3"})
+
+    with caplog.at_level(logging.DEBUG, logger="sluice.api.routes_events"):
+        body = _run(go).text
+    assert _events(body) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_keepalive_default_is_well_inside_the_contract_bound() -> None:
+    assert ApiSettings().keepalive_s == 10.0  # the contract: at least every 15 s
