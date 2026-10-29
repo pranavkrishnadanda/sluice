@@ -29,6 +29,7 @@ from pipeline_fakes import (
     ISO_DATES,
     NO_TRANSFORM,
     NOOP,
+    OLD_STRIP,
     STRIP_COMMAS,
     TOKENS_PER_CALL,
     FakeSandbox,
@@ -1266,3 +1267,21 @@ def test_pipeline_verifier_gets_no_magnitude_stats_for_a_date_column(two_columns
     script = Script(plan=plan, workers={"o_orderdate": [ISO_DATES]})
     run(two_columns, script)
     assert "median_before" not in verifier_stats(script)
+
+
+# --------------------------------------------------------------------------- H3: API hints
+
+
+def test_pipeline_feeds_a_polars_rename_hint_first_after_a_sandbox_attribute_error(
+    indian: Case,
+) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [OLD_STRIP, STRIP_COMMAS]})
+    result = run(indian, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert failed.error.startswith("sandbox: ")  # type: ignore[attr-defined]
+    prompt = script.roles("worker")[1]
+    previous = prompt.split("Previous attempt error: ", 1)[1][:400]
+    assert "strip_chars" in previous and "has no attribute 'strip'" in previous
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]

@@ -113,7 +113,13 @@ from sluice.agent.events import (
 from sluice.agent.events import PlanNode as EventPlanNode
 from sluice.agent.mapping import ColumnMapping, apply_mapping, propose_mapping
 from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
-from sluice.agent.worker import clip, guard_output, precheck_code, write_transform
+from sluice.agent.worker import (
+    clip,
+    guard_output,
+    precheck_code,
+    sandbox_feedback,
+    write_transform,
+)
 from sluice.contracts.model import ColumnSpec, Contract
 from sluice.contracts.validate import validate
 from sluice.evals.types import CaseInput, SystemOutput, pk_text
@@ -615,7 +621,7 @@ async def _attempt(
         outcome.stop = "the sandbox is unavailable"
         return f"sandbox unavailable ({type(exc).__name__})", None
     if not result.ok or result.values is None:
-        return f"sandbox: {result.error or 'no output'}", None
+        return f"sandbox: {sandbox_feedback(result.error or 'no output')}", None
     out = result.values
     if out.dtype == pl.Null:  # Ruling W2: an all-null output is a String column of nulls
         out = out.cast(pl.String)

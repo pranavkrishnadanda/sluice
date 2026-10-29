@@ -54,6 +54,13 @@ ISO_DATES = _module(
 )
 DIVIDE_100 = _module("    return values  # canned: paise -> rupees (see _paise_to_rupees)")
 DIVIDE_100_LOSSY = _module("    return values  # canned: paise -> rupees, every 2nd value dropped")
+OLD_STRIP = _module("    return values.str.strip()  # Polars 0.x name: fails in 2.1")
+OLD_STRIP_ERROR = (
+    "Traceback (most recent call last):\n"
+    + '  File "/usr/local/lib/python3.14/site-packages/polars/series/utils.py", line 95\n' * 40
+    + "AttributeError: 'ExprStringNameSpace' object has no attribute 'strip'. Did you mean: "
+    "'strip_chars'?"
+)
 NO_TRANSFORM = "import polars as pl\n\nx = 1\n"  # fails precheck: no `def transform`
 DOWN = "<provider outage>"  # a worker queue entry that makes that call fail with HTTP 503
 
@@ -95,6 +102,7 @@ CANNED: dict[str, Callable[[pl.Series], SandboxResult]] = {
     DIVIDE_100_LOSSY: lambda v: SandboxResult(True, _paise_to_rupees(v, lossy=True), None, 3),
     STRIP_COMMAS: lambda v: SandboxResult(True, _strip_commas(v), None, 3),
     CRASH: lambda v: SandboxResult(False, None, "ValueError: boom (line 5)", 3),
+    OLD_STRIP: lambda v: SandboxResult(False, None, OLD_STRIP_ERROR, 3),
     FILL_ZERO: lambda v: SandboxResult(True, pl.Series(["0.00"] * v.len()), None, 3),
     ALL_NULL: lambda v: SandboxResult(True, pl.Series([None] * v.len()), None, 3),
     NOOP: lambda v: SandboxResult(True, v, None, 3),
