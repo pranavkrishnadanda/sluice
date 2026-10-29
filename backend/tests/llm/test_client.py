@@ -13,8 +13,9 @@ import httpx
 import httpx2
 import pytest
 import respx
+from model_fakes import output_part
 from pydantic import BaseModel, Field
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -56,12 +57,36 @@ class RespxBridge(httpx2.AsyncBaseTransport):
         )
 
 
-def proxy_llm(router: respx.Router) -> LLM:
+def proxy_llm(router: respx.Router, **kwargs: Any) -> LLM:
     client = httpx2.AsyncClient(transport=RespxBridge(router))
-    return LLM(BASE_URL, API_KEY, http_client=client)
+    return LLM(BASE_URL, API_KEY, http_client=client, **kwargs)
 
 
 def completion(arguments: dict[str, Any], *, prompt_tokens: int, completion_tokens: int) -> dict:
+    """An OpenAI chat completion whose content is the JSON object (native structured output)."""
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1_761_609_600,
+        "model": "strong",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": json.dumps(arguments)},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def tool_completion(
+    arguments: dict[str, Any], *, prompt_tokens: int, completion_tokens: int
+) -> dict:
     """An OpenAI chat completion whose only content is a call to Pydantic AI's output tool."""
     return {
         "id": "chatcmpl-1",
@@ -97,13 +122,12 @@ def completion(arguments: dict[str, Any], *, prompt_tokens: int, completion_toke
 
 
 def scripted(*outputs: dict[str, Any], in_tok: int = 50, out_tok: int = 10) -> FunctionModel:
-    """A FunctionModel that answers each request with the next output-tool call in `outputs`."""
+    """A FunctionModel that answers each request with the next structured output in `outputs`."""
     queue = list(outputs)
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        tool = info.output_tools[0].name
         return ModelResponse(
-            parts=[ToolCallPart(tool, json.dumps(queue.pop(0)))],
+            parts=[output_part(info, json.dumps(queue.pop(0)))],
             usage=RequestUsage(input_tokens=in_tok, output_tokens=out_tok),
         )
 
@@ -402,3 +426,383 @@ def test_request_timeout_is_below_the_per_file_wall_cap() -> None:
     llm = LLM(BASE_URL, API_KEY)
     assert llm._http.timeout.read == REQUEST_TIMEOUT_S
     run(llm.aclose())
+
+
+# ---------------------------------------------------------------- structured-output mode (gpt-oss)
+
+PARSE_FAILED = {
+    # LiteLLM 1.106.5 relaying Groq's 400 when gpt-oss wrote prose instead of the structured output
+    "error": {
+        "message": (
+            'litellm.BadRequestError: GroqException - {"error":{"message":"Parsing failed. The '
+            'model generated output that could not be parsed.","type":'
+            '"invalid_request_error","code":"output_parse_failed",'
+            f'"failed_generation":"We need to write a transform function {API_KEY}"}}}}'
+        ),
+        "type": None,
+        "param": None,
+        "code": "400",
+    }
+}
+
+
+def _parse_failed() -> httpx.Response:
+    return httpx.Response(400, json=PARSE_FAILED)
+
+
+def _ok() -> httpx.Response:
+    return httpx.Response(200, json=completion(OK, prompt_tokens=7, completion_tokens=3))
+
+
+def test_default_output_mode_sends_json_schema_response_format_and_no_tools() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+
+    out, _ = run(proxy_llm(router).run("mapper", "strong", "s", "p", Answer))
+
+    body = json.loads(route.calls.last.request.content)
+    assert out == Answer(**OK)
+    assert body["response_format"]["type"] == "json_schema"
+    assert set(body["response_format"]["json_schema"]["schema"]["properties"]) == {
+        "column",
+        "confidence",
+    }
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+def test_tool_output_mode_sends_the_output_tool() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, json=tool_completion(OK, prompt_tokens=1, completion_tokens=1)
+        )
+    )
+
+    out, _ = run(proxy_llm(router, output_mode="tool").run("mapper", "strong", "s", "p", Answer))
+
+    body = json.loads(route.calls.last.request.content)
+    assert out == Answer(**OK)
+    assert body["tools"][0]["function"]["name"] == "final_result"
+    assert "response_format" not in body
+
+
+def test_output_parse_failed_is_retried_once_with_a_json_only_nudge() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[_parse_failed(), _ok()]
+    )
+    llm = proxy_llm(router)
+
+    out, record = run(llm.run("worker", "small", "s", "map amt", Answer))
+
+    assert out == Answer(**OK)
+    assert route.call_count == 2
+    retried = json.dumps(json.loads(route.calls.last.request.content)["messages"])
+    assert "only the JSON object" in retried
+    assert (record.input_tokens, record.output_tokens) == (7, 3)
+    assert record.rejected_attempts == 1  # the 400 attempt returned no usage; counted, not priced
+    assert llm.records == [record]
+
+
+def test_output_parse_failed_twice_raises_output_error_not_unavailable() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_parse_failed())
+    llm = proxy_llm(router)
+
+    with pytest.raises(LLMOutputError) as caught:
+        run(llm.run("worker", "small", "s", "p", Answer))
+
+    assert route.call_count == 2
+    assert caught.value.record is not None
+    assert caught.value.record.rejected_attempts == 2
+    assert (caught.value.record.input_tokens, caught.value.record.output_tokens) == (0, 0)
+    assert llm.records == [caught.value.record]
+    assert "output_parse_failed" in str(caught.value)
+    assert_no_key_reachable(caught.value)
+
+
+def test_other_400_is_still_unavailable_and_not_retried() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=httpx.Response(400, json={"error": {"message": "bad model", "code": "400"}})
+    )
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert caught.value.status_code == 400
+    assert route.call_count == 1
+
+
+def test_native_output_sends_strict_false_for_groq_best_effort_mode() -> None:
+    # Groq strict mode rejects schemas with optional fields; best-effort accepts any schema.
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+
+    run(proxy_llm(router).run("mapper", "strong", "s", "p", Answer))
+
+    schema = json.loads(route.calls.last.request.content)["response_format"]["json_schema"]
+    assert schema["strict"] is False
+
+
+def test_json_validate_failed_is_also_a_retryable_generation_error() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[
+            httpx.Response(
+                400,
+                json={"error": {"message": "GroqException - json_validate_failed", "code": "400"}},
+            ),
+            _ok(),
+        ]
+    )
+
+    out, _ = run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert out == Answer(**OK)
+    assert route.call_count == 2
+
+
+def test_prompted_output_mode_puts_the_schema_in_the_prompt() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+
+    out, _ = run(
+        proxy_llm(router, output_mode="prompted").run("mapper", "strong", "s", "p", Answer)
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert out == Answer(**OK)
+    assert "confidence" in json.dumps(body["messages"])
+    assert "tools" not in body
+    assert body.get("response_format", {}).get("type") != "json_schema"
+
+
+def test_record_of_a_clean_call_has_no_rejected_attempts() -> None:
+    llm = LLM(BASE_URL, API_KEY, model_override=scripted(OK))
+
+    _, record = run(llm.run("mapper", "strong", "s", "p", Answer))
+
+    assert record.rejected_attempts == 0
+
+
+# ---------------------------------------------------------------- generation-error matching
+
+
+def _error_400(code: str | None, message: str) -> httpx.Response:
+    error: dict[str, Any] = {"message": message, "type": "invalid_request_error"}
+    if code is not None:
+        error["code"] = code
+    return httpx.Response(400, json={"error": error})
+
+
+def test_structured_groq_code_is_matched_without_reading_the_message() -> None:
+    # Groq reached directly (no proxy): the code is a field, the message says nothing useful.
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[_error_400("output_parse_failed", "Parsing failed."), _ok()]
+    )
+
+    out, _ = run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert out == Answer(**OK)
+    assert route.call_count == 2
+
+
+def test_structured_code_wins_over_a_message_mentioning_a_generation_code() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=_error_400(
+            "context_length_exceeded", "prompt too long (earlier: output_parse_failed)"
+        )
+    )
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert caught.value.status_code == 400
+    assert route.call_count == 1
+
+
+def test_context_length_exceeded_400_is_unavailable_and_not_retried() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=_error_400(
+            "400",
+            "litellm.ContextWindowExceededError: GroqException - "
+            '{"error":{"message":"Please reduce the length of the messages",'
+            '"code":"context_length_exceeded"}}',
+        )
+    )
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert caught.value.status_code == 400
+    assert route.call_count == 1
+
+
+def test_401_is_unavailable_and_not_retried() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            401, json={"error": {"message": "invalid key", "code": "invalid_api_key"}}
+        )
+    )
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert caught.value.status_code == 401
+    assert route.call_count == 1
+
+
+# ---------------------------------------------------------------- rate limits (429 back-off)
+
+
+class FakeTime:
+    """A monotonic clock that only moves when the client sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _paced_llm(router: respx.Router, fake: FakeTime) -> LLM:
+    return proxy_llm(router, clock=fake.clock, sleep=fake.sleep)
+
+
+def _rate_limited(retry_after: str | None = None) -> httpx.Response:
+    headers = {} if retry_after is None else {"retry-after": retry_after}
+    return httpx.Response(
+        429,
+        json={"error": {"message": f"litellm.RateLimitError: limit {API_KEY}", "code": "429"}},
+        headers=headers,
+    )
+
+
+def test_429_with_retry_after_waits_that_long_then_succeeds() -> None:
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[_rate_limited("7"), _ok()]
+    )
+    llm = _paced_llm(router, fake)
+
+    out, record = run(llm.run("worker", "small", "s", "p", Answer))
+
+    assert out == Answer(**OK)
+    assert route.call_count == 2
+    assert fake.sleeps == [7.0]
+    assert llm.records == [record]
+
+
+def test_429_without_retry_after_backs_off_exponentially() -> None:
+    from sluice.llm.client import RATE_LIMIT_BACKOFF_S
+
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[_rate_limited(), _rate_limited(), _ok()]
+    )
+
+    run(_paced_llm(router, fake).run("worker", "small", "s", "p", Answer))
+
+    assert fake.sleeps == [RATE_LIMIT_BACKOFF_S, 2 * RATE_LIMIT_BACKOFF_S]
+
+
+def test_429_beyond_the_retry_limit_is_unavailable_without_a_key() -> None:
+    from sluice.llm.client import RATE_LIMIT_RETRIES
+
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_rate_limited("1"))
+    llm = _paced_llm(router, fake)
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(llm.run("worker", "small", "s", "p", Answer))
+
+    assert caught.value.status_code == 429
+    assert route.call_count == RATE_LIMIT_RETRIES + 1
+    assert len(fake.sleeps) == RATE_LIMIT_RETRIES
+    assert llm.records == []
+    assert_no_key_reachable(caught.value)
+
+
+def test_429_whose_wait_exceeds_the_wall_budget_gives_up_at_once() -> None:
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_rate_limited("30"))
+    llm = _paced_llm(router, fake)
+
+    async def call() -> None:
+        with llm.wall_budget(10):
+            await llm.run("worker", "small", "s", "p", Answer)
+
+    with pytest.raises(LLMUnavailable):
+        run(call())
+
+    assert route.call_count == 1
+    assert fake.sleeps == []
+
+
+def test_wall_budget_bounds_the_total_wait_across_retries() -> None:
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_rate_limited("4"))
+    llm = _paced_llm(router, fake)
+
+    async def call() -> None:
+        with llm.wall_budget(10):
+            await llm.run("worker", "small", "s", "p", Answer)
+
+    with pytest.raises(LLMUnavailable):
+        run(call())
+
+    assert fake.sleeps == [4.0, 4.0]  # a third 4 s wait would end past the 10 s budget
+    assert route.call_count == 3
+
+
+def test_retry_after_http_date_is_honoured() -> None:
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[_rate_limited("Wed, 21 Oct 2015 07:28:00 GMT"), _ok()]
+    )
+
+    run(_paced_llm(router, fake).run("worker", "small", "s", "p", Answer))
+
+    # A date in the past means "now"; the client still waits the minimum back-off step.
+    from sluice.llm.client import RATE_LIMIT_BACKOFF_S
+
+    assert fake.sleeps == [RATE_LIMIT_BACKOFF_S]
+
+
+def test_proxy_cooldown_with_retry_after_is_paced_like_a_429() -> None:
+    fake = FakeTime()
+    router = respx.Router(assert_all_called=False)
+    cooldown = httpx.Response(
+        500,
+        json={
+            "error": {
+                "message": "No deployments available for selected model, Try again in 30 "
+                "seconds. All deployments are in cooldown.",
+                "code": "500",
+            }
+        },
+        headers={"retry-after": "3"},
+    )
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(side_effect=[cooldown, _ok()])
+
+    run(_paced_llm(router, fake).run("worker", "small", "s", "p", Answer))
+
+    assert route.call_count == 2
+    assert fake.sleeps == [3.0]

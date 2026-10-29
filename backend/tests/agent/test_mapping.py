@@ -10,8 +10,9 @@ from typing import Any
 
 import polars as pl
 import pytest
+from model_fakes import output_part
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -72,7 +73,7 @@ class Scripted:
         )
         answer = self.queue.pop(0)
         return ModelResponse(
-            parts=[ToolCallPart(info.output_tools[0].name, json.dumps(answer))],
+            parts=[output_part(info, json.dumps(answer))],
             usage=RequestUsage(input_tokens=40, output_tokens=8),
         )
 

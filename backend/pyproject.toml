@@ -46,7 +46,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]  # tests/: shared helpers (model_fakes)
 markers = [
     "slow: long-running tests, excluded from `make test`",
     "integration: needs the Compose stack (`make up`); run with `make test-integration`",

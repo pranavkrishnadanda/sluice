@@ -9,13 +9,13 @@ from typing import Any
 
 import polars as pl
 import pytest
+from model_fakes import output_part
 from pydantic import ValidationError
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
-    ToolCallPart,
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -223,9 +223,8 @@ class Scripted:
         for msg in messages:
             if isinstance(msg, ModelRequest):
                 self.prompts += [str(p.content) for p in msg.parts if isinstance(p, UserPromptPart)]
-        tool = info.output_tools[0].name
         return ModelResponse(
-            parts=[ToolCallPart(tool, json.dumps(self.queue.pop(0)))],
+            parts=[output_part(info, json.dumps(self.queue.pop(0)))],
             usage=RequestUsage(input_tokens=40, output_tokens=8),
         )
 

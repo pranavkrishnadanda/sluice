@@ -108,7 +108,7 @@ Rules-only baseline on the `dev` split (300 cases, 1 trial), 95% CIs; full table
 | Agent and pipeline | Python 3.14, a hand-written state machine, Pydantic AI for typed LLM output |
 | Data | DuckDB, Polars, PyArrow, Pandera data contracts |
 | Storage | Postgres (control plane + Iceberg catalog), Apache Iceberg on RustFS (S3 API), Redis |
-| Models | LiteLLM gateway; orchestrator on Groq with Gemini fallback; workers on local vLLM (vllm-metal on Apple Silicon) |
+| Models | LiteLLM gateway; orchestrator on Groq gpt-oss-120b (fallbacks: Gemini, then Groq qwen); workers on Groq gpt-oss-20b (fallback: Groq qwen); local vLLM (vllm-metal) optional |
 | Sandbox | Docker: no network, read-only filesystem, dropped capabilities, resource limits, timeouts |
 | Observability | OpenTelemetry, Arize Phoenix, Prometheus, Grafana |
 | Evals and CI | code graders, bootstrap CIs, pass^k, GitHub Actions eval gate |
