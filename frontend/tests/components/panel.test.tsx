@@ -275,7 +275,12 @@ describe("data tab", () => {
     expect(getPreview.mock.calls[0]?.[1]).toEqual({ offset: 0, limit: 1_000 });
     // More pages exist, so the full count is not known yet.
     expect(table).toHaveAttribute("aria-rowcount", "-1");
-    expect(screen.getByText(/1,000 of 48,210 rows loaded/)).toBeInTheDocument();
+    // Rows shown of the upload, then rows loaded.
+    expect(
+      screen.getByText(
+        /Showing 1,000 of 48,210 uploaded rows · 48,210 loaded$/,
+      ),
+    ).toBeInTheDocument();
     // Each body row in the DOM is one of the loaded rows; still windowed.
     expect(table.querySelectorAll("tr").length).toBeLessThan(200);
 
@@ -298,7 +303,9 @@ describe("data tab", () => {
       limit: 1_000,
     });
     expect(
-      await screen.findByText(/2,000 of 48,210 rows loaded/),
+      await screen.findByText(
+        /Showing 2,000 of 48,210 uploaded rows · 48,210 loaded$/,
+      ),
     ).toBeInTheDocument();
     expect(table.querySelectorAll("tr").length).toBeLessThan(200);
   });

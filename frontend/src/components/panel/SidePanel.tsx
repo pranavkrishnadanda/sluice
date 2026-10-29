@@ -236,6 +236,7 @@ function DataPanel({
           onLoadMore={pages.loadMore}
           viewportHeight={viewportHeight}
           sample={sample}
+          rowsLoaded={state?.loaded?.rowsLoaded ?? null}
         />
       );
   }
