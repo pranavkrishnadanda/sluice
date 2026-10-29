@@ -6,6 +6,7 @@ import { Composer, type ComposerProps } from "@/components/thread/Composer";
 import { FileChip } from "@/components/thread/FileChip";
 import { NewRunComposer } from "@/components/thread/NewRunComposer";
 import { RunThread } from "@/components/thread/RunThread";
+import { ApiError } from "@/lib/api/errors";
 import { RUN_REPAIRED_EVENTS } from "@/lib/api/fixtures/run-repaired";
 import { MockApiClient } from "@/lib/api/mock-client";
 import type { ApiClient, RunEvent } from "@/lib/api/types";
@@ -61,6 +62,7 @@ function controlledClient(events: readonly RunEvent[] = RUN_REPAIRED_EVENTS) {
     streamEvents,
     getTransforms: (id) => base.getTransforms(id),
     getPreview: (id, n) => base.getPreview(id, n),
+    getInput: (id, n) => base.getInput(id, n),
     getEvalSummary: () => base.getEvalSummary(),
   };
   const pick = (call?: number) =>
@@ -341,7 +343,7 @@ describe("Composer", () => {
     await user.upload(screen.getByLabelText("Attach a file"), file);
     expect(screen.getByText("orders_2026-11.csv")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Start run" }));
-    expect(createRun).toHaveBeenCalledWith(file, "orders");
+    expect(createRun).toHaveBeenCalledWith(file, "auto");
     await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/runs/run-1"));
   });
 
@@ -358,7 +360,7 @@ describe("Composer", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(/\.csv, \.json/);
     expect(screen.getByText("orders.csv")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Start run" }));
-    expect(onSubmit).toHaveBeenCalledWith(good, "orders");
+    expect(onSubmit).toHaveBeenCalledWith(good, "auto");
   });
 
   test("choosing a new file clears a failed submit's error", async () => {
@@ -406,6 +408,58 @@ describe("Composer", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Start run" }));
     expect(onSubmit).toHaveBeenCalledWith(file, "lineitem");
+  });
+});
+
+describe("Composer table choice", () => {
+  const TABLE_UNKNOWN =
+    "Couldn't tell which table this file is for — pick one.";
+
+  test("defaults to Auto and offers each table", () => {
+    render(<Composer onSubmit={vi.fn<ComposerProps["onSubmit"]>()} />);
+    const select = screen.getByLabelText("Target table");
+    expect(select).toHaveValue("auto");
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Auto", "orders", "lineitem"]);
+  });
+
+  test("a 422 table_unknown asks the user to pick a table", async () => {
+    const client = new MockApiClient({ delayMs: 0 });
+    const createRun = vi.spyOn(client, "createRun").mockRejectedValueOnce(
+      new ApiError(422, "x", `422 ${TABLE_UNKNOWN}`, {
+        detail: TABLE_UNKNOWN,
+        code: "table_unknown",
+      }),
+    );
+    render(
+      <ApiProvider client={client}>
+        <NewRunComposer />
+      </ApiProvider>,
+    );
+    const user = userEvent.setup();
+    const file = new File(["a,b"], "mystery.csv", { type: "text/csv" });
+    await user.upload(screen.getByLabelText("Attach a file"), file);
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+
+    const select = screen.getByLabelText("Target table");
+    expect(await screen.findByRole("alert")).toHaveTextContent(TABLE_UNKNOWN);
+    expect(select).toHaveAttribute("aria-invalid", "true");
+    expect(select).toHaveAccessibleDescription(TABLE_UNKNOWN);
+    expect(select).toHaveFocus();
+
+    // Sending Auto again would only be refused again: keep asking.
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(createRun).toHaveBeenCalledTimes(1);
+    expect(select).toHaveFocus();
+
+    await user.selectOptions(select, "lineitem");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(select).not.toHaveAttribute("aria-invalid");
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(createRun).toHaveBeenLastCalledWith(file, "lineitem");
   });
 });
 
