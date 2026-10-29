@@ -69,18 +69,18 @@ schema in the prompt (``prompted``), or Pydantic AI's required output tool (``to
 
 DEFAULT_OUTPUT_MODE: Final[OutputMode] = "native"
 
-REQUEST_TIMEOUT_S: Final = 90.0
+REQUEST_TIMEOUT_S: Final = 120.0
 """Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
 
 Nested between the proxy's worst case and the per-file wall cap, so a hung deployment still
-reaches its fallback and one hung call cannot double a file's wall time. From
-``backend/litellm/config.yaml`` (per-attempt timeouts: local ``small`` 20 s, hosted 30 s; a
-timeout is not retried, it goes to the fallback group), the worst-case proxy path is:
+reaches its last fallback and one hung call cannot by itself exceed a file's wall time. From
+``backend/litellm/config.yaml`` (per-attempt timeout 30 s on every deployment; a timeout is not
+retried, it goes to the next group of the chain), the worst-case proxy path is:
 
-* small:  20 x (1 + 0 retries) + small-fallback 30 x (1 + 0) = 50 s
-* strong: 30 x (1 + 0 retries) + strong-fallback 30 x (1 + 0) = 60 s
+* strong: gpt-oss-120b 30 + Gemini 30 + qwen 30 = 90 s
+* small:  gpt-oss-20b 30 + qwen 30 = 60 s
 
-so 60 s < 90 s (this) < 180 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
+so 90 s < 120 s (this) < 180 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
 overhead and fast-failing 429/5xx retries. ``tests/llm/test_litellm_config.py`` asserts the
 nesting from the config itself."""
 

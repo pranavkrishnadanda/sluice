@@ -1,25 +1,26 @@
 # LiteLLM proxy config (ghcr.io/berriai/litellm:v1.106.5), mounted by compose.yaml.
 # Clients ask for a *tier* ("strong" / "small"). Each tier is a model group with one deployment;
-# on failure the router falls back to the "<tier>-fallback" group.
+# on failure the router walks the tier's fallback chain in order (router_settings.fallbacks):
+#   strong: groq gpt-oss-120b -> strong-fallback (Gemini) -> small-fallback (Groq qwen)
+#   small:  groq gpt-oss-20b  -> small-fallback (Groq qwen)
 #
-# Model choice (read 2026-10-28):
-#   https://console.groq.com/docs/models: production models are openai/gpt-oss-120b and
-#     openai/gpt-oss-20b ($0.15/$0.60 and $0.075/$0.30 per 1M tokens). llama-3.3-70b-versatile and
-#     llama-3.1-8b-instant are now "Enterprise / Contact Sales" and missing from the free-plan
-#     table. qwen/qwen3-32b is gone, and its successor qwen/qwen3.8-27b is preview-only.
+# Owner decisions (2026-10-29): no local vLLM for now (its deployment is kept below as a commented
+# block); the Gemini key's prepaid credit is depleted (HTTP 402), so Gemini stays in the strong
+# chain but a free Groq model, qwen/qwen3.8-27b, is the last resort for both tiers.
+#
+# Model choice (https://console.groq.com/docs/models, read 2026-10-28 and 2026-10-29):
+#   production models openai/gpt-oss-120b and openai/gpt-oss-20b ($0.15/$0.60 and $0.075/$0.30 per
+#   1M tokens); qwen/qwen3.8-27b is a *preview* model ("intended for evaluation purposes only",
+#   $0.80/$4.00), acceptable as a last-resort fallback. All three take a json_schema
+#   response_format (LiteLLM 1.106.5 supports_response_schema is true for each).
 #   https://ai.google.dev/gemini-api/docs/models and /pricing (updated 2026-10-27):
-#     gemini-3.8-flash is the current stable Flash model. It is free on the free tier and costs
-#     $0.75/$3.75 per 1M tokens on the paid tier until 2026-12-31.
-#   Local worker: spec §7.4 default Qwen3.5-4B-MLX-4bit on vllm-metal. Start it with
-#     `--served-model-name Qwen3.5-4B-MLX-4bit --enable-auto-tool-choice --tool-call-parser hermes`
-#     on port 58000. The client sends a json_schema response_format by default (vLLM structured
-#     outputs); the tool-call flags are only needed for `LLM(output_mode="tool")`.
+#     gemini-3.8-flash is the current stable Flash model ($0.75/$3.75 per 1M tokens, paid tier).
 #
 # Rate limits are per deployment, enforced by the router before each call. Usage is counted in
 # Redis (router_settings.redis_*) so every proxy worker and restart shares one budget. This
 # replaces the spec's hand-written token bucket (Ruling P1). LiteLLM knows only per-minute limits.
 # Daily caps (RPD/TPD) are listed for reference and surface as provider 429s, which trigger the
-# fallback.
+# fallback. The client (sluice.llm.client) additionally backs off and re-sends on a 429.
 
 model_list:
   # strong: orchestrator / verifier ------------------------------------------------------------
@@ -28,8 +29,8 @@ model_list:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
       timeout: 30  # per attempt; see "Timeouts" under router_settings
-      # Groq free plan (https://console.groq.com/docs/rate-limits, "Free Plan Limits" tab,
-      # read 2026-10-28): 30 RPM, 1K RPD, 8K TPM, 200K TPD. Verify in console (/settings/limits).
+      # Groq free plan, owner's console (2026-10-29): 30 RPM, 8K TPM; daily 1K RPD, 200K TPD
+      # (not enforced here, they surface as provider 429s).
       rpm: 30
       tpm: 8000
     model_info:
@@ -45,44 +46,32 @@ model_list:
       model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY
       timeout: 30  # per attempt; see "Timeouts" under router_settings
-      # Google publishes free-tier limits only in AI Studio, not in its public docs
-      # (https://ai.google.dev/gemini-api/docs/rate-limits points to the AI Studio page). These are
-      # conservative placeholders. Verify in console (AI Studio > Rate limits) and adjust.
-      rpm: 10
-      tpm: 250000
+      # Limits from the owner's AI Studio console (Rate limits page, checked 2026-10-29):
+      # 1K RPM, 2M TPM, 10K requests/day for gemini-3.8-flash. The daily cap isn't enforced here.
+      rpm: 1000
+      tpm: 2000000
     model_info:
       allowed_fails_policy:  # hosted: tolerant, see "Cooldown" under router_settings
         RateLimitErrorAllowedFails: 3
         InternalServerErrorAllowedFails: 2
         ServiceUnavailableErrorAllowedFails: 2
         TimeoutErrorAllowedFails: 2
+        # Prepaid credit depleted: Gemini answers 402, which LiteLLM 1.106.5 maps to
+        # PaymentRequiredError (a BadRequestError; observed through this proxy 2026-10-29). It is
+        # not retried in place (BadRequestErrorRetries: 0) and the router moves on to the next
+        # group in the chain. 0 allowed fails cools the deployment down on the first one, so
+        # later calls skip it for cooldown_time instead of paying the round trip. An explicit
+        # entry also cools down on other 400s from Gemini, which is fine for a fallback.
+        BadRequestErrorAllowedFails: 0
       cooldown_time: 30
 
-  # small: workers ------------------------------------------------------------------------------
+  # small: workers / mapper ---------------------------------------------------------------------
   - model_name: small
-    litellm_params:
-      model: openai/Qwen3.5-4B-MLX-4bit
-      api_base: http://host.docker.internal:58000/v1
-      api_key: "none"  # local vLLM, no auth
-      timeout: 20  # per attempt; see "Timeouts" under router_settings
-      # Optional: when vLLM is not running, the connection error falls back to small-fallback.
-      # No rpm/tpm here: the local server has no provider quota.
-    model_info:
-      # local: cool down on the FIRST failure (0 allowed fails), for 60 s, see "Cooldown" below.
-      # LiteLLM reports "connection refused" as InternalServerError.
-      allowed_fails_policy:
-        InternalServerErrorAllowedFails: 0
-        ServiceUnavailableErrorAllowedFails: 0
-        TimeoutErrorAllowedFails: 0
-      cooldown_time: 60
-
-  - model_name: small-fallback
     litellm_params:
       model: groq/openai/gpt-oss-20b
       api_key: os.environ/GROQ_API_KEY
       timeout: 30  # per attempt; see "Timeouts" under router_settings
-      # Groq free plan (same source as above): 30 RPM, 1K RPD, 8K TPM, 200K TPD.
-      # Verify in console.
+      # Groq free plan, owner's console (2026-10-29): 30 RPM, 8K TPM; daily 1K RPD, 200K TPD.
       rpm: 30
       tpm: 8000
     model_info:
@@ -93,28 +82,70 @@ model_list:
         TimeoutErrorAllowedFails: 2
       cooldown_time: 30
 
+  # last resort for both tiers --------------------------------------------------------------------
+  - model_name: small-fallback
+    litellm_params:
+      model: groq/qwen/qwen3.8-27b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 30  # per attempt; see "Timeouts" under router_settings
+      # Groq free plan, owner's console (2026-10-29): 30 RPM, 8K TPM; daily 1K RPD, 200K TPD.
+      # Shared by both chains, so strong and small fallbacks draw on the same minute budget.
+      rpm: 30
+      tpm: 8000
+    model_info:
+      allowed_fails_policy:  # hosted: tolerant, see "Cooldown" under router_settings
+        RateLimitErrorAllowedFails: 3
+        InternalServerErrorAllowedFails: 2
+        ServiceUnavailableErrorAllowedFails: 2
+        TimeoutErrorAllowedFails: 2
+      cooldown_time: 30
+
+  # Local vLLM worker (disabled, owner decision 2026-10-29). To enable it:
+  #   1. Start spec §7.4's default model on vllm-metal, port 58000:
+  #        vllm serve <Qwen3.5-4B-MLX-4bit path> --served-model-name Qwen3.5-4B-MLX-4bit --port 58000
+  #      (the client sends a json_schema response_format; add
+  #      `--enable-auto-tool-choice --tool-call-parser hermes` only for LLM(output_mode="tool")).
+  #   2. Uncomment this block and rename the Groq gpt-oss-20b group above from `small` to
+  #      `small-remote`, then set fallbacks to `small: ["small-remote", "small-fallback"]`.
+  #   3. Restore the local-worker retry policy (model_group_retry_policy.small, all retries 0) and
+  #      re-check the timeout nesting in tests/llm/test_litellm_config.py.
+  # - model_name: small
+  #   litellm_params:
+  #     model: openai/Qwen3.5-4B-MLX-4bit
+  #     api_base: http://host.docker.internal:58000/v1
+  #     api_key: "none"  # local vLLM, no auth
+  #     timeout: 20  # per attempt
+  #   model_info:
+  #     # local: cool down on the FIRST failure (0 allowed fails), for 60 s. LiteLLM reports
+  #     # "connection refused" as InternalServerError.
+  #     allowed_fails_policy:
+  #       InternalServerErrorAllowedFails: 0
+  #       ServiceUnavailableErrorAllowedFails: 0
+  #       TimeoutErrorAllowedFails: 0
+  #     cooldown_time: 60
+
 router_settings:
   routing_strategy: usage-based-routing-v2
   optional_pre_call_checks: ["enforce_model_rate_limits"]
   redis_host: redis
   redis_port: 6379
-  # Timeouts (nested so a hung deployment still reaches its fallback). Each deployment sets its
-  # own per-attempt `timeout` in litellm_params (LiteLLM v1.106.5 router._get_timeout: request
-  # kwarg > deployment litellm_params.timeout > this router default): local `small` 20 s,
-  # hosted 30 s. A timeout is not retried on the same group (TimeoutErrorRetries: 0), so it moves
-  # straight to the fallback. Worst case, every attempt hanging:
-  #   small:  20 x (1 + 0) + 30 x (1 + 0) = 50 s
-  #   strong: 30 x (1 + 0) + 30 x (1 + 0) = 60 s
-  # sluice.llm.client.REQUEST_TIMEOUT_S (90 s) must exceed both, and caps.MAX_WALL_S_PER_FILE
+  # Timeouts (nested so a hung deployment still reaches its last fallback). Each deployment sets
+  # its own per-attempt `timeout` in litellm_params (LiteLLM v1.106.5 router._get_timeout: request
+  # kwarg > deployment litellm_params.timeout > this router default): 30 s everywhere. A timeout is
+  # not retried on the same group (TimeoutErrorRetries: 0), so it moves straight to the next group
+  # in the chain. Worst case, every attempt hanging:
+  #   strong: 30 (120b) + 30 (Gemini) + 30 (qwen) = 90 s
+  #   small:  30 (20b)  + 30 (qwen)               = 60 s
+  # sluice.llm.client.REQUEST_TIMEOUT_S (120 s) must exceed both, and caps.MAX_WALL_S_PER_FILE
   # (180 s) must exceed the client timeout; tests/llm/test_litellm_config.py asserts this.
-  # (One timeout retry per hosted group would make strong 30x2 + 30x2 = 120 s.)
   timeout: 30
   num_retries: 2
   # Retries (retry_policy): 429, 500 and 503 are retried up to 2 times on the SAME group (here
-  # one deployment), so up to 3 attempts before the fallback; a timeout is not retried (see
-  # "Timeouts" above). Bad request, auth,
-  # not found, content-policy and every other error get 0 retries and go straight to the
-  # fallback. The `small` group gets 0 retries for everything (model_group_retry_policy).
+  # one deployment), so up to 3 attempts before the next group; a timeout is not retried (see
+  # "Timeouts" above). Bad request (incl. Gemini's 402 PaymentRequiredError), auth, not found,
+  # content-policy and every other error get 0 retries and go straight to the next group: the
+  # router's generic `fallbacks` catch any exception and try each group of the chain in order
+  # (router_utils/fallback_event_handlers.run_async_fallback).
   #
   # Cooldown (LiteLLM v1.106.5 router_utils/cooldown_handlers.py, router.py). There is
   # deliberately NO router-wide allowed_fails or cooldown_time, so LiteLLM's defaults stay
@@ -127,12 +158,11 @@ router_settings:
   # A cooled-down
   # deployment is not retried: Router.should_retry_this_error raises when no deployment is
   # healthy, and the request goes to the fallback group.
-  #   - small (local vLLM): 0 allowed fails, cooldown 60 s. The first refused connection cools
-  #     it down, the call falls back at once, and later calls skip it for 60 s.
-  #   - hosted (strong, strong-fallback, small-fallback): cooldown 30 s.
+  #   - every deployment is hosted: cooldown 30 s.
   #     - 429: the 4th within the window. One call's 3 attempts of 429 do not eject the
   #       deployment.
   #     - 500/503/timeout: the 3rd within the window.
+  #     - Gemini only: the first 400/402 (BadRequestErrorAllowedFails: 0, see its block).
   #     The proxy's own rpm/tpm pre-check (enforce_model_rate_limits) raises litellm.RateLimitError
   #     and calls set_cooldown_deployments (router.async_routing_strategy_pre_call_checks), so
   #     local-limit rejections feed the SAME RateLimitError counter. They cannot be told apart in
@@ -149,18 +179,8 @@ router_settings:
     NotFoundErrorRetries: 0
     ContentPolicyViolationErrorRetries: 0
     DefaultRetries: 0
-  # The local worker gets no retries. A refused connection (vLLM not running) is not worth
-  # retrying, and the hosted fallback is right there. Without this, call 1 waited ~4 s in retry
-  # backoff before the retry found the deployment cooled down (measured 2026-10-28).
-  model_group_retry_policy:
-    small:
-      DefaultRetries: 0
-      RateLimitErrorRetries: 0
-      InternalServerErrorRetries: 0
-      ServiceUnavailableErrorRetries: 0
-      TimeoutErrorRetries: 0
   fallbacks:
-    - strong: ["strong-fallback"]
+    - strong: ["strong-fallback", "small-fallback"]
     - small: ["small-fallback"]
 
 litellm_settings:

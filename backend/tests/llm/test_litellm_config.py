@@ -1,8 +1,11 @@
-"""backend/litellm/config.yaml: cooldown thresholds are scoped per deployment (Ruling M2).
+"""backend/litellm/config.yaml: routes, rate limits, cooldown policies and timeout nesting.
+
+Owner decisions of 2026-10-29: no local vLLM (its deployment stays as a commented block), the
+Gemini key's prepaid credit is depleted (HTTP 402), so a free Groq qwen model is the last resort.
 
 No router-wide `allowed_fails` / `cooldown_time` override: LiteLLM's defaults apply to anything
-not covered below. The local worker cools down on its first failure; hosted deployments carry
-deliberate, more tolerant per-deployment policies so a short 429 burst does not eject them.
+not covered below. Hosted deployments carry tolerant per-deployment policies so a short 429 burst
+does not eject them.
 """
 
 from pathlib import Path
@@ -10,6 +13,8 @@ from typing import Any
 
 import pytest
 import yaml
+
+from sluice.llm import prices
 
 CONFIG = Path(__file__).resolve().parents[2] / "litellm" / "config.yaml"
 
@@ -19,10 +24,17 @@ HOSTED_POLICY = {
     "ServiceUnavailableErrorAllowedFails": 2,
     "TimeoutErrorAllowedFails": 2,
 }
-LOCAL_POLICY = {
-    "InternalServerErrorAllowedFails": 0,
-    "ServiceUnavailableErrorAllowedFails": 0,
-    "TimeoutErrorAllowedFails": 0,
+GROUPS = ("strong", "strong-fallback", "small", "small-fallback")
+DEPLOYMENTS = {
+    "strong": "groq/openai/gpt-oss-120b",
+    "strong-fallback": "gemini/gemini-3.8-flash",
+    "small": "groq/openai/gpt-oss-20b",
+    "small-fallback": "groq/qwen/qwen3.8-27b",
+}
+GROQ_GROUPS = ("strong", "small", "small-fallback")
+CHAINS = {
+    "strong": ["strong-fallback", "small-fallback"],
+    "small": ["small-fallback"],
 }
 
 
@@ -36,6 +48,67 @@ def _deployment(config: dict[str, Any], group: str) -> dict[str, Any]:
     return entry
 
 
+def _fallbacks(config: dict[str, Any]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    for entry in config["router_settings"]["fallbacks"]:
+        merged.update(entry)
+    return merged
+
+
+# --- routes ---------------------------------------------------------------------------------
+
+
+def test_each_group_has_one_deployment_on_the_chosen_model(config: dict[str, Any]) -> None:
+    served = {m["model_name"]: m["litellm_params"]["model"] for m in config["model_list"]}
+
+    assert served == DEPLOYMENTS
+
+
+def test_fallback_chains_end_on_free_groq_qwen(config: dict[str, Any]) -> None:
+    assert _fallbacks(config) == CHAINS
+
+
+def test_local_vllm_deployment_is_kept_only_as_a_commented_block(config: dict[str, Any]) -> None:
+    text = CONFIG.read_text(encoding="utf-8")
+    commented = [line for line in text.splitlines() if line.lstrip().startswith("#")]
+    models = [m["litellm_params"]["model"] for m in config["model_list"]]
+
+    assert all("Qwen3.5-4B-MLX-4bit" not in model for model in models)
+    assert any("model: openai/Qwen3.5-4B-MLX-4bit" in line for line in commented)
+    assert any("host.docker.internal:58000" in line for line in commented)
+
+
+def test_every_deployment_has_a_list_price(config: dict[str, Any]) -> None:
+    for entry in config["model_list"]:
+        assert entry["litellm_params"]["model"] in prices.PRICES
+
+
+def test_tier_primary_prices_match_the_primary_deployments() -> None:
+    primaries = {tier: DEPLOYMENTS[tier] for tier in ("strong", "small")}
+    assert primaries == prices.TIER_PRIMARY
+
+
+# --- rate limits ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("group", GROQ_GROUPS)
+def test_groq_deployments_carry_the_free_plan_minute_limits(
+    config: dict[str, Any], group: str
+) -> None:
+    params = _deployment(config, group)["litellm_params"]
+
+    assert (params["rpm"], params["tpm"]) == (30, 8000)
+
+
+def test_gemini_carries_the_owner_console_limits(config: dict[str, Any]) -> None:
+    params = _deployment(config, "strong-fallback")["litellm_params"]
+
+    assert (params["rpm"], params["tpm"]) == (1000, 2_000_000)
+
+
+# --- cooldown and retry policies ------------------------------------------------------------
+
+
 def test_no_router_wide_cooldown_overrides(config: dict[str, Any]) -> None:
     router = config["router_settings"]
 
@@ -44,20 +117,29 @@ def test_no_router_wide_cooldown_overrides(config: dict[str, Any]) -> None:
     assert "cooldown_time" not in router
 
 
-def test_local_worker_cools_down_on_first_failure(config: dict[str, Any]) -> None:
-    info = _deployment(config, "small")["model_info"]
-
-    assert info["allowed_fails_policy"] == LOCAL_POLICY
-    assert info["cooldown_time"] == 60
-    assert config["router_settings"]["model_group_retry_policy"]["small"]["DefaultRetries"] == 0
-
-
-@pytest.mark.parametrize("group", ["strong", "strong-fallback", "small-fallback"])
-def test_hosted_deployments_have_tolerant_policies(config: dict[str, Any], group: str) -> None:
+@pytest.mark.parametrize("group", GROQ_GROUPS)
+def test_groq_deployments_have_tolerant_policies(config: dict[str, Any], group: str) -> None:
     info = _deployment(config, group)["model_info"]
 
     assert info["allowed_fails_policy"] == HOSTED_POLICY
     assert info["cooldown_time"] == 30
+
+
+def test_gemini_cools_down_on_its_first_payment_required(config: dict[str, Any]) -> None:
+    # LiteLLM 1.106.5 maps Gemini's 402 to PaymentRequiredError, a BadRequestError: not retried
+    # (BadRequestErrorRetries 0), the router moves on to the next fallback, and with 0 allowed
+    # fails the deployment is skipped for its cooldown instead of being asked again each call.
+    info = _deployment(config, "strong-fallback")["model_info"]
+
+    assert info["allowed_fails_policy"] == {**HOSTED_POLICY, "BadRequestErrorAllowedFails": 0}
+    assert info["cooldown_time"] == 30
+
+
+def test_a_bad_request_including_402_is_never_retried_in_place(config: dict[str, Any]) -> None:
+    router = config["router_settings"]
+
+    assert router["retry_policy"]["BadRequestErrorRetries"] == 0
+    assert "model_group_retry_policy" not in router
 
 
 def test_policies_live_in_model_info_not_litellm_params(config: dict[str, Any]) -> None:
@@ -67,7 +149,7 @@ def test_policies_live_in_model_info_not_litellm_params(config: dict[str, Any]) 
         assert "cooldown_time" not in entry["litellm_params"]
 
 
-# --- timeout nesting: a hung primary must reach its fallback inside the client timeout -------
+# --- timeout nesting: a hung primary must reach its last fallback inside the client timeout ---
 
 TIERS = ("small", "strong")
 
@@ -85,22 +167,26 @@ def _timeout_retries(config: dict[str, Any], group: str) -> int:
 
 
 def worst_case_proxy_s(config: dict[str, Any], tier: str) -> float:
-    """Every attempt of the primary and of its fallback group hangs until its timeout."""
+    """Every attempt of the primary and of each group in its fallback chain hangs."""
     return sum(
         _timeout(config, group) * (1 + _timeout_retries(config, group))
-        for group in (tier, f"{tier}-fallback")
+        for group in (tier, *_fallbacks(config)[tier])
     )
 
 
 def test_every_deployment_has_its_own_short_timeout(config: dict[str, Any]) -> None:
-    assert _deployment(config, "small")["litellm_params"]["timeout"] == 20
-    for group in ("strong", "strong-fallback", "small-fallback"):
+    for group in GROUPS:
         assert _deployment(config, group)["litellm_params"]["timeout"] == 30
 
 
-@pytest.mark.parametrize("group", ["small", "small-fallback", "strong", "strong-fallback"])
+@pytest.mark.parametrize("group", GROUPS)
 def test_a_timeout_is_retried_at_most_once(config: dict[str, Any], group: str) -> None:
     assert _timeout_retries(config, group) <= 1
+
+
+def test_worst_case_paths_are_the_documented_ones(config: dict[str, Any]) -> None:
+    assert worst_case_proxy_s(config, "strong") == 90  # 120b, Gemini, qwen: 30 s each
+    assert worst_case_proxy_s(config, "small") == 60  # 20b, qwen
 
 
 @pytest.mark.parametrize("tier", TIERS)
