@@ -344,6 +344,46 @@ def test_worker_terminal_adopted_on_resync_reaches_live_subscribers_once(
     assert store.finished == [("r1", "succeeded", 0.0)]
 
 
+def test_worker_resynced_events_count_in_the_running_cost_and_progress(
+    blobs: LocalBlobStore,
+) -> None:
+    """T4 deferred minor: an event found on resync is tracked like any other (cost, loaded)."""
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    store.commit_then_fail = lambda e: e.type == "node_finished"  # type: ignore[attr-defined]
+    events = [started("r1"), node_finished("n1", 0.25), finished()]
+    _run(lambda: _drive(store, blobs, scripted(events), "r1"))
+
+    assert store.types("r1") == ["run_started", "node_finished", "run_finished"]
+    (terminal,) = store.terminals("r1")
+    assert (terminal.status, terminal.cost_usd) == ("failed", 0.25)
+    assert ("r1", None, 0.25) in store.progress
+    assert store.finished == [("r1", "failed", 0.25)]
+
+
+def test_worker_resynced_loaded_sets_the_loaded_flag(blobs: LocalBlobStore) -> None:
+    from sluice.api.worker import _RunState
+
+    store = FakeStore()
+    store.add("r1", status="running")
+    log = EventLog()
+    store.append_event("r1", log.emit(started("r1")))
+    loaded = log.emit(ev.Loaded(rows_loaded=2, rows_quarantined=0, snapshot_id="42"))
+    store.append_event("r1", loaded)  # stored, but its emit reported a failure
+    state = _RunState("orders.csv")
+    state.seq = 1
+
+    async def go() -> None:  # the hub publishes onto the running loop
+        worker = _worker(store, blobs, EventHub(), scripted([]))
+        worker._close_failed("r1", state, "ConnectionError")
+
+    _run(go)
+
+    assert state.loaded is True
+    assert store.types("r1") == ["run_started", "loaded", "run_finished"]
+
+
 def test_worker_run_closed_after_its_run_finished_still_finishes_the_run(
     blobs: LocalBlobStore,
 ) -> None:

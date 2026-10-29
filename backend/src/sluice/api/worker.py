@@ -393,8 +393,9 @@ class Worker:
         A :class:`DuplicateEvent` means an earlier append committed although it reported an
         error: resync ``seq`` from the store and retry once. The resynced events were stored
         but never published (``state.seq`` only advances after a publish), so they are
-        published now, in order, each exactly once; a stored ``run_finished`` among them is
-        adopted as the run's terminal event.
+        published and tracked (:meth:`_track`: running cost, progress, plan, ``loaded``) now,
+        in order, each exactly once; a stored ``run_finished`` among them is adopted as the
+        run's terminal event, and the fallback's ``costUsd`` includes the resynced spend.
         """
         for _ in range(2):
             terminal = RunFinished(
@@ -417,6 +418,7 @@ class Worker:
                     state.seq = tail[-1].seq
                 for event in tail:
                     self._publish(run_id, state, event)
+                    self._track(run_id, state, event)  # cost, rows, plan, loaded: as in _emit
                 stored = [e for e in tail if isinstance(e, RunFinished)]
                 if stored:
                     return stored[-1]
