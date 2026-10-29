@@ -11,6 +11,7 @@ import { describe, expect, test, vi } from "vitest";
 import { ApiProvider } from "@/components/api/ApiProvider";
 import { DATA_ROW_HEIGHT } from "@/components/panel/DataTab";
 import { SidePanel } from "@/components/panel/SidePanel";
+import { ApiError } from "@/lib/api/errors";
 import { RUN_CLEAN_EVENTS } from "@/lib/api/fixtures/run-clean";
 import { RUN_REPAIRED_EVENTS } from "@/lib/api/fixtures/run-repaired";
 import { MockApiClient } from "@/lib/api/mock-client";
@@ -373,6 +374,36 @@ describe("data tab", () => {
       withPreview({ columns: [], totalRows: 0, rows: [], nextOffset: null }),
     );
     expect(await screen.findByText(/no changed cells/i)).toBeInTheDocument();
+  });
+
+  test("a preview that is still being written (409 not_ready) is retried", async () => {
+    const notReady = new ApiError(409, "/runs/x/preview", "409 Not ready", {
+      detail: "The preview is still being written; try again shortly.",
+      code: "not_ready",
+    });
+    const getPreview = vi
+      .fn<ApiClient["getPreview"]>()
+      .mockRejectedValueOnce(notReady)
+      .mockResolvedValue(bigPreview(1));
+    renderPanel("x", null, { ...withPreview(bigPreview(1)), getPreview });
+    expect(
+      await screen.findByRole("table", { name: "Before and after values" }),
+    ).toBeInTheDocument();
+    expect(getPreview).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  test("a run without a stored preview (409 no_preview) is not retried", async () => {
+    const getPreview = vi.fn<ApiClient["getPreview"]>().mockRejectedValue(
+      new ApiError(409, "/runs/x/preview", "409 No preview", {
+        detail: "This run has no preview.",
+        code: "no_preview",
+      }),
+    );
+    renderPanel("x", null, { ...withPreview(bigPreview(1)), getPreview });
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("This run has no preview.");
+    expect(getPreview).toHaveBeenCalledTimes(1);
   });
 
   test("a failed preview offers a retry", async () => {

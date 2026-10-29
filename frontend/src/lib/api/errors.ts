@@ -68,3 +68,38 @@ export function errorDetail(err: unknown): string | null {
 export function isNotFound(err: unknown): boolean {
   return err instanceof ApiError && err.status === 404;
 }
+
+/**
+ * `true` for the preview's `409 not_ready`: the run has loaded but its
+ * preview is still being written, and the contract says to retry shortly.
+ */
+export function isNotReady(err: unknown): boolean {
+  return (
+    err instanceof ApiError && err.status === 409 && err.code === "not_ready"
+  );
+}
+
+/** Waits between retries of a `not_ready` answer: about 16 s in all. */
+export const NOT_READY_RETRY_MS: readonly number[] = [
+  250, 500, 1_000, 2_000, 4_000, 8_000,
+];
+
+/**
+ * Calls `load`, retrying while it rejects with `409 not_ready` (see
+ * {@link isNotReady}), once after each delay in `delays`. Any other error,
+ * or `not_ready` after the last retry, rejects as usual.
+ */
+export async function retryWhileNotReady<T>(
+  load: () => Promise<T>,
+  delays: readonly number[] = NOT_READY_RETRY_MS,
+): Promise<T> {
+  for (const delay of delays) {
+    try {
+      return await load();
+    } catch (err) {
+      if (!isNotReady(err)) throw err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  return load();
+}
