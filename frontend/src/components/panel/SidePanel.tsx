@@ -267,11 +267,14 @@ const REPLAY_SETTLE_MS = 250;
  * initial state, so a finished, loaded run would otherwise ask for its
  * whole upload before the replay reaches `loaded`. A finished run without
  * `loaded` is known at once; an unfinished one once the stream has been
- * quiet for {@link REPLAY_SETTLE_MS} (the replay has caught up).
+ * quiet for {@link REPLAY_SETTLE_MS} (the replay has caught up). The quiet
+ * timer runs for the `runId` prop even before any event arrives, so a
+ * queued run (nothing published yet) or a stream that fails before its
+ * first event still shows the upload from creation.
  */
 function useInputWanted(runId: string, state: RunViewState | null): boolean {
-  const notLoaded =
-    state !== null && state.runId !== null && state.loaded === null;
+  // From the prop, not `state.runId`: that is only set by `run_started`.
+  const notLoaded = state !== null && state.loaded === null;
   const finished = state?.finished ?? false;
   // The run this view saw a quiet stream for; it never un-settles.
   const [settledFor, setSettledFor] = useState<string | null>(null);

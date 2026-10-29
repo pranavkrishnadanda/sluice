@@ -212,6 +212,31 @@ describe("raw uploaded file in the Data tab", () => {
       expect(getInput.mock.calls[0]?.[2]).toBeInstanceOf(AbortSignal);
     });
 
+    test("a queued run with an empty stream shows the upload after the quiet gap", async () => {
+      const getInput = vi.fn<ApiClient["getInput"]>(onePage);
+      renderPanel(INITIAL_RUN_VIEW_STATE, client({ getInput }));
+      expect(getInput).not.toHaveBeenCalled();
+      expect(
+        await screen.findByRole("table", { name: "Uploaded file" }),
+      ).toBeInTheDocument();
+      expect(getInput).toHaveBeenCalledTimes(1);
+    });
+
+    test("a stream that errors before any event shows the 404 note, not a forever skeleton", async () => {
+      const getInput = vi.fn<ApiClient["getInput"]>(async () => {
+        throw new ApiError(404, "x", "404 Unknown run", {
+          detail: "Unknown run",
+        });
+      });
+      renderPanel(INITIAL_RUN_VIEW_STATE, client({ getInput }));
+      expect(
+        await screen.findByText(/uploaded file isn.t available/i),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("status", { name: "Loading the run’s data" }),
+      ).not.toBeInTheDocument();
+    });
+
     test("a pending request aborts when the run loads, changes or the panel closes", async () => {
       const signals: AbortSignal[] = [];
       const getInput = vi.fn<ApiClient["getInput"]>((_id, _p, signal) => {
