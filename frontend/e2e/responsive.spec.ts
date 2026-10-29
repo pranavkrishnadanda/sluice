@@ -140,3 +140,53 @@ test.describe("desktop width", () => {
     });
   }
 });
+
+/**
+ * Every laid-out element in the Plan tab fits its own box and the panel:
+ * nothing is wider than its container and nothing scrolls sideways.
+ */
+async function expectPlanFits(page: Page) {
+  const panel = page.getByRole("complementary", { name: "Details" });
+  await panel.getByRole("tab", { name: "Plan" }).click();
+  const plan = panel.getByRole("region", { name: "Plan steps" });
+  await expect(plan).toBeVisible();
+  const overflow = await panel
+    .getByRole("tabpanel", { name: "Plan" })
+    .evaluate((root) => {
+      const limit = root.getBoundingClientRect().right + 0.5;
+      const bad: string[] = [];
+      for (const el of [root, ...root.querySelectorAll<HTMLElement>("*")]) {
+        // Inline boxes have no client width; sr-only text is clipped on purpose.
+        if (!(el instanceof HTMLElement) || el.clientWidth === 0) continue;
+        if (el.classList.contains("sr-only")) continue;
+        const r = el.getBoundingClientRect();
+        if (el.scrollWidth > el.clientWidth + 0.5 || r.right > limit) {
+          bad.push(
+            `${el.tagName}.${el.className} ${el.scrollWidth}/${el.clientWidth}`,
+          );
+        }
+      }
+      return bad;
+    });
+  expect(overflow).toEqual([]);
+}
+
+test.describe("plan tab width", () => {
+  test("a 360 px wide screen: the plan wraps, never scrolls sideways", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 360, height: 800 });
+    await openFinishedRun(page, "run-repaired");
+    await page.getByRole("button", { name: "Details" }).click();
+    await expectPlanFits(page);
+    await expectNoHorizontalScroll(page);
+  });
+
+  test("the 1440 px desktop layout: the plan fits the side panel", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openFinishedRun(page, "run-repaired");
+    await expectPlanFits(page);
+  });
+});

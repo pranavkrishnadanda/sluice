@@ -649,24 +649,19 @@ describe("code tab", () => {
 });
 
 describe("plan tab", () => {
-  test("plan tab layers nodes by dependency", async () => {
+  test("plan tab stacks steps by dependency wave", async () => {
     const user = userEvent.setup();
-    const { container } = renderPanel(
-      "run-repaired",
-      stateOf(RUN_REPAIRED_EVENTS),
-    );
+    renderPanel("run-repaired", stateOf(RUN_REPAIRED_EVENTS));
     await user.click(screen.getByRole("tab", { name: "Plan" }));
-    const n1 = container.querySelector('[data-node-id="n1"]');
-    const n2 = container.querySelector('[data-node-id="n2"]');
-    expect(n1).toHaveAttribute("data-layer", "0");
-    expect(n2).toHaveAttribute("data-layer", "1");
-    expect(n1).toHaveAttribute("data-status", "done");
-    expect(container.querySelectorAll("[data-edge]")).toHaveLength(1);
-    // Text alternative: the steps and their dependencies, in order.
-    const steps = screen.getByRole("list", { name: /plan steps/i });
-    const items = within(steps).getAllByRole("listitem");
+    const plan = screen.getByRole("region", { name: "Plan steps" });
+    // A chain: one wave per step, top to bottom.
+    const lists = within(plan).getAllByRole("list");
+    expect(lists).toHaveLength(2);
+    const items = within(plan).getAllByRole("listitem");
     expect(items).toHaveLength(2);
-    expect(items[1]).toHaveTextContent(/after step 1/i);
+    expect(items[0]).toHaveAttribute("data-status", "done");
+    expect(items[0]).toHaveTextContent(/2 attempts · retried on strong/);
+    expect(items[1]).toHaveTextContent(/depends on: 1/);
   });
 
   test("plan tab empty state", async () => {

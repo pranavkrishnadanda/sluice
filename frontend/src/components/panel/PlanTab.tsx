@@ -1,185 +1,226 @@
 "use client";
 
 import { useId, useMemo } from "react";
-import type { ModelTier } from "@/lib/api/types";
-import type { NodeStatus, NodeViewState, RunViewState } from "@/lib/run-state";
-import { layoutPlan, PLAN_NODE_HEIGHT, PLAN_VIEW_WIDTH } from "./plan-layout";
+import { ActivityLine } from "@/components/thread/ActivityLine";
+import { formatMs, formatUsd } from "@/lib/format";
+import {
+  type NodeViewState,
+  type RunViewState,
+  STOPPED_NODE_NOTE,
+} from "@/lib/run-state";
+import { planWaves } from "./plan-layout";
 
-/** Extra height for a node whose title wraps onto a second line. */
-const SECOND_LINE = 16;
+type CardStatus =
+  | "pending"
+  | "running"
+  | "retrying"
+  | "done"
+  | "failed"
+  | "stopped";
 
-const TIER_LABEL: Record<ModelTier, string> = {
-  rules: "rules",
-  small: "small model",
-  strong: "strong model",
+/** A failed node the run's end cut off mid-attempt reads as stopped. */
+function cardStatus(n: NodeViewState): CardStatus {
+  if (n.status === "failed" && n.lastError === STOPPED_NODE_NOTE) {
+    return "stopped";
+  }
+  return n.status;
+}
+
+const STATUS_TONE: Record<CardStatus, string> = {
+  pending: "text-muted",
+  running: "text-accent",
+  retrying: "text-warn",
+  done: "text-ok",
+  failed: "text-error",
+  stopped: "text-error",
 };
 
-const STATUS_LABEL: Record<NodeStatus, string> = {
-  pending: "waiting",
-  running: "running",
-  retrying: "retrying",
-  done: "done",
-  failed: "failed",
-};
+const CHIP =
+  "inline-flex h-5 items-center rounded-full bg-chip px-2 font-medium text-[0.6875rem] leading-none";
 
-/** Approximate glyphs that fit in `width` px of 12.5 px Inter. */
-const budget = (width: number) => Math.max(8, Math.floor((width - 24) / 6.4));
-
-function clip(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
 }
 
-/** Word-wraps `text` into at most two lines of `max` glyphs (SVG has no wrap). */
-export function wrapTitle(text: string, max: number): [string, string?] {
-  if (text.length <= max) return [text];
-  const cut = text.lastIndexOf(" ", max);
-  const head = cut > max / 2 ? text.slice(0, cut) : text.slice(0, max);
-  const rest = text.slice(head.length).trimStart();
-  return [head, clip(rest, max)];
+/** "2 attempts · retried on strong · 7.3 s · $0.0018 · depends on: 1, 2". */
+function nodeMeta(n: NodeViewState, deps: number[]): string {
+  const parts: string[] = [];
+  if (n.status === "running" || n.status === "retrying") {
+    const of = n.maxAttempts ? `/${n.maxAttempts}` : "";
+    parts.push(`attempt ${n.attempt}${of}`);
+  } else if (n.attempt > 0) {
+    parts.push(plural(n.attempt, "attempt", "attempts"));
+  }
+  if (n.attempt > 1) parts.push(`retried on ${n.tier}`);
+  if (n.status === "done") {
+    if (n.latencyMs != null) parts.push(formatMs(n.latencyMs));
+    parts.push(formatUsd(n.costUsd));
+  }
+  if (deps.length > 0) parts.push(`depends on: ${deps.join(", ")}`);
+  return parts.join(" · ");
 }
 
-function nodeMeta(n: NodeViewState): string {
-  const attempt = n.attempt > 1 ? ` · attempt ${n.attempt}` : "";
-  return `${TIER_LABEL[n.tier]} · ${STATUS_LABEL[n.status]}${attempt}`;
-}
-
-function PlanGraph({ nodes }: { nodes: NodeViewState[] }) {
-  const arrowId = useId();
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  // Widths do not depend on height: lay out once, then grow every node by a
-  // line if any title needs two, so bands stay aligned.
-  const { layout, twoLine } = useMemo(() => {
-    const titles = new Map(nodes.map((n) => [n.id, n.title]));
-    const first = layoutPlan(nodes);
-    const wraps = first.nodes.some(
-      (p) => (titles.get(p.id)?.length ?? 0) > budget(p.width),
-    );
-    return wraps
-      ? {
-          layout: layoutPlan(nodes, PLAN_NODE_HEIGHT + SECOND_LINE),
-          twoLine: true,
-        }
-      : { layout: first, twoLine: false };
-  }, [nodes]);
-  const stepOf = new Map(nodes.map((n, i) => [n.id, i + 1]));
-  const fits = layout.width <= PLAN_VIEW_WIDTH;
-
+function NodeCard({
+  node,
+  step,
+  deps,
+  live,
+}: {
+  node: NodeViewState;
+  step: number;
+  deps: number[];
+  live: boolean;
+}) {
+  const status = cardStatus(node);
+  const meta = nodeMeta(node, deps);
+  const open = node.status === "running" || node.status === "retrying";
   return (
-    <figure className="space-y-3">
-      <div className="overflow-x-auto overscroll-x-contain">
-        <svg
-          aria-hidden="true"
-          focusable="false"
-          viewBox={`0 0 ${layout.width} ${layout.height}`}
-          width={fits ? "100%" : layout.width}
-          className="block h-auto"
-        >
-          <defs>
-            <marker
-              id={arrowId}
-              viewBox="0 0 10 10"
-              refX="9"
-              refY="5"
-              markerWidth="7"
-              markerHeight="7"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 1 L 9 5 L 0 9 z" className="fill-(--text-muted)" />
-            </marker>
-          </defs>
-          {layout.edges.map((e) => (
-            <path
-              key={`${e.from}->${e.to}`}
-              data-edge={`${e.from}->${e.to}`}
-              d={e.d}
-              fill="none"
-              strokeWidth="1.5"
-              markerEnd={`url(#${arrowId})`}
-              className="stroke-(--text-muted)"
-            />
-          ))}
-          {layout.nodes.map((p) => {
-            const n = byId.get(p.id);
-            if (!n) return null;
-            return (
-              <g
-                key={p.id}
-                data-node-id={p.id}
-                data-layer={p.layer}
-                data-status={n.status}
-                className="plan-node"
-                transform={`translate(${p.x} ${p.y})`}
-              >
-                <title>{`${n.title} (${nodeMeta(n)})`}</title>
-                <rect
-                  width={p.width}
-                  height={p.height}
-                  rx="12"
-                  strokeWidth="1.5"
-                />
-                <text
-                  x="12"
-                  y="18"
-                  className="fill-(--text-muted) font-mono text-[10.5px]"
-                >
-                  {`${stepOf.get(p.id) ?? ""} · ${p.id}`}
-                </text>
-                <text className="fill-(--text) font-medium text-[12.5px]">
-                  {wrapTitle(n.title, budget(p.width)).map((line, i) => (
-                    <tspan
-                      key={i === 0 ? "title" : "title-2"}
-                      x="12"
-                      y={35 + i * SECOND_LINE}
-                    >
-                      {line}
-                    </tspan>
-                  ))}
-                </text>
-                <text
-                  x="12"
-                  y={twoLine ? 52 + SECOND_LINE : 52}
-                  className="fill-(--text-muted) text-[11px]"
-                >
-                  {clip(nodeMeta(n), budget(p.width) + 2)}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
+    <li
+      data-testid={`plan-node-${node.id}`}
+      data-node-id={node.id}
+      data-status={status}
+      className="plan-card min-w-0 rounded-2xl border-[1.5px] px-3.5 py-3"
+    >
+      <div className="flex min-w-0 items-start gap-2.5">
+        <span className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full bg-chip font-medium text-fg text-xs tabular-nums">
+          <span className="sr-only">Step </span>
+          {step}
+        </span>
+        <div className="min-w-0 flex-1 space-y-0.5">
+          {node.columns.length > 0 && (
+            <p className="break-all font-mono text-[0.6875rem] text-muted leading-5">
+              {node.columns.join(", ")}
+            </p>
+          )}
+          <p className="text-pretty break-words font-medium text-sm leading-5">
+            {node.title}
+          </p>
+        </div>
       </div>
-      <figcaption className="text-muted text-xs leading-5">
-        {nodes.length} {nodes.length === 1 ? "step" : "steps"}, top to bottom in
-        dependency order.
-      </figcaption>
-      {/* The graph's text alternative: every step, its tier, status and inputs. */}
-      <ol aria-label="Plan steps" className="sr-only">
-        {nodes.map((n, i) => {
-          const deps = n.dependsOn
-            .map((d) => stepOf.get(d))
-            .filter((s): s is number => s !== undefined);
-          return (
-            <li key={n.id}>
-              {`Step ${i + 1}: ${n.title} — ${nodeMeta(n)}. `}
-              {deps.length === 0
-                ? "No dependencies."
-                : `Runs after step ${deps.join(", step ")}.`}
-            </li>
-          );
-        })}
-      </ol>
-    </figure>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5 pl-8.5">
+        <span className={`${CHIP} font-mono text-fg`}>{node.tier}</span>
+        <span className={`${CHIP} ${STATUS_TONE[status]}`}>{status}</span>
+      </div>
+      {meta && (
+        <p className="mt-1.5 break-words pl-8.5 text-muted text-xs leading-5">
+          {meta}
+        </p>
+      )}
+      {live && open && node.activity && (
+        <div className="pl-8.5">
+          <ActivityLine key={node.activity.seq} activity={node.activity} />
+        </div>
+      )}
+    </li>
   );
 }
 
-/** The run's plan as a layered DAG, or why there isn't one. */
-export function PlanTab({ state }: { state: RunViewState | null }) {
+/** The downward link between one wave and the next. */
+function Connector() {
+  return (
+    <div aria-hidden="true" className="flex justify-center py-1.5">
+      <svg
+        aria-hidden="true"
+        focusable="false"
+        viewBox="0 0 12 22"
+        width="12"
+        height="22"
+        fill="none"
+        className="text-muted"
+      >
+        <path
+          d="M6 1v18M2 15l4 4 4-4"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </div>
+  );
+}
+
+function Wave({
+  nodes,
+  stepOf,
+  live,
+}: {
+  nodes: NodeViewState[];
+  stepOf: Map<string, number>;
+  live: boolean;
+}) {
+  const headingId = useId();
+  const label =
+    nodes.length > 1 ? `Runs in parallel · ${nodes.length} steps` : "Step";
+  return (
+    <div className="min-w-0 space-y-2">
+      <h2
+        id={headingId}
+        className="font-medium text-muted text-xs uppercase leading-5 tracking-wide"
+      >
+        {label}
+      </h2>
+      <ol aria-labelledby={headingId} className="min-w-0 space-y-2">
+        {nodes.map((n) => (
+          <NodeCard
+            key={n.id}
+            node={n}
+            step={stepOf.get(n.id) ?? 0}
+            deps={n.dependsOn
+              .map((d) => stepOf.get(d))
+              .filter((s): s is number => s !== undefined)}
+            live={live}
+          />
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function PlanWaves({ nodes, live }: { nodes: NodeViewState[]; live: boolean }) {
+  const waves = useMemo(() => {
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    return planWaves(nodes).map((ids) =>
+      ids
+        .map((id) => byId.get(id))
+        .filter((n): n is NodeViewState => n !== undefined),
+    );
+  }, [nodes]);
+  const stepOf = new Map(nodes.map((n, i) => [n.id, i + 1]));
+  return (
+    <section aria-label="Plan steps" className="min-w-0 space-y-3">
+      <p className="text-muted text-xs leading-5">
+        {plural(nodes.length, "step", "steps")} in{" "}
+        {plural(waves.length, "wave", "waves")}, top to bottom in dependency
+        order.
+      </p>
+      <div className="min-w-0">
+        {waves.map((wave, i) => (
+          <div key={wave[0]?.id ?? i} className="min-w-0">
+            {i > 0 && <Connector />}
+            <Wave nodes={wave} stepOf={stepOf} live={live} />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+export interface PlanTabProps {
+  state: RunViewState | null;
+  /** The stream is connected and the run unfinished: show live activity. */
+  live?: boolean;
+}
+
+/** The run's plan as vertical dependency waves, or why there isn't one. */
+export function PlanTab({ state, live = false }: PlanTabProps) {
   if (!state?.planned) {
     return (
       <div className="grid min-h-40 place-items-center gap-2 rounded-xl bg-chip px-4 text-center">
         <p className="text-muted text-sm">
           {state?.status === "failed"
             ? "The run stopped before a plan was made."
-            : "Planning… the step graph appears once the profile is read."}
+            : "Planning… the steps appear once the profile is read."}
         </p>
       </div>
     );
@@ -200,5 +241,5 @@ export function PlanTab({ state }: { state: RunViewState | null }) {
       </div>
     );
   }
-  return <PlanGraph nodes={state.nodes} />;
+  return <PlanWaves nodes={state.nodes} live={live && !state.finished} />;
 }

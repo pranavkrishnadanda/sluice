@@ -35,16 +35,16 @@ async function afterLoad(page: Page, mode: Mode) {
 
 /**
  * Most text axe still cannot measure with opaque glass, per view: the brand
- * link on the bare backdrop gradient (every view), the diff's "−" marker
- * glyph (Code), and the SVG plan-node text plus its overlapped caption
- * (Plan; the sr-only "Plan steps" list is its text alternative). A regression
- * that hides real text from the contrast check pushes a view over its limit.
+ * link on the bare backdrop gradient (every view) and the diff's "−" marker
+ * glyph (Code). The Plan tab is plain HTML cards now, so it is fully
+ * measured. A regression that hides real text from the contrast check
+ * pushes a view over its limit.
  */
 const INCOMPLETE_LIMIT: Record<string, number> = {
   "Data tab": 1,
   "Live run": 1,
   "Code tab, diff": 2,
-  "Plan tab": 8,
+  "Plan tab": 1,
   Evals: 1,
 };
 
@@ -91,7 +91,7 @@ for (const colorScheme of ["light", "dark"] as const) {
 
         await details.getByRole("tab", { name: "Plan" }).click();
         await expect(
-          details.getByRole("list", { name: "Plan steps" }),
+          details.getByRole("region", { name: "Plan steps" }),
         ).toBeAttached();
         expectClean(await scan(page), mode, "Plan tab");
       });

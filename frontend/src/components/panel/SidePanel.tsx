@@ -256,6 +256,8 @@ export interface SidePanelProps {
   state: RunViewState | null;
   /** Fixed Data-table viewport height in px; tests only (jsdom has no layout). */
   dataViewportHeight?: number;
+  /** The run's stream is connected and unfinished (live activity lines). */
+  live?: boolean;
 }
 
 /**
@@ -269,6 +271,7 @@ export function SidePanel({
   runId,
   state,
   dataViewportHeight,
+  live = false,
 }: SidePanelProps) {
   const api = useApi();
   const sample = api.isSampleReplay?.(runId) ?? false;
@@ -371,7 +374,7 @@ export function SidePanel({
       </Tabs.Content>
 
       <Tabs.Content value="plan" className="focus-visible:outline-offset-4">
-        <PlanTab state={state} />
+        <PlanTab state={state} live={live} />
       </Tabs.Content>
     </Tabs.Root>
   );
@@ -384,5 +387,12 @@ export function SidePanel({
  */
 export function RunSidePanel({ runId }: { runId: string }) {
   const stream = useRunStream();
-  return <SidePanel key={runId} runId={runId} state={stream?.state ?? null} />;
+  return (
+    <SidePanel
+      key={runId}
+      runId={runId}
+      state={stream?.state ?? null}
+      live={stream?.connection === "live"}
+    />
+  );
 }
