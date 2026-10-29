@@ -92,14 +92,18 @@ function eventsOf<T extends RunEvent["type"]>(
  * Records, from page load, when the thread first shows the plan (a row
  * past "Rules" other than "Planning repairs…") and when the run summary
  * (rendered on `run_finished`) appears, so the spec can tell a live stream
- * from a history that arrived all at once.
+ * from a history that arrived all at once. Also records when the details
+ * panel first lists an attempt as passed (the Code tab's accepted transform).
  */
+interface Timeline {
+  planAt: number | null;
+  summaryAt: number | null;
+  codeAt: number | null;
+}
+
 async function recordThreadTimeline(page: Page) {
   await page.addInitScript(() => {
-    const timeline: { planAt: number | null; summaryAt: number | null } = {
-      planAt: null,
-      summaryAt: null,
-    };
+    const timeline: Timeline = { planAt: null, summaryAt: null, codeAt: null };
     Object.assign(window, { sluiceE2eTimeline: timeline });
     const check = () => {
       const now = performance.now();
@@ -112,6 +116,16 @@ async function recordThreadTimeline(page: Page) {
         !rows.some((t) => t.includes("Planning repairs"))
       ) {
         timeline.planAt = now;
+      }
+      if (
+        timeline.codeAt === null &&
+        [
+          ...document.querySelectorAll(
+            'aside[aria-label="Details"] fieldset label',
+          ),
+        ].some((l) => (l.textContent ?? "").includes("passed"))
+      ) {
+        timeline.codeAt = now;
       }
       if (
         timeline.summaryAt === null &&
@@ -184,6 +198,13 @@ test.describe("live backend", () => {
       new URL(page.url()).pathname.split("/").at(-1) ?? "",
     );
 
+    // Open the Code tab now, while the run is in flight, and keep it open:
+    // it refetches transforms only when an attempt fails or finishes, so an
+    // accepted transform it shows later came from the live run, not a
+    // refetch after the end.
+    const details = page.getByRole("complementary", { name: "Details" });
+    await details.getByRole("tab", { name: "Code" }).click();
+
     // The new run is listed (and current) in the sidebar.
     // (By its link: a repeat upload of the case lists the same file name.)
     const nav = page.getByRole("navigation", { name: "Primary" });
@@ -224,17 +245,19 @@ test.describe("live backend", () => {
     ).toBeVisible();
     await expect(summary.getByText(final.summary)).toBeVisible();
 
-    const details = page.getByRole("complementary", { name: "Details" });
+    // The sidebar settles on the final status with no reload: the list is
+    // refetched when `run_finished` arrives.
+    await expect(runLink).toHaveAttribute("aria-current", "page");
+    await expect(runLink).toHaveAccessibleName(
+      new RegExp(
+        `^${escapeRegExp(input.name)}\\s*, ${STATUS_LABEL[final.status]}$`,
+      ),
+    );
+
     const timeline = await page.evaluate(
       () =>
-        (
-          window as unknown as {
-            sluiceE2eTimeline: {
-              planAt: number | null;
-              summaryAt: number | null;
-            };
-          }
-        ).sluiceE2eTimeline,
+        (window as unknown as { sluiceE2eTimeline: Timeline })
+          .sluiceE2eTimeline,
     );
 
     if (!plan) {
@@ -249,6 +272,7 @@ test.describe("live backend", () => {
         "run_started",
         "run_finished",
       ]);
+      await details.getByRole("tab", { name: "Data" }).click();
       await expect(
         details.getByText("No preview — this run didn’t load any data."),
       ).toBeVisible();
@@ -266,37 +290,20 @@ test.describe("live backend", () => {
       expect(timeline.summaryAt, "summary shown").not.toBeNull();
       expect(timeline.planAt ?? 0).toBeLessThan(timeline.summaryAt ?? 0);
 
-      // Data: before/after rows once the run loaded.
-      if (loaded) {
-        const values = details.getByRole("table", {
-          name: "Before and after values",
-        });
-        await expect(values).toBeVisible({ timeout: 30_000 });
-        await expect(values.locator("tbody tr").first()).toBeVisible();
-        await expect(
-          values.getByRole("columnheader", { name: "before" }),
-        ).toBeVisible();
-        await expect(
-          values.getByRole("columnheader", { name: "after" }),
-        ).toBeVisible();
-        // The UI retried until the preview was written; nothing else failed.
-        expect(previews.at(-1)?.status).toBe(200);
-        for (const p of previews.filter((r) => r.status !== 200)) {
-          expect(p).toEqual({ status: 409, code: "not_ready" });
-        }
-      } else {
-        await expect(
-          details.getByText("No preview — this run didn’t load any data."),
-        ).toBeVisible();
-      }
-      expect((await scan(page)).blocking, "axe: Data tab").toEqual([]);
-
       // Code: each accepted transform, when the plan had nodes.
       const accepted = eventsOf(events, "node_finished").filter(
         (e) => e.tier !== "rules",
       );
-      await details.getByRole("tab", { name: "Code" }).click();
       if (accepted.length > 0) {
+        // Shown in the tab opened during the run (see above): the API served
+        // each transform as its attempt ended.
+        expect(timeline.codeAt, "accepted transform shown live").not.toBeNull();
+        test.info().annotations.push({
+          type: "code-tab",
+          description: `first passed attempt shown ${Math.round(
+            (timeline.codeAt ?? 0) - (timeline.summaryAt ?? 0),
+          )} ms relative to the run summary`,
+        });
         const transforms = await getTransforms(runId);
         for (const done of accepted) {
           const transform = transforms.find((t) => t.id === done.transformId);
@@ -328,6 +335,32 @@ test.describe("live backend", () => {
         }
         expect((await scan(page)).blocking, "axe: Code tab").toEqual([]);
       }
+      await details.getByRole("tab", { name: "Data" }).click();
+
+      // Data: before/after rows once the run loaded.
+      if (loaded) {
+        const values = details.getByRole("table", {
+          name: "Before and after values",
+        });
+        await expect(values).toBeVisible({ timeout: 30_000 });
+        await expect(values.locator("tbody tr").first()).toBeVisible();
+        await expect(
+          values.getByRole("columnheader", { name: "before" }),
+        ).toBeVisible();
+        await expect(
+          values.getByRole("columnheader", { name: "after" }),
+        ).toBeVisible();
+        // The UI retried until the preview was written; nothing else failed.
+        expect(previews.at(-1)?.status).toBe(200);
+        for (const p of previews.filter((r) => r.status !== 200)) {
+          expect(p).toEqual({ status: 409, code: "not_ready" });
+        }
+      } else {
+        await expect(
+          details.getByText("No preview — this run didn’t load any data."),
+        ).toBeVisible();
+      }
+      expect((await scan(page)).blocking, "axe: Data tab").toEqual([]);
 
       // Plan: one step per planned node.
       if (plan.nodes.length > 0) {
@@ -347,23 +380,6 @@ test.describe("live backend", () => {
       fullPage: true,
       animations: "disabled",
     });
-
-    // Reopening the finished run replays its history to the same outcome,
-    // and the sidebar lists it with its final status. (Checked after a
-    // reload: the backend publishes `run_finished` before it marks the run
-    // finished, so the list refetched on `run_finished` can still say
-    // "Running"; see the task-8 report.)
-    await page.reload();
-    await expect(summary).toBeVisible({ timeout: 30_000 });
-    await expect(
-      summary.getByText(STATUS_LABEL[final.status], { exact: true }),
-    ).toBeVisible();
-    await expect(runLink).toHaveAttribute("aria-current", "page");
-    await expect(runLink).toHaveAccessibleName(
-      new RegExp(
-        `^${escapeRegExp(input.name)}\\s*, ${STATUS_LABEL[final.status]}$`,
-      ),
-    );
 
     expect(problems).toEqual([]);
   });
