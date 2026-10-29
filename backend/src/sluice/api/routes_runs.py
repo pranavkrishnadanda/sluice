@@ -62,6 +62,11 @@ LIST_LIMIT: Final = 100
 MAX_FIELD_BYTES: Final = 1024
 """Longest accepted ``table`` field value (the real values are 6-8 bytes)."""
 MAX_PARTS: Final = 16
+MAX_PART_HEADER_BYTES: Final = 8 * 1024
+"""Longest multipart part header (name or value, and the whole line for python-multipart's own
+check); 422 ``invalid_request`` above it. HTTP request headers are uvicorn's concern."""
+MAX_PART_HEADERS: Final = 8
+"""Headers per multipart part (python-multipart's default, pinned here)."""
 MULTIPART_OVERHEAD: Final = 64 * 1024
 """Body bytes allowed on top of the file limit: boundaries, part headers, the ``table`` field."""
 MAX_OFFSET: Final = 2**31 - 1
@@ -159,7 +164,8 @@ class MultipartStream:
 
     Raises (from :meth:`next`): :class:`TooLarge` once more than ``max_total`` body bytes have
     arrived, :class:`BadForm` for malformed bodies, a second ``file`` part, an over-long
-    ``table`` value, too many parts or a body that ends mid-way.
+    ``table`` value or part header (:data:`MAX_PART_HEADER_BYTES`), too many parts or a body
+    that ends mid-way. Memory: O(one chunk + MAX_PART_HEADER_BYTES).
     """
 
     def __init__(self, chunks: AsyncIterator[bytes], boundary: bytes, max_total: int) -> None:
@@ -188,6 +194,8 @@ class MultipartStream:
                 "on_headers_finished": self._on_headers_finished,
                 "on_end": self._on_end,
             },
+            max_header_size=MAX_PART_HEADER_BYTES,
+            max_header_count=MAX_PART_HEADERS,
         )
 
     async def next(self) -> Event | None:
@@ -208,7 +216,7 @@ class MultipartStream:
             try:
                 self._parser.write(chunk)
             except FormParserError as exc:
-                raise BadForm("malformed multipart body") from exc
+                raise BadForm(_parse_error_reason(exc)) from exc
         return self._pending.popleft()
 
     # parser callbacks (synchronous, called from ``write``) ----------------------------------
@@ -222,10 +230,10 @@ class MultipartStream:
         self._field.clear()
 
     def _on_header_field(self, data: bytes, start: int, end: int) -> None:
-        self._header_name += data[start:end]
+        _append_capped(self._header_name, data[start:end], "a multipart part header name")
 
     def _on_header_value(self, data: bytes, start: int, end: int) -> None:
-        self._header_value += data[start:end]
+        _append_capped(self._header_value, data[start:end], "a multipart part header value")
 
     def _on_header_end(self) -> None:
         if bytes(self._header_name).lower() == b"content-disposition":
@@ -265,6 +273,23 @@ class MultipartStream:
 
     def _on_end(self) -> None:
         self._ended = True
+
+
+def _parse_error_reason(exc: FormParserError) -> str:
+    """User-facing reason for a python-multipart error (its text is the library's own)."""
+    if "header" in str(exc).lower():
+        return (
+            f"a multipart part header is longer than {MAX_PART_HEADER_BYTES // 1024} KiB "
+            f"or a part has more than {MAX_PART_HEADERS} headers"
+        )
+    return "malformed multipart body"
+
+
+def _append_capped(buffer: bytearray, data: bytes, what: str) -> None:
+    """Grow a part-header buffer, refusing more than :data:`MAX_PART_HEADER_BYTES` in it."""
+    if len(buffer) + len(data) > MAX_PART_HEADER_BYTES:
+        raise BadForm(f"{what} is longer than {MAX_PART_HEADER_BYTES // 1024} KiB")
+    buffer += data
 
 
 async def _file_chunks(form: MultipartStream) -> AsyncIterator[bytes]:

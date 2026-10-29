@@ -29,6 +29,7 @@ from sluice.api.blobs import LocalBlobStore
 from sluice.api.routes_runs import (
     DECODED_TOO_LARGE_DETAIL,
     MAX_FIELD_BYTES,
+    MAX_PART_HEADER_BYTES,
     PREVIEW_SAVE_GRACE_S,
     TOO_LARGE_DETAIL,
     sanitise_file_name,
@@ -270,6 +271,48 @@ def test_post_runs_oversized_table_field_is_422(client: TestClient, store: Route
     res = _post(client, table="o" * (MAX_FIELD_BYTES + 1))
     assert res.status_code == 422
     assert store.runs == {}
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        'Content-Disposition: form-data; name="table"; x="' + "a" * MAX_PART_HEADER_BYTES + '"',
+        "X-" + "n" * MAX_PART_HEADER_BYTES + ": v",
+    ],
+    ids=["long-value", "long-name"],
+)
+def test_post_runs_part_header_over_8kib_is_422(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore, header: str
+) -> None:
+    boundary = "b0undary"
+    body = f"--{boundary}\r\n{header}\r\n\r\norders\r\n--{boundary}--\r\n".encode()
+    res = client.post(
+        "/runs", content=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    )
+    assert res.status_code == 422
+    assert res.json()["code"] == "invalid_request"
+    assert "header" in res.json()["detail"]
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_part_header_just_under_8kib_is_accepted(client: TestClient) -> None:
+    name = "o" * (MAX_PART_HEADER_BYTES - 200) + ".csv"
+    res = _post(client, name=name)
+    assert res.status_code == 201
+    assert len(res.json()["fileName"]) == 255  # the display name is still capped
+
+
+def test_part_header_buffer_refuses_growth_past_the_cap() -> None:
+    from sluice.api.routes_runs import BadForm, _append_capped
+
+    buffer = bytearray(b"x" * MAX_PART_HEADER_BYTES)
+    with pytest.raises(BadForm, match="8 KiB"):
+        _append_capped(buffer, b"y", "a header value")
+    assert len(buffer) == MAX_PART_HEADER_BYTES
+
+
+def test_part_header_cap_is_8_kib() -> None:
+    assert MAX_PART_HEADER_BYTES == 8 * 1024
 
 
 @pytest.mark.parametrize("name", ["orders.txt", "orders", "orders.csv.exe", "orders.xlsx"])

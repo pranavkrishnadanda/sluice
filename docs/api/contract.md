@@ -51,7 +51,7 @@ responses and its own connection copy for network errors and 5xx.
 | `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
-| `422` | Unknown `table`, a missing form field, or a file that cannot be parsed in its format |
+| `422` | Unknown `table`, a missing form field, a malformed multipart body (including a part header longer than **8 KiB** or more than 8 headers in one part; `code: "invalid_request"`), or a file that cannot be parsed in its format |
 | `422` | `code: "too_large_decoded"`: a `.parquet` upload whose footer declares more than **5,000,000 rows** or more than **1 GiB** of decoded data (checked before the data is read) |
 
 ## Base URL, CORS and configuration
