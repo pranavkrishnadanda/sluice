@@ -202,6 +202,25 @@ class LLMUnavailable(LLMError):
         self.status_code = status_code
 
 
+@dataclass(frozen=True, slots=True)
+class Backoff:
+    """A rate-limit wait of one `LLM.run` call, as told to an `LLM.on_backoff` hook.
+
+    The hook hears each wait twice: ``done=False`` just before the client sleeps ``wait_s``
+    seconds, ``done=True`` once it has. Only the role, tier and wait: no provider text.
+    """
+
+    role: str
+    tier: Tier
+    wait_s: float
+    done: bool
+
+
+BackoffHook = Callable[[Backoff], None]
+
+_backoff_hook: ContextVar[BackoffHook | None] = ContextVar("sluice_llm_backoff", default=None)
+"""Told about every rate-limit wait of the `run` calls in its `LLM.on_backoff` block."""
+
 _deadline: ContextVar[float | None] = ContextVar("sluice_llm_deadline", default=None)
 """Absolute time (the client's clock) by which rate-limit back-off must end; see `wall_budget`.
 In-flight requests are not cut off at it (each is bounded by `REQUEST_TIMEOUT_S` instead)."""
@@ -321,6 +340,20 @@ class LLM:
         finally:
             _deadline.reset(token)
 
+    @contextlib.contextmanager
+    def on_backoff(self, hook: BackoffHook) -> Iterator[None]:
+        """Call ``hook`` around every rate-limit wait of the `run` calls inside this block.
+
+        Context-local like `wall_budget`: asyncio tasks started inside the block inherit it, and
+        an inner block replaces it until it ends. The hook runs on the event loop, synchronously;
+        its exceptions propagate out of `run`.
+        """
+        token = _backoff_hook.set(hook)
+        try:
+            yield
+        finally:
+            _backoff_hook.reset(token)
+
     async def run[T](
         self, role: str, tier: Tier, system: str, prompt: str, output_type: type[T]
     ) -> tuple[T, CallRecord]:
@@ -393,7 +426,12 @@ class LLM:
                     wait = _backoff_s(throttled, attempt.retry_after)
                     if self._clock() + wait <= deadline:
                         throttled += 1
+                        hook = _backoff_hook.get()
+                        if hook is not None:
+                            hook(Backoff(role=role, tier=tier, wait_s=wait, done=False))
                         await self._sleep(wait)
+                        if hook is not None:
+                            hook(Backoff(role=role, tier=tier, wait_s=wait, done=True))
                         continue
                 if attempt.kind == "invalid":
                     raise LLMOutputError(
