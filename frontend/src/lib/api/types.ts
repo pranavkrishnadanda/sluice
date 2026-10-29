@@ -184,6 +184,17 @@ export interface DataPreview {
   /** `offset` for the next page; `null` after the last page. */
   nextOffset: number | null;
 }
+/** One page of `GET /runs/{id}/input`: the uploaded file's raw rows. */
+export interface RawInput {
+  /** The file's own column names (nested JSON flattened), not the contract's. */
+  columns: string[];
+  /** One array per row, in `columns` order; `null` for an empty cell. */
+  rows: (string | null)[][];
+  /** Rows in the uploaded file. */
+  totalRows: number;
+  /** `offset` for the next page; `null` after the last page. */
+  nextOffset: number | null;
+}
 export interface PreviewPage {
   offset: number;
   /** Capped by the server at {@link PREVIEW_MAX_LIMIT}. */

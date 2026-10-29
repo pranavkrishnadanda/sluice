@@ -48,13 +48,14 @@ from sluice.agent.events import TableName
 from sluice.agent.mapping import resolve_table
 from sluice.api.blobs import BlobStore, TooLarge
 from sluice.api.errors import ApiError
-from sluice.api.schemas import DataPreview, RunSummary, Transform
+from sluice.api.schemas import DataPreview, RawInput, RunSummary, Transform
 from sluice.api.settings import MAX_UPLOAD_BYTES
 from sluice.api.store import MAX_FILE_NAME_CHARS, TERMINAL_STATUSES, RunRow, RunStore
 from sluice.contracts.model import Contract, known_contracts, load_contract
 from sluice.io import DecodedTooLarge, read_input
 from sluice.runs.execute import file_sha256
 from sluice.runs.preview import PREVIEW_MAX_LIMIT, page_preview
+from sluice.runs.raw_input import read_raw_page
 
 _log = logging.getLogger(__name__)
 
@@ -598,3 +599,21 @@ async def get_preview(
     """A page of the before/after preview; ``409`` until the run has emitted ``loaded``."""
     state = request.app.state
     return await asyncio.to_thread(_preview, state.store, state.blobs, run_id, offset, limit)
+
+
+def _raw_input(store: RunStore, blobs: BlobStore, run_id: str, offset: int, limit: int) -> RawInput:
+    row = _run_or_404(store, run_id)
+    with blobs.open_local(row.blob_key) as path:
+        return read_raw_page(path, offset, min(limit, PREVIEW_MAX_LIMIT))
+
+
+@router.get("/runs/{run_id}/input", response_model=RawInput)
+async def get_input(
+    request: Request,
+    run_id: str,
+    offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
+    limit: Annotated[int, Query(ge=1)] = PREVIEW_MAX_LIMIT,
+) -> RawInput:
+    """A page of the uploaded file's raw rows as text, from the moment the run exists."""
+    state = request.app.state
+    return await asyncio.to_thread(_raw_input, state.store, state.blobs, run_id, offset, limit)

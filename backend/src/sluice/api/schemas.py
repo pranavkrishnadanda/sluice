@@ -88,6 +88,15 @@ class DataPreview(ApiModel):
     next_offset: Count | None
 
 
+class RawInput(ApiModel):
+    """One page of ``GET /runs/{id}/input``: the uploaded file's own columns and raw text."""
+
+    columns: list[str]
+    rows: list[list[str | None]]
+    total_rows: Count
+    next_offset: Count | None
+
+
 class CI(ApiModel):
     """A 95% interval."""
 

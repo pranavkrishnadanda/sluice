@@ -46,7 +46,7 @@ responses and its own connection copy for network errors and 5xx.
 | Status | When |
 | --- | --- |
 | `403` | A non-`GET` request (e.g. `POST /runs`) whose `Origin` header is not an allowed UI origin: `code` is `forbidden_origin`, answered before the body is read. Requests without `Origin` (curl, scripts) are allowed |
-| `404` | Unknown run id (any `/runs/{id}/...` route) |
+| `404` | Unknown run id (any `/runs/{id}/...` route, `GET /runs/{id}/input` included) |
 | `404` | `GET /evals/summary` before any scored agent eval run exists: `code` is `no_evals` |
 | `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
@@ -141,6 +141,11 @@ export interface DataPreview {
   columns: string[]; rows: PreviewRow[]; totalRows: number; nextOffset: number | null;
 }
 export interface PreviewPage { offset: number; limit: number }
+export interface RawInput {                       // GET /runs/{id}/input
+  columns: string[];                              // the file's own columns, not the contract's
+  rows: (string | null)[][];                      // one array per row, in `columns` order
+  totalRows: number; nextOffset: number | null;
+}
 export interface CI { mean: number; lo: number; hi: number }
 export interface EvalSummary {
   split: "dev" | "holdout" | "ood"; n: number; generatedAt: string;
@@ -157,6 +162,7 @@ export interface ApiClient {
   streamEvents(runId: string, onEvent: (e: RunEvent) => void, signal: AbortSignal): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
+  getInput(runId: string, page: PreviewPage): Promise<RawInput>;
   getEvalSummary(): Promise<EvalSummary>;
   isSampleReplay?(runId: string): boolean; // demo mock only, not an HTTP route
 }
@@ -171,6 +177,7 @@ export interface ApiClient {
 | `streamEvents(runId, onEvent, signal)` | `GET /runs/{id}/events` (`Accept: text/event-stream`) | `200` SSE stream of `RunEvent`, see below |
 | `getTransforms(runId)` | `GET /runs/{id}/transforms` | `200` `Transform[]`, see below |
 | `getPreview(runId, { offset, limit })` | `GET /runs/{id}/preview?offset=<n>&limit=<n>` | `200` `DataPreview`, see below; `409` before `loaded` |
+| `getInput(runId, { offset, limit })` | `GET /runs/{id}/input?offset=<n>&limit=<n>` | `200` `RawInput`, see [Uploaded file](#uploaded-file); available from creation |
 | `getEvalSummary()` | `GET /evals/summary` | `200` `EvalSummary`; `404` `no_evals` before any eval run |
 
 Path parameters are URL-encoded. Unknown run ids return `404`.
@@ -373,6 +380,24 @@ before/after preview:
   as null and flagged for review.
 - `rows[].quarantined` is `true` when the whole row was held back from the
   load; `reason` says why (`null` otherwise).
+
+## Uploaded file
+
+`GET /runs/{id}/input?offset=<n>&limit=<n>` pages through the **uploaded
+file's raw rows**, as stored, from the moment the run is created (queued,
+running, held back, failed or loaded alike). The UI shows it before
+`loaded`, and for runs that never load, as "Uploaded file (not loaded)".
+
+- `404` for an unknown run id. Paging is as for the preview: `offset`
+  defaults to `0`; `limit` defaults to, and is capped at, **1,000**;
+  `nextOffset` is `null` after the last page; an `offset` past the end gives
+  `rows: []`.
+- `columns` are the **file's own column names** (nested JSON objects are
+  flattened to dotted names such as `customer.name`), not the contract's.
+- `rows[i][j]` is the text of column `columns[j]` in that row, or `null` for
+  an empty or missing cell. CSV and JSON cells are the raw text; Parquet
+  values are rendered as text (`"3.25"`, `"true"`).
+- `totalRows` is the number of rows in the file.
 
 ## Evals
 
