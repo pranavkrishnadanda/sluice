@@ -25,6 +25,7 @@ function stubClient(listRuns: () => Promise<RunSummary[]>): ApiClient {
     streamEvents: never,
     getTransforms: never,
     getPreview: never,
+    getInput: never,
     getEvalSummary: never,
   };
 }

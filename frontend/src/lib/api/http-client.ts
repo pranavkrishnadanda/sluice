@@ -3,10 +3,11 @@ import type {
   ApiClient,
   DataPreview,
   EvalSummary,
+  InputPreview,
   PreviewPage,
   RunEvent,
   RunSummary,
-  TableName,
+  TableChoice,
   Transform,
 } from "./types";
 
@@ -92,6 +93,12 @@ function isRunEvent(value: unknown): value is RunEvent {
   );
 }
 
+const pageQuery = (page: PreviewPage) =>
+  new URLSearchParams({
+    offset: String(page.offset),
+    limit: String(page.limit),
+  });
+
 function wait(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted || ms <= 0) return resolve();
@@ -125,7 +132,7 @@ export class HttpApiClient implements ApiClient {
     return this.#json("/runs");
   }
 
-  createRun(file: File, table: TableName): Promise<RunSummary> {
+  createRun(file: File, table: TableChoice): Promise<RunSummary> {
     const body = new FormData();
     body.append("file", file);
     body.append("table", table);
@@ -137,11 +144,15 @@ export class HttpApiClient implements ApiClient {
   }
 
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview> {
-    const query = new URLSearchParams({
-      offset: String(page.offset),
-      limit: String(page.limit),
-    });
-    return this.#json(`/runs/${encodeURIComponent(runId)}/preview?${query}`);
+    return this.#json(
+      `/runs/${encodeURIComponent(runId)}/preview?${pageQuery(page)}`,
+    );
+  }
+
+  getInput(runId: string, page: PreviewPage): Promise<InputPreview> {
+    return this.#json(
+      `/runs/${encodeURIComponent(runId)}/input?${pageQuery(page)}`,
+    );
   }
 
   getEvalSummary(): Promise<EvalSummary> {

@@ -1,5 +1,6 @@
 import {
   type DataPreview,
+  type InputPreview,
   PREVIEW_MAX_LIMIT,
   type PreviewCell,
   type PreviewPage,
@@ -51,6 +52,11 @@ function indianGrouping(amount: string): string {
 interface PreviewSpec {
   seed: number;
   columns: string[];
+  /**
+   * The uploaded file's shape: its key column (taken from part `part` of
+   * the `"|"`-joined pk) and any column it named differently.
+   */
+  input: { key: string; part: number; renamed?: Record<string, string> };
   row(index: number, rand: () => number): PreviewRow;
 }
 
@@ -58,6 +64,7 @@ const SPECS: Record<string, PreviewSpec> = {
   "run-repaired": {
     seed: 0x5eed_0a1d,
     columns: ["o_custkey", "o_orderdate", "o_totalprice"],
+    input: { key: "o_orderkey", part: 0, renamed: { o_totalprice: "amt" } },
     row(i, rand) {
       const orderKey = 1 + i * 4;
       const custKey = 1 + Math.floor(rand() * 1_500);
@@ -98,6 +105,7 @@ const SPECS: Record<string, PreviewSpec> = {
   "run-clean": {
     seed: 0x5eed_c1ea,
     columns: ["o_clerk", "o_orderdate"],
+    input: { key: "o_orderkey", part: 0 },
     row(i, rand) {
       const clerk = `Clerk#${pad(1 + Math.floor(rand() * 1_000), 9)}`;
       const padded = rand() < 0.08;
@@ -118,6 +126,7 @@ const SPECS: Record<string, PreviewSpec> = {
   "run-quarantined": {
     seed: 0x5eed_9a7e,
     columns: ["l_orderkey", "l_discount", "l_shipmode"],
+    input: { key: "l_linenumber", part: 1 },
     row(i, rand) {
       const orderKey = 1 + Math.floor(i / 4) * 4;
       const lineNumber = 1 + (i % 4);
@@ -179,5 +188,29 @@ export function generatePreview(
     rows,
     totalRows,
     nextOffset: end < totalRows ? end : null,
+  };
+}
+
+/**
+ * One page of the run's uploaded file as raw text: the preview's `before`
+ * values under the file's own column names, same paging and cap.
+ */
+export function generateInput(
+  runId: string,
+  totalRows: number,
+  page: PreviewPage,
+): InputPreview {
+  const spec = SPECS[runId];
+  if (!spec) throw new Error(`No input fixture for ${runId}`);
+  const preview = generatePreview(runId, totalRows, page);
+  const { key, part, renamed = {} } = spec.input;
+  return {
+    columns: [key, ...spec.columns.map((c) => renamed[c] ?? c)],
+    rows: preview.rows.map((row) => [
+      row.pk.split("|")[part] ?? row.pk,
+      ...spec.columns.map((c) => row.cells[c]?.before ?? null),
+    ]),
+    totalRows: preview.totalRows,
+    nextOffset: preview.nextOffset,
   };
 }

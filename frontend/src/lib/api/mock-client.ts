@@ -1,6 +1,6 @@
 import { ApiError } from "./errors";
 import { EVAL_SUMMARY } from "./fixtures/eval-summary";
-import { generatePreview } from "./fixtures/preview";
+import { generateInput, generatePreview } from "./fixtures/preview";
 import {
   RUN_CLEAN,
   RUN_CLEAN_EVENTS,
@@ -16,19 +16,27 @@ import {
   RUN_REPAIRED_EVENTS,
   RUN_REPAIRED_TRANSFORMS,
 } from "./fixtures/run-repaired";
+import { RUN_REPAIRED_LIVE_EVENTS } from "./fixtures/run-repaired-live";
 import type {
   ApiClient,
   DataPreview,
   EvalSummary,
+  InputPreview,
   PreviewPage,
   RunEvent,
   RunSummary,
-  TableName,
+  TableChoice,
   Transform,
 } from "./types";
 
 /** Default pause between replayed events, so the live timeline is watchable. */
 export const MOCK_EVENT_DELAY_MS = 400;
+/**
+ * An `activity` phase is held this many event delays before the next event,
+ * so its spinner and ticking clock are seen; a `waiting` back-off is held
+ * for its `retryInS` (both scaled with `delayMs`, so 0 stays instant).
+ */
+const ACTIVITY_HOLD = 4;
 
 export interface MockApiClientOptions {
   /** Delay between streamed events in ms (default {@link MOCK_EVENT_DELAY_MS}). */
@@ -96,18 +104,14 @@ const transformIdFor = (runId: string, fixtureId: string) =>
   `${runId}_${fixtureId}`;
 
 /**
- * Re-stamps run-repaired's log as a brand-new run starting at `createdAt`,
- * with this run's own transform ids.
+ * run-repaired's live log (with `activity` lines) as a brand-new run, with
+ * this run's own transform ids. `at` is stamped as each event streams.
  */
 function replayAs(summary: RunSummary): RunEvent[] {
-  const origin = Date.parse(RUN_REPAIRED_EVENTS[0]?.at ?? summary.createdAt);
-  const start = Date.parse(summary.createdAt);
-  return RUN_REPAIRED_EVENTS.map((e) => {
-    const at = new Date(start + (Date.parse(e.at) - origin)).toISOString();
+  return RUN_REPAIRED_LIVE_EVENTS.map((e) => {
     if (e.type === "run_started") {
       return {
         ...e,
-        at,
         runId: summary.id,
         fileName: summary.fileName,
         table: summary.table,
@@ -116,13 +120,9 @@ function replayAs(summary: RunSummary): RunEvent[] {
       };
     }
     if (e.type === "node_finished") {
-      return {
-        ...e,
-        at,
-        transformId: transformIdFor(summary.id, e.transformId),
-      };
+      return { ...e, transformId: transformIdFor(summary.id, e.transformId) };
     }
-    return { ...e, at };
+    return { ...e };
   });
 }
 
@@ -149,11 +149,13 @@ export class MockApiClient implements ApiClient {
       .slice(0, MAX_LISTED_RUNS);
   }
 
-  async createRun(file: File, table: TableName): Promise<RunSummary> {
+  async createRun(file: File, table: TableChoice): Promise<RunSummary> {
     const summary: RunSummary = {
       id: `run-${this.#nextRun++}`,
       fileName: file.name,
-      table,
+      // The mock can't read the file: "auto" resolves to the table of the
+      // sample run it replays.
+      table: table === "auto" ? RUN_REPAIRED.table : table,
       // The mock never reads the file, so it has no row count to report.
       rows: null,
       status: "queued",
@@ -184,12 +186,28 @@ export class MockApiClient implements ApiClient {
     signal: AbortSignal,
   ): Promise<void> {
     const run = this.#get(runId);
-    for (const [i, event] of run.events.entries()) {
-      if (i > 0 && this.#delayMs > 0) await pause(this.#delayMs, signal);
+    let previous: RunEvent | null = null;
+    for (const event of run.events) {
+      if (previous && this.#delayMs > 0) {
+        await pause(this.#holdAfter(previous), signal);
+      }
       if (signal.aborted) return;
-      this.#track(run, event);
-      onEvent(structuredClone(event));
+      // A created run is happening now: its clock is the wall clock.
+      const sent = run.sample
+        ? { ...event, at: new Date().toISOString() }
+        : event;
+      this.#track(run, sent);
+      onEvent(structuredClone(sent));
+      previous = event;
     }
+  }
+
+  /** How long the replay waits after `event` before streaming the next. */
+  #holdAfter(event: RunEvent): number {
+    if (event.type !== "activity") return this.#delayMs;
+    const scale = this.#delayMs / MOCK_EVENT_DELAY_MS;
+    const backOff = (event.retryInS ?? 0) * 1_000 * scale;
+    return Math.max(this.#delayMs * ACTIVITY_HOLD, backOff);
   }
 
   async getTransforms(runId: string): Promise<Transform[]> {
@@ -206,6 +224,14 @@ export class MockApiClient implements ApiClient {
     }
     const fixture = this.#get(run.previewOf);
     return generatePreview(run.previewOf, fixture.summary.rows ?? 0, page);
+  }
+
+  async getInput(runId: string, page: PreviewPage): Promise<InputPreview> {
+    // Available from creation, like the server. A created run's file was
+    // never read, so its rows are the sample run's (the UI says so).
+    const run = this.#get(runId);
+    const fixture = this.#get(run.previewOf);
+    return generateInput(run.previewOf, fixture.summary.rows ?? 0, page);
   }
 
   async getEvalSummary(): Promise<EvalSummary> {

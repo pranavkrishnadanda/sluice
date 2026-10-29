@@ -1,4 +1,5 @@
 import {
+  type ActivityPhase,
   type Issue,
   MAX_ATTEMPT_ERROR_CHARS,
   type ModelTier,
@@ -8,6 +9,21 @@ import {
   type RunStatus,
   type TableName,
 } from "@/lib/api/types";
+
+/**
+ * The latest `activity` event: what is being performed right now. The UI
+ * ticks the elapsed time (and a `waiting` countdown) from `at`.
+ */
+export interface ActivityView {
+  seq: number;
+  /** When the phase started (the event's `at`). */
+  at: string;
+  phase: ActivityPhase;
+  message: string;
+  tier: ModelTier | null;
+  attempt: number | null;
+  retryInS: number | null;
+}
 
 export type NodeStatus = "pending" | "running" | "retrying" | "done" | "failed";
 
@@ -35,6 +51,8 @@ export interface NodeViewState {
   latencyMs: number | null;
   lastError: string | null;
   transformId: string | null;
+  /** What this node is doing right now; `null` between phases. */
+  activity: ActivityView | null;
 }
 
 export interface RunViewState {
@@ -69,6 +87,11 @@ export interface RunViewState {
    */
   totals: { costUsd: number; tokens: number; latencyMs: number };
   summary: string | null;
+  /**
+   * Run-wide activity (an `activity` with no `nodeId`), e.g. planning or
+   * loading; cleared by any later non-activity event.
+   */
+  activity: ActivityView | null;
   finished: boolean;
   startedAt: string | null;
   finishedAt: string | null;
@@ -92,6 +115,7 @@ export const INITIAL_RUN_VIEW_STATE: RunViewState = {
   loaded: null,
   totals: { costUsd: 0, tokens: 0, latencyMs: 0 },
   summary: null,
+  activity: null,
   finished: false,
   startedAt: null,
   finishedAt: null,
@@ -113,6 +137,7 @@ function toNode(node: PlanNode): NodeViewState {
     latencyMs: null,
     lastError: null,
     transformId: null,
+    activity: null,
   };
 }
 
@@ -140,6 +165,7 @@ function onNodeFinished(
       latencyMs: e.latencyMs,
       lastError: null,
       transformId: e.transformId,
+      activity: null,
     })),
     totals: known
       ? {
@@ -166,6 +192,7 @@ function onAttemptFailed(
       lastError: e.error.slice(0, MAX_ATTEMPT_ERROR_CHARS),
       costUsd: n.costUsd + e.costUsd,
       tokens: n.tokens + e.tokens,
+      activity: null,
     })),
     totals: known
       ? {
@@ -200,6 +227,29 @@ function closeOpenNodes(nodes: NodeViewState[]): NodeViewState[] {
   });
 }
 
+function onActivity(
+  state: RunViewState,
+  e: RunEventOf<"activity">,
+): Partial<RunViewState> {
+  const view: ActivityView = {
+    seq: e.seq,
+    at: e.at,
+    phase: e.phase,
+    message: e.message,
+    tier: e.tier,
+    attempt: e.attempt,
+    retryInS: e.retryInS,
+  };
+  if (e.nodeId === null) return { activity: view };
+  // Unknown node: nothing to attach it to (like other node events).
+  if (!state.nodes.some((n) => n.id === e.nodeId)) return {};
+  // A newer, node-scoped activity supersedes the run-wide one.
+  return {
+    activity: null,
+    nodes: updateNode(state, e.nodeId, () => ({ activity: view })),
+  };
+}
+
 function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
   switch (e.type) {
     case "run_started":
@@ -223,12 +273,19 @@ function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
       };
     case "node_started":
       return {
-        nodes: updateNode(state, e.nodeId, () => ({
+        nodes: updateNode(state, e.nodeId, (n) => ({
           status: e.attempt > 1 ? "retrying" : "running",
           attempt: e.attempt,
           maxAttempts: e.maxAttempts,
+          // The tier this attempt uses (older servers omit it).
+          tier: e.tier ?? n.tier,
+          // The server may announce an attempt's first phase just before
+          // its node_started; only an earlier attempt's activity is stale.
+          activity: n.activity?.attempt === e.attempt ? n.activity : null,
         })),
       };
+    case "activity":
+      return onActivity(state, e);
     case "attempt_failed":
       return onAttemptFailed(state, e);
     case "node_finished":
@@ -252,8 +309,13 @@ function apply(state: RunViewState, e: RunEvent): Partial<RunViewState> {
         finished: true,
         finishedAt: e.at,
         totals: { ...state.totals, costUsd: e.costUsd, tokens: e.tokens },
-        nodes: closeOpenNodes(state.nodes),
+        nodes: closeOpenNodes(state.nodes).map((n) =>
+          n.activity ? { ...n, activity: null } : n,
+        ),
       };
+    default:
+      // Unknown event types are ignored (contract: clients skip them).
+      return {};
   }
 }
 
@@ -269,5 +331,21 @@ export function reduceRunEvents(
 ): RunViewState {
   const current = state ?? INITIAL_RUN_VIEW_STATE;
   if (e.seq <= current.lastSeq) return current;
-  return { ...current, ...apply(current, e), lastSeq: e.seq };
+  // Any later non-activity event ends the run-wide phase it followed.
+  const cleared =
+    e.type !== "activity" && current.activity
+      ? { ...current, activity: null }
+      : current;
+  return { ...cleared, ...apply(cleared, e), lastSeq: e.seq };
+}
+
+/** The newest activity, run-wide or on any node; `null` when idle. */
+export function latestActivity(state: RunViewState): ActivityView | null {
+  let latest = state.activity;
+  for (const n of state.nodes) {
+    if (n.activity && (!latest || n.activity.seq > latest.seq)) {
+      latest = n.activity;
+    }
+  }
+  return latest;
 }

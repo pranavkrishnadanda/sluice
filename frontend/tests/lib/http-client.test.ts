@@ -59,6 +59,58 @@ describe("HttpApiClient", () => {
     expect(form.get("file")).toBeInstanceOf(File);
   });
 
+  test("createRun sends table=auto to let the server pick", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse(run, 201));
+    vi.stubGlobal("fetch", fetchMock);
+    await new HttpApiClient("http://api.test").createRun(
+      new File(["a\n"], "x.csv"),
+      "auto",
+    );
+    const body = fetchMock.mock.calls[0]?.[1]?.body;
+    expect(body instanceof FormData && body.get("table")).toBe("auto");
+  });
+
+  test("a 422 table_unknown surfaces its code", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async () =>
+        jsonResponse(
+          {
+            detail: "Couldn't tell which table this file is for — pick one.",
+            code: "table_unknown",
+          },
+          422,
+        ),
+      ),
+    );
+    await expect(
+      new HttpApiClient("http://api.test").createRun(
+        new File(["a\n"], "x.csv"),
+        "auto",
+      ),
+    ).rejects.toMatchObject({ status: 422, code: "table_unknown" });
+  });
+
+  test("getInput pages the raw upload and encodes run id", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      jsonResponse({
+        columns: ["a"],
+        rows: [["1"]],
+        totalRows: 1,
+        nextOffset: null,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const input = await new HttpApiClient("http://api.test").getInput("run/1", {
+      offset: 1_000,
+      limit: 1_000,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://api.test/runs/run%2F1/input?offset=1000&limit=1000",
+    );
+    expect(input.rows).toEqual([["1"]]);
+  });
+
   test("getPreview passes offset and limit and encodes run id", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () =>
       jsonResponse({ columns: [], rows: [], totalRows: 0, nextOffset: null }),

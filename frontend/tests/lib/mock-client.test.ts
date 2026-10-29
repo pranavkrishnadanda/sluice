@@ -112,7 +112,10 @@ describe("MockApiClient", () => {
 
     const events = await collect(client, first.id);
     const repaired = await collect(client, "run-repaired");
-    expect(events.map((e) => e.type)).toEqual(repaired.map((e) => e.type));
+    // A live replay adds `activity` lines between the fixture's events.
+    expect(
+      events.filter((e) => e.type !== "activity").map((e) => e.type),
+    ).toEqual(repaired.map((e) => e.type));
     expect(events[0]).toMatchObject({
       type: "run_started",
       runId: "run-1",

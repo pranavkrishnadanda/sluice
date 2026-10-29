@@ -11,6 +11,12 @@ export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 export const MAX_ATTEMPT_ERROR_CHARS = 2_000;
 
 export type TableName = "orders" | "lineitem";
+/**
+ * What `POST /runs` accepts as `table`: a named table, or `"auto"` to let
+ * the server pick the table whose contract the file's columns match best
+ * (422 `code="table_unknown"` when it can't tell).
+ */
+export type TableChoice = TableName | "auto";
 export type RunStatus =
   | "queued"
   | "running"
@@ -37,6 +43,7 @@ export type IssueKind =
 export interface RunSummary {
   id: string;
   fileName: string;
+  /** The resolved table (never `"auto"`). */
   table: TableName;
   /** `null` until the file has been profiled (and for demo replays). */
   rows: number | null;
@@ -56,6 +63,17 @@ export interface PlanNode {
   tier: ModelTier;
   dependsOn: string[];
 }
+/** What the pipeline is doing right now, for the live `activity` line. */
+export type ActivityPhase =
+  | "mapping"
+  | "planning"
+  | "writing"
+  | "sandbox"
+  | "checking"
+  | "verifying"
+  | "waiting"
+  | "loading"
+  | "previewing";
 interface EventBase {
   seq: number;
   at: string;
@@ -79,6 +97,25 @@ export type RunEvent = EventBase &
         attempt: number;
         /** Attempt budget for this node, known from its first attempt. */
         maxAttempts: number;
+        /** The tier this attempt uses; absent from older servers. */
+        tier?: ModelTier;
+      }
+    | {
+        /**
+         * A phase has started. Shown (per node when `nodeId` is set, else
+         * run-wide) until a later activity, node or terminal event replaces
+         * it; `run_finished` clears all. Never a periodic heartbeat: the UI
+         * ticks the elapsed time itself from `at`.
+         */
+        type: "activity";
+        nodeId: string | null;
+        phase: ActivityPhase;
+        /** Short user-facing copy; never prompts, data values or paths. */
+        message: string;
+        tier: ModelTier | null;
+        attempt: number | null;
+        /** With `phase: "waiting"`: seconds until the retry. */
+        retryInS: number | null;
       }
     | {
         type: "attempt_failed";
@@ -153,6 +190,20 @@ export interface PreviewPage {
   /** Capped by the server at {@link PREVIEW_MAX_LIMIT}. */
   limit: number;
 }
+/**
+ * `GET /runs/{id}/input`: the uploaded file's raw rows as text, available
+ * from the run's creation (same paging rules and cap as the preview).
+ */
+export interface InputPreview {
+  /** The file's own column names, in file order. */
+  columns: string[];
+  /** One array per row, aligned with `columns`. */
+  rows: (string | null)[][];
+  /** Rows in the uploaded file. */
+  totalRows: number;
+  /** `offset` for the next page; `null` after the last page. */
+  nextOffset: number | null;
+}
 export interface CI {
   mean: number;
   lo: number;
@@ -190,7 +241,7 @@ export interface EvalSummary {
 export interface ApiClient {
   readonly isDemo: boolean;
   listRuns(): Promise<RunSummary[]>;
-  createRun(file: File, table: TableName): Promise<RunSummary>;
+  createRun(file: File, table: TableChoice): Promise<RunSummary>;
   streamEvents(
     runId: string,
     onEvent: (e: RunEvent) => void,
@@ -198,6 +249,8 @@ export interface ApiClient {
   ): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
+  /** The uploaded file's raw rows (`GET /runs/{id}/input`). */
+  getInput(runId: string, page: PreviewPage): Promise<InputPreview>;
   getEvalSummary(): Promise<EvalSummary>;
   /**
    * Demo only, never part of the HTTP API: `true` when `runId` was created
