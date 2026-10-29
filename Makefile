@@ -1,4 +1,4 @@
-.PHONY: test test-all test-integration lint fmt cases eval-rules results up down ps sandbox-image
+.PHONY: test test-all test-integration lint fmt cases eval-rules results up down ps sandbox-image api
 
 # Default selection (pyproject addopts) excludes integration, live and slow.
 test:
@@ -31,6 +31,11 @@ eval-rules:
 
 results:
 	$(SLUICE) results
+
+# API server for the UI on 127.0.0.1:8080 (port 8000 is reserved). One worker: the event hub and
+# job worker are in-process.
+api:
+	cd backend && PYTHONPATH=src uv run uvicorn sluice.api.app:create_app --factory --host 127.0.0.1 --port 8080 --workers 1
 
 # Services (compose.yaml). Secrets come from backend/.env (copy backend/.env.example).
 COMPOSE = docker compose --env-file backend/.env
