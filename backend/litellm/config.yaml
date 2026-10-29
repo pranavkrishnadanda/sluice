@@ -138,6 +138,10 @@ router_settings:
   #   small:  30 (20b)  + 30 (qwen)               = 60 s
   # sluice.llm.client.REQUEST_TIMEOUT_S (120 s) must exceed both, and caps.MAX_WALL_S_PER_FILE
   # (180 s) must exceed the client timeout; tests/llm/test_litellm_config.py asserts this.
+  # That is the timeout-only bound. Slow retried errors (429/500/503 that each take the full 30 s,
+  # 3 attempts per group) can reach 270 s (strong) / 180 s (small),
+  # sluice.llm.client.SLOW_ERROR_WORST_CASE_S. Such a call ends at the client timeout as
+  # LLMUnavailable, so the file degrades to rules-only output for that step and is never wrong.
   timeout: 30
   num_retries: 2
   # Retries (retry_policy): 429, 500 and 503 are retried up to 2 times on the SAME group (here

@@ -72,17 +72,29 @@ DEFAULT_OUTPUT_MODE: Final[OutputMode] = "native"
 REQUEST_TIMEOUT_S: Final = 120.0
 """Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
 
-Nested between the proxy's worst case and the per-file wall cap, so a hung deployment still
-reaches its last fallback and one hung call cannot by itself exceed a file's wall time. From
-``backend/litellm/config.yaml`` (per-attempt timeout 30 s on every deployment; a timeout is not
-retried, it goes to the next group of the chain), the worst-case proxy path is:
+Nested between the proxy's timeout-only worst case and the per-file wall cap, so a hung
+deployment still reaches its last fallback and one hung call cannot by itself exceed a file's
+wall time. From ``backend/litellm/config.yaml`` (per-attempt timeout 30 s on every deployment; a
+timeout is not retried, it goes to the next group of the chain), the path where every attempt
+*times out* is:
 
 * strong: gpt-oss-120b 30 + Gemini 30 + qwen 30 = 90 s
 * small:  gpt-oss-20b 30 + qwen 30 = 60 s
 
 so 90 s < 120 s (this) < 180 s (``caps.MAX_WALL_S_PER_FILE``). The headroom covers proxy
-overhead and fast-failing 429/5xx retries. ``tests/llm/test_litellm_config.py`` asserts the
-nesting from the config itself."""
+overhead and *fast-failing* 429/5xx retries. ``tests/llm/test_litellm_config.py`` asserts the
+nesting from the config itself.
+
+This does not bound *slow* errors: LiteLLM retries a 429/500/503 twice on the same group, so a
+group can take up to 3 attempts x 30 s (`SLOW_ERROR_WORST_CASE_S`). Such a call hits this
+timeout first and surfaces as `LLMUnavailable`: the file degrades to rules-only output for that
+step, never to wrong output. The numbers are left as they are, since a client timeout above the
+slow-error bound would exceed the per-file wall cap."""
+
+SLOW_ERROR_WORST_CASE_S: Final[dict[str, float]] = {"strong": 270.0, "small": 180.0}
+"""Proxy time if every attempt of every group in the chain fails slowly with a retried error:
+attempts per group (1 + 2 retries) x groups x 30 s. strong = 3 x 3 x 30, small = 3 x 2 x 30.
+Above `REQUEST_TIMEOUT_S` on purpose (see there); the config test recomputes it from the YAML."""
 
 CONNECT_TIMEOUT_S: Final = 5.0
 
@@ -106,11 +118,12 @@ Also the minimum wait, so a Retry-After of 0 or in the past does not hot-loop th
 
 RATE_LIMIT_MAX_BACKOFF_S: Final = 30.0
 """Cap of the computed back-off (the hosted deployments' cooldown is 30 s). A Retry-After the
-provider sends is honoured as is, bounded only by the wall budget."""
+provider sends is honoured as is, bounded only by the wall budget (see `LLM.wall_budget`)."""
 
 DEFAULT_WALL_BUDGET_S: Final = 120.0
-"""Rate-limit waiting allowed per call when no `LLM.wall_budget` is active. The pipeline sets the
-per-file budget (``caps.MAX_WALL_S_PER_FILE``) around each file, so this applies to ad-hoc use."""
+"""Deadline for rate-limit back-off per call when no `LLM.wall_budget` is active. The pipeline sets
+the per-file budget (``caps.MAX_WALL_S_PER_FILE``) around each file, so this applies to ad-hoc use.
+Like the per-file budget it bounds only the waiting, not the requests themselves."""
 
 PROXY_COOLDOWN_MARKER: Final = "No deployments available"
 """LiteLLM's router error when every deployment of the route is cooling down or over its limits.
@@ -187,7 +200,8 @@ class LLMUnavailable(LLMError):
 
 
 _deadline: ContextVar[float | None] = ContextVar("sluice_llm_deadline", default=None)
-"""Absolute time (the client's clock) by which rate-limit waiting must end; see `wall_budget`."""
+"""Absolute time (the client's clock) by which rate-limit back-off must end; see `wall_budget`.
+In-flight requests are not cut off at it (each is bounded by `REQUEST_TIMEOUT_S` instead)."""
 
 
 async def _capture_headers(response: httpx2.Response) -> None:
@@ -289,10 +303,14 @@ class LLM:
 
     @contextlib.contextmanager
     def wall_budget(self, seconds: float) -> Iterator[None]:
-        """Bound rate-limit waiting of every `run` inside this block (and tasks it starts).
+        """Bound rate-limit back-off of every `run` inside this block (and tasks it starts).
 
-        A wait that would end more than `seconds` after entering the block is not started; the
-        call fails as `LLMUnavailable` instead, so a file's wall cap is not overrun by back-off.
+        A back-off wait that would end more than `seconds` after entering the block is not
+        started; the call fails as `LLMUnavailable` instead. So back-off alone never runs past the
+        budget. The budget does not cover time spent in requests: a request started just before
+        the deadline still runs to completion (up to `REQUEST_TIMEOUT_S`). With the pipeline's
+        per-file budget, which checks its wall cap only between attempts, a file can therefore
+        overrun ``MAX_WALL_S_PER_FILE`` by up to one request.
         """
         token = _deadline.set(self._clock() + seconds)
         try:
