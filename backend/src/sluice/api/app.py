@@ -29,6 +29,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from sluice import tracing
 from sluice.api.blobs import BlobStore, S3BlobStore
 from sluice.api.hub import EventHub
+from sluice.api.routes_events import router as events_router
 from sluice.api.schemas import ErrorBody
 from sluice.api.settings import ApiSettings
 from sluice.api.store import RunStore
@@ -287,4 +288,5 @@ def create_app(
         """Liveness: the process is up. Touches no dependency."""
         return {"status": "ok"}
 
+    app.include_router(events_router)
     return app
