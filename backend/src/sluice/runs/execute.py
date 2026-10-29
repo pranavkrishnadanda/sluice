@@ -79,6 +79,7 @@ RunFn = Callable[[CaseInput], SystemOutput]
 LoadFn = Callable[..., LoadResult]
 LoadedFn = Callable[..., LoadResult | None]
 Emit = Callable[[EventModel], None]
+OnTransform = Callable[[dict[str, Any]], None]
 Status = Literal["succeeded", "quarantined", "failed"]
 
 
@@ -208,6 +209,7 @@ def execute_run(
     *,
     run_id: str,
     emit: Emit,
+    on_transform: OnTransform | None = None,
     contract_version: str = "v1",
     run_fn: RunFn | None = None,
     load_fn: LoadFn = load_output,
@@ -222,6 +224,8 @@ def execute_run(
         table: The target contract table (``orders`` / ``lineitem``).
         run_id: The run's opaque id (``[A-Za-z0-9_-]{1,64}``), used end to end.
         emit: Receives each public event, stamped, as it happens (from the calling thread).
+        on_transform: Passed to the system as ``CaseInput.on_transform`` (each transform
+            record, before the event that announces it); ``None`` (``sluice run``): not used.
         contract_version: The contract version to load against.
         run_fn: The system to run (default: :func:`resolve_run_fn`, resolved only when needed).
         load_fn: Loads the output (``sluice.load.iceberg.load_output``).
@@ -246,8 +250,9 @@ def execute_run(
         )
         try:
             ending = _run_and_load(
-                path, contract, run_id, log, run_fn, load_fn, loaded_fn, settings_fn, reference_fn
-            )
+                path, contract, run_id, log, run_fn, load_fn, loaded_fn, settings_fn,
+                reference_fn, on_transform,
+            )  # fmt: skip
         except Exception as exc:
             root.set_attribute("sluice.status", "failed")
             log.publish(log.finished("failed", type(exc).__name__))
@@ -269,6 +274,7 @@ def _run_and_load(
     loaded_fn: LoadedFn,
     settings_fn: Callable[[], Settings],
     reference_fn: Callable[[str], dict[str, set[Any]]],
+    on_transform: OnTransform | None,
 ) -> _Ending:
     """Everything between ``run_started`` and the final events; raises on any failure."""
     sha = file_sha256(path)
@@ -279,7 +285,14 @@ def _run_and_load(
         return _Ending(outcome, None, log.finished("succeeded", _skip_summary(prior)))
 
     fn = run_fn or resolve_run_fn(note=_log.warning)
-    case = CaseInput(path, contract, reference_fn(contract.name), run_id=run_id, on_event=log.relay)
+    case = CaseInput(
+        path,
+        contract,
+        reference_fn(contract.name),
+        run_id=run_id,
+        on_event=log.relay,
+        on_transform=on_transform,
+    )
     out = fn(case)
     log.cost = max(out.cost_usd, 0.0)
     log.tokens = max(int(out.meta.get("tokens", 0)), 0)

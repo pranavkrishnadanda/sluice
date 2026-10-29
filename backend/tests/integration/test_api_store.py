@@ -200,6 +200,93 @@ def test_artefacts_upsert_and_get(store: RunStore) -> None:
     assert art.transforms == [{"id": "t1", "code": "x"}]
 
 
+def _record(transform_id: str, attempt: int, passed: bool) -> dict[str, object]:
+    return {
+        "transform_id": transform_id,
+        "node_id": "n1",
+        "attempt": attempt,
+        "code": "def transform(s): return s",
+        "model": "small",
+        "passed": passed,
+    }
+
+
+def test_append_transform_creates_the_row_and_appends_once_per_id(store: RunStore) -> None:
+    _create(store, "r1")
+    store.append_transform("r1", _record("t1", 1, False))
+    art = store.get_artefacts("r1")
+    assert art is not None
+    assert art.preview_key is None
+    assert art.transforms == [_record("t1", 1, False)]
+    assert art.saved is False  # live transforms only: the end-of-run save has not happened
+
+    store.append_transform("r1", _record("t2", 2, True))
+    store.append_transform("r1", _record("t1", 1, False))  # a repeat is ignored
+    art = store.get_artefacts("r1")
+    assert art is not None
+    assert [t["transform_id"] for t in art.transforms] == ["t1", "t2"]
+
+
+def test_append_transform_concurrent_appends_lose_nothing(store: RunStore) -> None:
+    _create(store, "r1")
+    ids = [f"t{i}" for i in range(8)]
+    threads = [
+        threading.Thread(target=store.append_transform, args=("r1", _record(t, 1, True)))
+        for t in ids
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    art = store.get_artefacts("r1")
+    assert art is not None
+    assert sorted(t["transform_id"] for t in art.transforms) == ids
+
+
+def test_append_transform_unknown_run_or_bad_record_raises(store: RunStore) -> None:
+    with pytest.raises(RunNotFound):
+        store.append_transform("nope", _record("t1", 1, True))
+    _create(store, "r1")
+    with pytest.raises(ValueError, match="transform_id"):
+        store.append_transform("r1", {"code": "x"})
+
+
+def test_save_artefacts_reconciles_live_transforms_by_id(store: RunStore) -> None:
+    _create(store, "r1")
+    store.append_transform("r1", _record("t1", 1, False))
+    store.append_transform("r1", _record("t9", 1, False))
+    store.save_artefacts(
+        "r1",
+        preview_key="runs/r1/preview.parquet",
+        transforms=[_record("t1", 1, True), _record("t2", 2, True)],
+    )
+    store.save_artefacts(  # idempotent: a repeat changes nothing
+        "r1",
+        preview_key="runs/r1/preview.parquet",
+        transforms=[_record("t1", 1, True), _record("t2", 2, True)],
+    )
+    art = store.get_artefacts("r1")
+    assert art is not None
+    assert art.preview_key == "runs/r1/preview.parquet"
+    assert art.saved is True
+    assert [(t["transform_id"], t["passed"]) for t in art.transforms] == [
+        ("t1", True),
+        ("t2", True),
+        ("t9", False),
+    ]
+
+
+def test_ensure_schema_marks_artefacts_saved_before_the_column_existed(store: RunStore) -> None:
+    _create(store, "r1")
+    with psycopg.connect(store._dsn, connect_timeout=5, autocommit=True) as conn:
+        conn.execute("ALTER TABLE run_artefacts DROP COLUMN saved")
+        conn.execute("INSERT INTO run_artefacts (run_id, preview_key) VALUES ('r1', NULL)")
+    store.ensure_schema()
+    store.append_transform("r1", _record("t1", 1, True))
+    art = store.get_artefacts("r1")
+    assert art is not None and art.saved is True  # rows from before the column: saved
+
+
 def test_interrupted_lists_running_runs(store: RunStore) -> None:
     _create(store, "r1")
     _create(store, "r2")

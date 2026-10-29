@@ -31,6 +31,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, get_args
 
@@ -71,6 +72,14 @@ RUN_NOT_FOUND: Final = "Run not found."
 NOT_LOADED_DETAIL: Final = "The preview is available once the run has loaded its data."
 NOT_READY_DETAIL: Final = "The preview is not ready yet."
 NO_PREVIEW_DETAIL: Final = "This run has no preview."
+PREVIEW_SAVE_GRACE_S: Final = 300.0
+"""How long after ``finished_at`` an unsaved preview still counts as ``not_ready``.
+
+The worker finishes a run (and publishes ``run_finished``) before it builds the preview, so a
+terminal run normally answers ``not_ready`` until the end-of-run save marks its artefacts
+``saved``. If the process died in between, the save never comes: past this grace the answer
+is ``no_preview``. Generous: building the preview of a 100 MB upload takes seconds.
+"""
 
 
 class BadForm(Exception):
@@ -464,6 +473,14 @@ def _read_page(path: Path, contract: Contract, offset: int, limit: int) -> DataP
     )
 
 
+def _save_overdue(row: RunRow) -> bool:
+    """Whether a finished run's end-of-run save is :data:`PREVIEW_SAVE_GRACE_S` overdue."""
+    if row.finished_at is None:
+        return False
+    finished = datetime.fromisoformat(row.finished_at)
+    return (datetime.now(UTC) - finished).total_seconds() > PREVIEW_SAVE_GRACE_S
+
+
 def _preview(
     store: RunStore, blobs: BlobStore, run_id: str, offset: int, limit: int
 ) -> DataPreview:
@@ -473,7 +490,8 @@ def _preview(
     artefacts = store.get_artefacts(run_id)
     key = None if artefacts is None else artefacts.preview_key
     if key is None:
-        if row.status in TERMINAL_STATUSES:
+        saved = artefacts is not None and artefacts.saved
+        if row.status in TERMINAL_STATUSES and (saved or _save_overdue(row)):
             raise ApiError(409, NO_PREVIEW_DETAIL, "no_preview")
         raise ApiError(409, NOT_READY_DETAIL, "not_ready")
     with blobs.open_local(key) as path:

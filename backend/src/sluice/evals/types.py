@@ -45,6 +45,11 @@ class CaseInput:
         on_event: Live sink for the run's events, called with each event as it is emitted by a
             system that can stream them (the agent pipeline). Systems that cannot ignore it;
             their events (if any) are only in ``meta["events"]``.
+        on_transform: Live sink for transform records (the ``meta["transforms"]`` shape, incl.
+            ``transform_id``), called once per attempt that produced code, with ``passed``
+            final, **before** that attempt's ``node_finished``/``attempt_failed`` event, by a
+            system that has transforms (the agent pipeline). The API worker persists them so a
+            ``node_finished.transformId`` is resolvable as soon as it is delivered.
     """
 
     path: Path
@@ -52,6 +57,7 @@ class CaseInput:
     reference: dict[str, set[Any]]
     run_id: str | None = None
     on_event: Callable[[EventModel], None] | None = None
+    on_transform: Callable[[dict[str, Any]], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)

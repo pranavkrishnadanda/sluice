@@ -20,7 +20,8 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``. Each
    attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
-   own reason).
+   own reason). The attempt's transform record (when it produced code) goes to
+   ``case.on_transform`` just before that event.
    A node whose dependency was not accepted never starts. ``depends_on`` only orders and
    gates: a dependent node still reads the mapped input frame (never its dependency's
    rewritten column), and every accepted column is applied together in rules pass 2.
@@ -463,6 +464,7 @@ async def _run_node(
             values, frame, flagged_before, records,
         )  # fmt: skip
         tokens, cost = _spend(records)
+        _hand_over_transform(run, outcome, attempt)
         if error is None:
             if rewritten is None:
                 raise PipelineError(f"node {node.id}: accepted attempt without output")
@@ -496,6 +498,21 @@ async def _run_node(
     outcome.stop = f"no accepted transform after {MAX_ATTEMPTS} attempts"
     if run.halted is None:  # the contract's failure path: hold the whole input back
         run.halted = f"node {node.id} ({node.column}): {outcome.stop}"
+
+
+def _hand_over_transform(run: _Run, outcome: _NodeOutcome, attempt: int) -> None:
+    """Pass this attempt's transform record (if it produced code) to ``case.on_transform``.
+
+    Called once the attempt's outcome is known (``passed`` is final) and before its
+    ``node_finished``/``attempt_failed`` is emitted, so a consumer that persists the record
+    has it in place when the event announcing it is delivered. A copy is passed.
+    """
+    hook = run.case.on_transform
+    if hook is None or not outcome.transforms:
+        return
+    record = outcome.transforms[-1]
+    if record["attempt"] == attempt:
+        hook(dict(record))
 
 
 async def _traced_attempt(

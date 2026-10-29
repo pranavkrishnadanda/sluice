@@ -37,6 +37,7 @@ class FakeStore:
         self.fail_append: Callable[[EventModel], bool] = lambda _e: False
         self.commit_then_fail: Callable[[EventModel], bool] = lambda _e: False
         """Store the event, then raise as if the connection dropped before the commit ack."""
+        self.fail_transform = False
 
     def add(self, run_id: str, *, status: str = "queued", cost: float = 0.0) -> None:
         self.runs[run_id] = RunRow(
@@ -110,11 +111,36 @@ class FakeStore:
             self.runs[run_id] = row.model_copy(update={"status": status, "cost_usd": cost_usd})
             self.finished.append((run_id, status, cost_usd))
 
+    def append_transform(self, run_id: str, record: dict[str, Any]) -> None:
+        """Like ``RunStore.append_transform``: append once per ``transform_id``."""
+        with self.lock:
+            if self.fail_transform:
+                raise ConnectionError("postgres is down")
+            if run_id not in self.runs:
+                raise RunNotFound(run_id)
+            current = self.artefacts.get(run_id) or Artefacts(preview_key=None)
+            if any(t["transform_id"] == record["transform_id"] for t in current.transforms):
+                return
+            self.artefacts[run_id] = current.model_copy(
+                update={"transforms": [*current.transforms, dict(record)]}
+            )
+
     def save_artefacts(
         self, run_id: str, *, preview_key: str | None, transforms: list[dict[str, Any]]
     ) -> None:
+        """Like ``RunStore.save_artefacts``: ``transforms`` win by id, others are kept."""
         with self.lock:
-            self.artefacts[run_id] = Artefacts(preview_key=preview_key, transforms=transforms)
+            ids = {t.get("transform_id") for t in transforms}
+            current = self.artefacts.get(run_id)
+            kept = [] if current is None else current.transforms
+            merged = [*transforms, *(t for t in kept if t.get("transform_id") not in ids)]
+            self.artefacts[run_id] = Artefacts(
+                preview_key=preview_key, transforms=merged, saved=True
+            )
+
+    def get_artefacts(self, run_id: str) -> Artefacts | None:
+        with self.lock:
+            return self.artefacts.get(run_id)
 
     def get_run(self, run_id: str) -> RunRow | None:
         with self.lock:

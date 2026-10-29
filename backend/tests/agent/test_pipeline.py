@@ -84,14 +84,19 @@ def run(
     reference: dict[str, set[Any]] | None = None,
     path: Path | None = None,
     run_id: str | None = None,
+    on_emit: Callable[[EventModel], None] | None = None,
+    on_transform: Callable[[dict[str, Any]], None] | None = None,
 ) -> Result:
     async def go() -> Result:
         model = FunctionModel(script.respond, model_name="script-model")
         async with LLM("http://litellm.test", "k", model_override=model) as llm:
-            log = EventLog()
+            log = EventLog(on_emit=on_emit)
             deps = PipelineDeps(llm=llm, sandbox=sandbox or FakeSandbox(), clock=clock)
             case_input = CaseInput(
-                path or case.input_path, contract or load_contract(case.table), reference or {}
+                path or case.input_path,
+                contract or load_contract(case.table),
+                reference or {},
+                on_transform=on_transform,
             )
             out = await run_pipeline(case_input, deps, log, run_id=run_id)
             return Result(out, log, llm)
@@ -1043,3 +1048,57 @@ def test_pipeline_meta_mapping_without_a_model_mapping_follows_the_rules(indian:
     script = Script(down=frozenset({"mapper"}))
     result = run(indian, script)
     assert result.out.meta["mapping"]["o_totalprice"] == "o_totalprice"
+
+
+# --------------------------------------------------------------------------- plan 4 (Task 8)
+
+
+def _trail(case: Case, script: Script) -> tuple[Result, list[tuple[str, Any]]]:
+    """Run with both live sinks writing into one ordered trail of (kind, payload)."""
+    trail: list[tuple[str, Any]] = []
+    result = run(
+        case,
+        script,
+        run_id="r1",
+        on_emit=lambda e: trail.append(("event", e)),
+        on_transform=lambda t: trail.append(("transform", dict(t))),
+    )
+    return result, trail
+
+
+def test_pipeline_on_transform_is_called_before_each_attempts_event(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+    _result, trail = _trail(indian, script)
+
+    kept = [
+        (kind, p["attempt"], p["passed"]) if kind == "transform" else (kind, p.type, p.attempt)
+        for kind, p in trail
+        if kind == "transform" or p.type in {"attempt_failed", "node_finished"}
+    ]
+    assert kept == [
+        ("transform", 1, False),
+        ("event", "attempt_failed", 1),
+        ("transform", 2, True),
+        ("event", "node_finished", 2),
+    ]
+
+
+def test_pipeline_on_transform_records_equal_meta_transforms(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+    result, trail = _trail(indian, script)
+
+    hooked = [p for kind, p in trail if kind == "transform"]
+    assert hooked == result.out.meta["transforms"]
+    for record in hooked:
+        TransformRecord.model_validate(record)
+    (done,) = result.events("node_finished")
+    assert done.transform_id == hooked[-1]["transform_id"]  # type: ignore[attr-defined]
+
+
+def test_pipeline_on_transform_not_called_for_an_attempt_without_code(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": ["", "", STRIP_COMMAS]})
+    result, trail = _trail(indian, script)
+
+    hooked = [p["attempt"] for kind, p in trail if kind == "transform"]
+    assert hooked == [2]
+    assert [e.attempt for e in result.events("attempt_failed")] == [1]  # type: ignore[attr-defined]

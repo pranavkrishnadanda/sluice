@@ -27,17 +27,24 @@ from api_fakes import (
     scripted,
     started,
 )
+from pipeline_fakes import CRASH, STRIP_COMMAS, FakeSandbox, Script, node
+from pydantic_ai.models.function import FunctionModel
 
 from sluice.agent import events as ev
 from sluice.agent.events import EventLog, EventModel
+from sluice.agent.pipeline import transform_id
 from sluice.api.blobs import LocalBlobStore
 from sluice.api.hub import EventHub
+from sluice.api.routes_runs import _transforms
 from sluice.api.store import TERMINAL_STATUSES, RunRow
 from sluice.api.worker import RESTART_SUMMARY, Worker
 from sluice.contracts.model import Contract
+from sluice.drift.cases import Recipe, build_case
 from sluice.evals.types import SystemOutput
+from sluice.llm.client import LLM
 from sluice.load.iceberg import LoadResult
 from sluice.runs.execute import RunOutcome, execute_run
+from sluice.systems.agent import AgentSystem
 from sluice.systems.rules_only import RulesOnlySystem
 
 
@@ -563,6 +570,7 @@ def _real_execute(run_fn: Any, loads: _Loads) -> ExecuteFn:
             table,
             run_id=run_id,
             emit=emit,
+            on_transform=kw.get("on_transform"),
             run_fn=run_fn,
             load_fn=loads,
             loaded_fn=lambda *_a, **_k: None,
@@ -716,3 +724,179 @@ def test_recover_closes_every_interrupted_run(blobs: LocalBlobStore) -> None:
     _run(go)
     assert sorted(r for (r, _s, _c) in store.finished) == ["a", "b"]
     assert [e.seq for e in store.terminals("a")] == [1]
+
+
+# --------------------------------------------------------------------------------------------
+# Live transforms and the finished status (Task 8 fix round 1: B1, B2)
+# --------------------------------------------------------------------------------------------
+
+
+INDIAN = ("indian_number_string", {"column": "o_totalprice"})
+
+
+def _agent(script: Script) -> AgentSystem:
+    def factory() -> LLM:
+        return LLM("http://litellm.test", "k", model_override=FunctionModel(script.respond))
+
+    return AgentSystem(llm_factory=factory, sandbox=FakeSandbox())
+
+
+async def _watch(
+    store: FakeStore,
+    blobs: LocalBlobStore,
+    execute: ExecuteFn,
+    on_event: Callable[[EventModel], None],
+) -> None:
+    """Run ``r1``; ``on_event`` sees each event the moment it is handed to subscribers.
+
+    It runs inside ``hub.publish``, so it observes the store exactly as the earliest possible
+    subscriber would on receiving the event (deterministic, unlike polling from a task).
+    """
+
+    class WatchingHub(EventHub):
+        def publish(self, run_id: str, event: EventModel) -> None:
+            on_event(event)
+            super().publish(run_id, event)
+
+    hub = WatchingHub()
+    worker = _worker(store, blobs, hub, execute)
+    async with hub.subscribe("r1") as live:
+        await worker.start()
+        try:
+            received = [e.seq async for e in live]
+        finally:
+            await worker.stop()
+    assert received == [e.seq for e in store.events_after("r1", 0)]
+
+
+def test_worker_subscriber_can_read_each_announced_transform_through_the_route(
+    blobs: LocalBlobStore, orders_df: pl.DataFrame, tmp_path: Path
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    recipe = Recipe("orders", "medium", [INDIAN], "csv", "utf-8", 40)
+    case = build_case("dev-0101", "dev", recipe, {"orders": orders_df}, 7, tmp_path / "case")
+    _upload(blobs, "r1", case.input_path.read_bytes())
+    script = Script(
+        plan={"nodes": [node("n1", "o_totalprice")]},
+        workers={"o_totalprice": [CRASH, STRIP_COMMAS]},
+    )
+    seen: list[tuple[str, list[tuple[str, bool]]]] = []
+
+    def on_event(event: EventModel) -> None:
+        if isinstance(event, ev.AttemptFailed | ev.NodeFinished):
+            listed = [(t.id, t.passed) for t in _transforms(store, "r1")]  # type: ignore[arg-type]
+            seen.append((event.type, listed))
+
+    execute = _real_execute(_agent(script).run, _Loads())
+    _run(lambda: _watch(store, blobs, execute, on_event))
+
+    first, second = transform_id("r1", "n1", 1), transform_id("r1", "n1", 2)
+    assert seen == [
+        ("attempt_failed", [(first, False)]),
+        ("node_finished", [(first, False), (second, True)]),
+    ]
+    (done,) = [e for e in store.events_after("r1", 0) if isinstance(e, ev.NodeFinished)]
+    assert done.transform_id == second
+    saved = store.artefacts["r1"].transforms
+    assert [t["transform_id"] for t in saved] == [first, second]  # no duplicates after the run
+
+
+def test_worker_run_is_finished_when_its_run_finished_reaches_a_subscriber(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    status_at_terminal: list[str | None] = []
+
+    def on_event(event: EventModel) -> None:
+        if isinstance(event, ev.RunFinished):
+            row = store.get_run("r1")
+            status_at_terminal.append(None if row is None else row.status)
+
+    events = [started("r1"), node_finished("n1", 0.5), finished("quarantined", cost=0.5)]
+    _run(lambda: _watch(store, blobs, scripted(events), on_event))
+    assert status_at_terminal == ["quarantined"]
+    assert store.finished == [("r1", "quarantined", 0.5)]  # finished exactly once
+
+
+def test_worker_own_failed_terminal_is_finished_before_it_is_published(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    status_at_terminal: list[str | None] = []
+
+    def on_event(event: EventModel) -> None:
+        if isinstance(event, ev.RunFinished):
+            row = store.get_run("r1")
+            status_at_terminal.append(None if row is None else row.status)
+
+    execute = scripted([started("r1")], raises=RuntimeError("boom"))
+    _run(lambda: _watch(store, blobs, execute, on_event))
+    assert status_at_terminal == ["failed"]
+    assert len(store.terminals("r1")) == 1
+    assert store.finished == [("r1", "failed", 0.0)]
+
+
+def _hooked_execute(
+    hooked: list[dict[str, Any]], output: SystemOutput, events: list[EventModel]
+) -> ExecuteFn:
+    """An ``execute`` that hands ``hooked`` to ``on_transform`` first, then emits ``events``."""
+    inner = scripted(events, output=output)
+
+    def execute(path: Path, table: str, *, run_id: str, emit: Any, **kw: Any) -> RunOutcome:
+        for record in hooked:
+            kw["on_transform"](record)
+        return inner(path, table, run_id=run_id, emit=emit, **kw)
+
+    return execute
+
+
+def _output(transforms: list[dict[str, Any]]) -> SystemOutput:
+    return SystemOutput(
+        df=pl.DataFrame(),
+        flags=set(),
+        quarantined=set(),
+        file_quarantined=False,
+        cost_usd=0.0,
+        latency_s=0.0,
+        meta={"transforms": transforms},
+    )
+
+
+def test_worker_end_of_run_save_reconciles_live_transforms_by_id(blobs: LocalBlobStore) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    live_only = _transform("n9", 1, False)  # hooked, then missing from meta (e.g. a crash)
+    final = _transform("n1", 1, True)
+    hooked = [live_only, {**final, "passed": False}]
+    execute = _hooked_execute(hooked, _output([final]), [started("r1"), finished()])
+
+    _run(lambda: _drive(store, blobs, execute, "r1"))
+
+    saved = store.artefacts["r1"].transforms
+    assert sorted((t["transform_id"], t["passed"]) for t in saved) == [
+        ("r1-n1-1", True),  # meta wins for an id it carries
+        ("r1-n9-1", False),  # a live-only record is kept
+    ]
+    assert store.artefacts["r1"].preview_key is None
+
+
+def test_worker_transform_hook_store_failure_does_not_fail_the_run(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    store.fail_transform = True
+    record = _transform("n1", 1, True)
+    execute = _hooked_execute([record], _output([record]), [started("r1"), finished()])
+
+    _run(lambda: _drive(store, blobs, execute, "r1"))
+
+    assert store.finished == [("r1", "succeeded", 0.0)]
+    assert [t["transform_id"] for t in store.artefacts["r1"].transforms] == ["r1-n1-1"]

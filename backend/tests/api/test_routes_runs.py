@@ -12,6 +12,7 @@ import io
 import json
 import unicodedata
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from sluice.api.app import create_app
 from sluice.api.blobs import LocalBlobStore
 from sluice.api.routes_runs import (
     MAX_FIELD_BYTES,
+    PREVIEW_SAVE_GRACE_S,
     TOO_LARGE_DETAIL,
     sanitise_file_name,
     upload_extension,
@@ -681,6 +683,44 @@ def test_get_preview_loaded_but_not_stored_yet_is_409(
     _record(store, "r1", [ev.Loaded(rows_loaded=1, rows_quarantined=0, snapshot_id="s")])
     res = client.get("/runs/r1/preview")
     assert res.status_code == 409
+
+
+def _finished_loaded_run(store: RouteStore, *, finished_s_ago: float) -> None:
+    store.add("r1", status="succeeded")
+    moment = datetime.now(UTC) - timedelta(seconds=finished_s_ago)
+    store.runs["r1"] = store.runs["r1"].model_copy(update={"finished_at": iso_utc(moment)})
+    _record(store, "r1", [ev.Loaded(rows_loaded=1, rows_quarantined=0, snapshot_id="s")])
+
+
+def test_get_preview_finished_but_preview_not_saved_yet_is_409_not_ready(
+    client: TestClient, store: RouteStore
+) -> None:
+    # run_finished (and the terminal status) come before the preview is written (B2).
+    _finished_loaded_run(store, finished_s_ago=0.5)
+    store.append_transform("r1", _transform("n-a", 1, True))  # live transforms, no preview
+    res = client.get("/runs/r1/preview")
+    assert res.status_code == 409
+    assert res.json()["code"] == "not_ready"
+
+
+def test_get_preview_finished_and_saved_without_preview_is_409_no_preview(
+    client: TestClient, store: RouteStore
+) -> None:
+    _finished_loaded_run(store, finished_s_ago=0.5)
+    store.save_artefacts("r1", preview_key=None, transforms=[])
+    res = client.get("/runs/r1/preview")
+    assert res.status_code == 409
+    assert res.json()["code"] == "no_preview"
+
+
+def test_get_preview_finished_long_ago_and_never_saved_is_409_no_preview(
+    client: TestClient, store: RouteStore
+) -> None:
+    # The process died between finish and the save: the preview will never come.
+    _finished_loaded_run(store, finished_s_ago=PREVIEW_SAVE_GRACE_S + 1)
+    res = client.get("/runs/r1/preview")
+    assert res.status_code == 409
+    assert res.json()["code"] == "no_preview"
 
 
 def test_get_preview_after_loaded_returns_contract_columns(
