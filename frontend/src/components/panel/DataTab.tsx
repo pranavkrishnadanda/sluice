@@ -115,20 +115,30 @@ export interface DataTabProps {
    * user's file; the caption says so.
    */
   sample?: boolean;
+  /** Rows the run wrote to the warehouse (`loaded.rowsLoaded`), if known. */
+  rowsLoaded?: number | null;
 }
 
-/** "1,000 of 48,210 rows loaded", or with `sample`, "Sample run · … sample rows". */
-function rowsCaption(
-  loaded: number,
+/**
+ * Rows shown of the upload, then rows loaded:
+ * "Showing 1,000 of 48,210 uploaded rows · 48,000 loaded". With `sample`,
+ * "Sample run · showing 1,000 of 48,210 sample rows" (a fixture's load count
+ * is not the user's, so it is left out).
+ */
+export function rowsCaption(
+  shown: number,
   total: number,
   partial: boolean,
   sample: boolean,
+  rowsLoaded: number | null = null,
 ): string {
-  const rows = sample ? "sample rows" : "rows";
-  const count = partial
-    ? `${formatCount(loaded)} of ${formatCount(total)} ${rows}${sample ? "" : " loaded"}`
-    : `${formatCount(total)} ${rows}`;
-  return sample ? `Sample run · ${count}` : count;
+  const of = partial
+    ? `${formatCount(shown)} of ${formatCount(total)}`
+    : `all ${formatCount(total)}`;
+  if (sample) return `Sample run · showing ${of} sample rows`;
+  const loaded =
+    rowsLoaded == null ? "" : ` · ${formatCount(rowsLoaded)} loaded`;
+  return `Showing ${of} uploaded rows${loaded}`;
 }
 
 /**
@@ -150,6 +160,7 @@ export function DataTab({
   onLoadMore,
   viewportHeight,
   sample = false,
+  rowsLoaded = null,
 }: DataTabProps) {
   const [changedOnly, setChangedOnly] = useState(true);
   const scrollRef = useRef<HTMLElement>(null);
@@ -227,7 +238,13 @@ export function DataTab({
             </>
           )}
           {" · "}
-          {rowsCaption(preview.rows.length, preview.totalRows, partial, sample)}
+          {rowsCaption(
+            preview.rows.length,
+            preview.totalRows,
+            partial,
+            sample,
+            rowsLoaded,
+          )}
         </p>
         <button
           type="button"

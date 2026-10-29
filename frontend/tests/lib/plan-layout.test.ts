@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { layoutPlan, nodeDepths } from "@/components/panel/plan-layout";
+import { nodeDepths, planWaves } from "@/components/panel/plan-layout";
 
 const n = (id: string, dependsOn: string[] = []) => ({ id, dependsOn });
 
-describe("plan layout", () => {
+describe("plan depths", () => {
   test("depth is the longest dependency chain", () => {
     const depths = nodeDepths([
       n("a"),
@@ -20,26 +20,38 @@ describe("plan layout", () => {
     expect(Number.isFinite(depths.get("b"))).toBe(true);
     expect(Number.isFinite(depths.get("c"))).toBe(true);
   });
+});
 
-  test("layers stack top to bottom and edges join known nodes", () => {
-    const layout = layoutPlan([
+describe("planWaves", () => {
+  test("a diamond is three waves: root, the parallel pair, the join", () => {
+    const waves = planWaves([
       n("a"),
       n("b", ["a"]),
       n("c", ["a"]),
-      n("x", ["missing"]),
+      n("d", ["b", "c"]),
     ]);
-    const byId = new Map(layout.nodes.map((p) => [p.id, p]));
-    expect(byId.get("a")?.layer).toBe(0);
-    expect(byId.get("b")?.layer).toBe(1);
-    expect((byId.get("b")?.y ?? 0) > (byId.get("a")?.y ?? 0)).toBe(true);
-    expect(layout.edges.map((e) => `${e.from}->${e.to}`).sort()).toEqual([
-      "a->b",
-      "a->c",
+    expect(waves).toEqual([["a"], ["b", "c"], ["d"]]);
+  });
+
+  test("a chain is one step per wave", () => {
+    expect(planWaves([n("a"), n("b", ["a"]), n("c", ["b"])])).toEqual([
+      ["a"],
+      ["b"],
+      ["c"],
     ]);
-    // Everything fits the view box.
-    for (const p of layout.nodes) {
-      expect(p.x).toBeGreaterThanOrEqual(0);
-      expect(p.x + p.width).toBeLessThanOrEqual(layout.width);
-    }
+  });
+
+  test("independent nodes all run in the first wave, in plan order", () => {
+    expect(planWaves([n("z"), n("y"), n("x")])).toEqual([["z", "y", "x"]]);
+  });
+
+  test("a node waits for its deepest dependency; unknown deps are ignored", () => {
+    expect(
+      planWaves([n("a"), n("b", ["a"]), n("c", ["a", "b"]), n("d", ["nope"])]),
+    ).toEqual([["a", "d"], ["b"], ["c"]]);
+  });
+
+  test("no nodes, no waves", () => {
+    expect(planWaves([])).toEqual([]);
   });
 });

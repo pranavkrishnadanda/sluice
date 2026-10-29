@@ -256,7 +256,7 @@ describe("code diff lines (WCAG AA, 4.5:1)", () => {
   }
 });
 
-/** Keep in step with `.plan-node` fills in globals.css. */
+/** Keep in step with `.plan-card` fills in globals.css. */
 const PLAN_TINT_PCT = 16;
 
 describe("plan node fills (WCAG AA, 4.5:1)", () => {

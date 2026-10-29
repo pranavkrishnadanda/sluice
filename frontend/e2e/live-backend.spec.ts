@@ -374,7 +374,7 @@ test.describe("live backend", () => {
         await details.getByRole("tab", { name: "Plan" }).click();
         await expect(
           details
-            .getByRole("list", { name: "Plan steps" })
+            .getByRole("region", { name: "Plan steps" })
             .getByRole("listitem"),
         ).toHaveCount(plan.nodes.length);
         expect((await scan(page)).blocking, "axe: Plan tab").toEqual([]);

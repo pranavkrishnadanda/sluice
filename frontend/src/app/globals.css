@@ -301,50 +301,45 @@
   }
 
   /*
-   * Plan DAG nodes: an opaque fill tinted 16% toward the status colour, with
-   * a stroke in that colour. tests/design/contrast.test.ts (PLAN_TINT_PCT)
-   * checks --text and --text-muted on every tint.
+   * Plan step cards: an opaque fill tinted 16% toward the status colour,
+   * with a border in that colour (dashed while pending).
+   * tests/design/contrast.test.ts (PLAN_TINT_PCT) checks --text and
+   * --text-muted on every tint.
    */
-  .plan-node rect {
-    fill: var(--glass-solid);
-    stroke: var(--text-muted);
-    stroke-dasharray: 4 3;
+  .plan-card {
+    background-color: var(--glass-solid);
+    border-color: var(--text-muted);
+    border-style: dashed;
   }
 
-  .plan-node[data-status="running"] rect {
-    fill: color-mix(in srgb, var(--accent) 16%, var(--glass-solid));
-    stroke: var(--accent);
-    stroke-dasharray: none;
-    animation: node-pulse 1.4s ease-in-out infinite;
+  .plan-card[data-status="running"] {
+    background-color: color-mix(in srgb, var(--accent) 16%, var(--glass-solid));
+    border-color: var(--accent);
+    border-style: solid;
   }
 
-  .plan-node[data-status="retrying"] rect {
-    fill: color-mix(in srgb, var(--warn) 16%, var(--glass-solid));
-    stroke: var(--warn);
-    stroke-dasharray: none;
+  .plan-card[data-status="retrying"] {
+    background-color: color-mix(in srgb, var(--warn) 16%, var(--glass-solid));
+    border-color: var(--warn);
+    border-style: solid;
   }
 
-  .plan-node[data-status="done"] rect {
-    fill: color-mix(in srgb, var(--ok) 16%, var(--glass-solid));
-    stroke: var(--ok);
-    stroke-dasharray: none;
+  .plan-card[data-status="done"] {
+    background-color: color-mix(in srgb, var(--ok) 16%, var(--glass-solid));
+    border-color: var(--ok);
+    border-style: solid;
   }
 
-  .plan-node[data-status="failed"] rect {
-    fill: color-mix(in srgb, var(--error) 16%, var(--glass-solid));
-    stroke: var(--error);
-    stroke-dasharray: none;
+  .plan-card[data-status="failed"],
+  .plan-card[data-status="stopped"] {
+    background-color: color-mix(in srgb, var(--error) 16%, var(--glass-solid));
+    border-color: var(--error);
+    border-style: solid;
   }
 
   /* New thread content fades in with a 4px rise; off under reduced motion. */
   .rise-in {
     animation: rise-in 180ms ease-out both;
-  }
-}
-
-@keyframes node-pulse {
-  50% {
-    stroke-opacity: 0.45;
   }
 }
 

@@ -336,9 +336,12 @@ describe("demo honesty", () => {
       </ApiProvider>,
     );
     expect(
-      await screen.findByText(/Sample run · .*1,000 of 48,210 sample rows/),
+      await screen.findByText(
+        /Sample run · showing 1,000 of 48,210 sample rows$/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/48,210 rows loaded/)).toBeNull();
+    // The fixture's load count is not the user's: not shown.
+    expect(screen.queryByText(/loaded/)).toBeNull();
   });
 
   test("a fixture run's Data tab has no sample label", async () => {
@@ -356,7 +359,9 @@ describe("demo honesty", () => {
       </ApiProvider>,
     );
     expect(
-      await screen.findByText(/1,000 of 48,210 rows loaded/),
+      await screen.findByText(
+        /Showing 1,000 of 48,210 uploaded rows · 48,210 loaded$/,
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Sample run/)).toBeNull();
   });

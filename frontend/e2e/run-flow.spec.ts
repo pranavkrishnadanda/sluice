@@ -71,6 +71,6 @@ test("a new upload streams to completion and exposes its code and plan", async (
 
   await details.getByRole("tab", { name: "Plan" }).click();
   await expect(
-    details.getByRole("list", { name: "Plan steps" }).getByRole("listitem"),
+    details.getByRole("region", { name: "Plan steps" }).getByRole("listitem"),
   ).toHaveCount(2);
 });
