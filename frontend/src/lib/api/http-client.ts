@@ -149,9 +149,14 @@ export class HttpApiClient implements ApiClient {
     );
   }
 
-  getInput(runId: string, page: PreviewPage): Promise<RawInput> {
+  getInput(
+    runId: string,
+    page: PreviewPage,
+    signal?: AbortSignal,
+  ): Promise<RawInput> {
     return this.#json(
       `/runs/${encodeURIComponent(runId)}/input?${pageQuery(page)}`,
+      signal ? { signal } : {},
     );
   }
 

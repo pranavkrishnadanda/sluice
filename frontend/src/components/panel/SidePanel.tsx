@@ -1,7 +1,7 @@
 "use client";
 
 import * as Tabs from "@radix-ui/react-tabs";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useApi } from "@/components/api/ApiProvider";
 import { DemoBadge } from "@/components/shell/DemoBadge";
 import { useRunStream } from "@/components/thread/run-stream";
@@ -191,17 +191,29 @@ function DataPanel({
   state,
   pages,
   input,
+  inputWanted,
   viewportHeight,
   sample,
 }: {
   state: RunViewState | null;
   pages: PreviewPages;
   input: PreviewPages<RawInput>;
+  /** The view knows the run has not loaded (see `useInputWanted`). */
+  inputWanted: boolean;
   viewportHeight?: number;
   /** The demo mock replays a fixture for this run (see `isSampleReplay`). */
   sample: boolean;
 }) {
   if (state && !state.loaded) {
+    // Not yet known whether the run loaded (its history is replaying):
+    // a neutral placeholder, not the uploaded file's.
+    if (!inputWanted) {
+      return (
+        <output aria-label="Loading the run’s data" className="contents">
+          <DataTabSkeleton />
+        </output>
+      );
+    }
     return (
       <InputPanel
         state={state}
@@ -240,6 +252,42 @@ function DataPanel({
         />
       );
   }
+}
+
+/**
+ * Quiet time after the latest event before a not-yet-loaded run's stream
+ * counts as caught up. A reopened run's history replays as a burst far
+ * faster than this; live events are spaced further apart.
+ */
+const REPLAY_SETTLE_MS = 250;
+
+/**
+ * Whether the raw upload is wanted. Only before `loaded` — and only once
+ * the view knows the run has not loaded: a run page starts from the
+ * initial state, so a finished, loaded run would otherwise ask for its
+ * whole upload before the replay reaches `loaded`. A finished run without
+ * `loaded` is known at once; an unfinished one once the stream has been
+ * quiet for {@link REPLAY_SETTLE_MS} (the replay has caught up). The quiet
+ * timer runs for the `runId` prop even before any event arrives, so a
+ * queued run (nothing published yet) or a stream that fails before its
+ * first event still shows the upload from creation.
+ */
+function useInputWanted(runId: string, state: RunViewState | null): boolean {
+  // From the prop, not `state.runId`: that is only set by `run_started`.
+  const notLoaded = state !== null && state.loaded === null;
+  const finished = state?.finished ?? false;
+  // The run this view saw a quiet stream for; it never un-settles.
+  const [settledFor, setSettledFor] = useState<string | null>(null);
+  const settled = settledFor === runId;
+  // Changes with every event while waiting, restarting the quiet timer.
+  const waitKey =
+    notLoaded && !finished && !settled ? `${runId}:${state.lastSeq}` : null;
+  useEffect(() => {
+    if (waitKey === null) return;
+    const timer = setTimeout(() => setSettledFor(runId), REPLAY_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [waitKey, runId]);
+  return notLoaded && (finished || settled);
 }
 
 const CODE_SKELETON = (
@@ -295,9 +343,12 @@ export function SidePanel({
       ),
   );
   // The raw upload: available from creation, wanted only until `loaded`.
+  // The request aborts when `loaded` arrives, the run changes or the panel
+  // closes (the server reads the whole upload to answer it).
+  const inputWanted = useInputWanted(runId, state);
   const input = usePreviewPages(
-    opened.has("data") && !loaded ? `${runId}|input` : null,
-    (offset, limit) => api.getInput(runId, { offset, limit }),
+    opened.has("data") && inputWanted ? `${runId}|input` : null,
+    (offset, limit, signal) => api.getInput(runId, { offset, limit }, signal),
   );
   const transforms = useResource(
     opened.has("code") ? `${runId}|${transformsKey(state)}` : null,
@@ -352,6 +403,7 @@ export function SidePanel({
           state={state}
           pages={pages}
           input={input}
+          inputWanted={inputWanted}
           viewportHeight={dataViewportHeight}
           sample={sample}
         />

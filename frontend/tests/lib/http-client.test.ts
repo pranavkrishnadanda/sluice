@@ -111,6 +111,20 @@ describe("HttpApiClient", () => {
     expect(input.rows).toEqual([["1"]]);
   });
 
+  test("getInput forwards its abort signal to fetch", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      jsonResponse({ columns: [], rows: [], totalRows: 0, nextOffset: null }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    await new HttpApiClient("http://api.test").getInput(
+      "run-1",
+      { offset: 0, limit: 10 },
+      controller.signal,
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+  });
+
   test("getPreview passes offset and limit and encodes run id", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () =>
       jsonResponse({ columns: [], rows: [], totalRows: 0, nextOffset: null }),
