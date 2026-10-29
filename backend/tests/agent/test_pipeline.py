@@ -394,6 +394,20 @@ def test_pipeline_precheck_failure_feeds_its_reason_to_the_next_attempt(indian: 
     assert done.attempt == 2  # type: ignore[attr-defined]
 
 
+def test_pipeline_runs_a_uniformly_indented_transform_dedented(indian: Case) -> None:
+    sandbox = FakeSandbox()
+    indented = "".join(f"    {line}\n" if line else "\n" for line in STRIP_COMMAS.splitlines())
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [indented]})
+
+    result = run(indian, script, sandbox=sandbox)
+
+    assert sandbox.calls == [STRIP_COMMAS]  # the dedented module ran; no attempt was spent
+    assert result.events("attempt_failed") == []
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    assert result.out.meta["transforms"][0]["code"] == STRIP_COMMAS
+
+
 def test_pipeline_schema_invalid_worker_output_is_a_failed_attempt(indian: Case) -> None:
     sandbox = FakeSandbox()
     # Attempt 1: empty code fails the schema twice (client repair retry) -> LLMOutputError.
@@ -412,7 +426,7 @@ def test_pipeline_explicit_precheck_rejection_skips_sandbox(
     indian: Case, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     answers = iter(["code is not allowed", None])
-    monkeypatch.setattr(pipeline, "precheck_code", lambda code: next(answers))
+    monkeypatch.setattr(pipeline, "prepare_code", lambda code: (code, next(answers)))
     sandbox = FakeSandbox()
     script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
     result = run(indian, script, sandbox=sandbox)

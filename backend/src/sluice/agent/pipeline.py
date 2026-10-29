@@ -15,7 +15,7 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    model call and an empty plan.
 5. **work**, nodes in dependency waves, the nodes of one wave concurrently (``asyncio.gather``).
    Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` (unchecked draft)
-   -> ``precheck_code``
+   -> ``prepare_code`` (``precheck_code``, after one dedent of a uniformly indented module)
    -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> keep only the rewritten
    cells pass 1 flagged, in every raw copy of a row (Ruling F2: parsed cells keep their raw
    text; duplicates stay identical, so dedupe is unchanged) -> an effect check (the
@@ -118,7 +118,7 @@ from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
 from sluice.agent.worker import (
     clip,
     guard_output,
-    precheck_code,
+    prepare_code,
     sandbox_feedback,
     write_transform,
 )
@@ -616,21 +616,23 @@ async def _attempt(
         outcome.stop, outcome.outage = "no model route is available", True
         return f"LLMUnavailable: {exc}", None
     records.append(record)
+    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
+    # A uniformly indented module is dedented once (``prepare_code``); the record keeps the
+    # code that was actually checked and run.
+    source, reason = prepare_code(code.code)
     transform = {
         "transform_id": transform_id(run.run_id, node.id, attempt),
         "node_id": node.id,
         "attempt": attempt,
-        "code": code.code,
+        "code": source,
         "model": record.model or tier,
         "passed": False,
     }
     outcome.transforms.append(transform)
-
-    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
-    if (reason := precheck_code(code.code)) is not None:
+    if reason is not None:
         return f"precheck: {reason}", None
     try:
-        result = await asyncio.to_thread(run.deps.sandbox, code.code, values)
+        result = await asyncio.to_thread(run.deps.sandbox, source, values)
     except SandboxError as exc:
         run.sandbox_error = type(exc).__name__
         outcome.stop = "the sandbox is unavailable"
