@@ -302,6 +302,53 @@ def test_worker_failed_terminal_append_falls_back_to_its_own_run_finished(
     assert store.finished == [("r1", "failed", 0.0)]
 
 
+def test_worker_terminal_adopted_on_resync_reaches_live_subscribers_once(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    calls = {"n": 0}
+
+    def first_terminal_commits_then_fails(event: EventModel) -> bool:
+        if event.type == "run_finished":  # type: ignore[attr-defined]
+            calls["n"] += 1
+            return calls["n"] == 1
+        return False
+
+    store.commit_then_fail = first_terminal_commits_then_fails
+
+    async def go() -> list[tuple[int, str]]:
+        hub = EventHub()
+        worker = _worker(store, blobs, hub, scripted(happy("r1")))
+        async with hub.subscribe("r1") as live:
+            await worker.start()
+            try:
+                received = [(e.seq, e.type) async for e in live]  # type: ignore[attr-defined]
+            finally:
+                await worker.stop()
+        return received
+
+    received = _run(go)
+    assert received == [(1, "run_started"), (2, "rules_applied"), (3, "run_finished")]
+    (terminal,) = store.terminals("r1")
+    assert terminal.status == "succeeded"  # the stored terminal was adopted, not replaced
+    assert store.finished == [("r1", "succeeded", 0.0)]
+
+
+def test_worker_run_closed_after_its_run_finished_still_finishes_the_run(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    events = [*happy("r1"), ev.RulesApplied(actions=["late"])]  # refused: the run is closed
+    _run(lambda: _drive(store, blobs, scripted(events), "r1"))
+
+    assert store.types("r1") == ["run_started", "rules_applied", "run_finished"]
+    assert store.finished == [("r1", "succeeded", 0.0)]
+
+
 def test_worker_missing_upload_still_ends_with_one_failed_run_finished(
     blobs: LocalBlobStore,
 ) -> None:
