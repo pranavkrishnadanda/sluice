@@ -27,10 +27,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sluice import tracing
+from sluice.api import routes_evals, routes_runs
 from sluice.api.blobs import BlobStore, S3BlobStore
+from sluice.api.errors import ApiError as ApiError  # re-exported: older imports
+from sluice.api.errors import error_response as error_response
 from sluice.api.hub import EventHub
 from sluice.api.routes_events import router as events_router
-from sluice.api.schemas import ErrorBody
 from sluice.api.settings import ApiSettings
 from sluice.api.store import RunStore
 from sluice.api.worker import ExecuteFn, Worker
@@ -60,32 +62,6 @@ _DETAILS_BY_STATUS: Final[dict[int, str]] = {
     404: "Not found.",
     405: "Method not allowed.",
 }
-
-
-class ApiError(Exception):
-    """An expected failure a route reports to the client as ``{detail, code}``.
-
-    Args:
-        status: HTTP status, 400-599.
-        detail: User-facing message. Never put secrets, paths or exception text here.
-        code: Optional machine-readable code (``too_large``, ``not_ready``, ...).
-    """
-
-    def __init__(self, status: int, detail: str, code: str | None = None) -> None:
-        if not 400 <= status <= 599:
-            raise ValueError(f"ApiError status must be 4xx or 5xx, got {status}")
-        super().__init__(detail)
-        self.status = status
-        self.detail = detail
-        self.code = code
-
-
-def error_response(
-    status: int, detail: str, code: str | None = None, headers: dict[str, str] | None = None
-) -> JSONResponse:
-    """The contract error body; ``code`` is omitted when ``None``."""
-    body = ErrorBody(detail=detail, code=code).model_dump(exclude_none=True)
-    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def _validation_detail(exc: RequestValidationError) -> str:
@@ -268,9 +244,6 @@ def create_app(
     app.state.execute = execute
     app.state.hub = None
     app.state.worker = None
-
-    # Imported here: the route modules import ``ApiError`` from this module.
-    from sluice.api import routes_evals, routes_runs
 
     app.state.evals_dir = routes_evals.DEFAULT_EVALS_DIR
     app.include_router(routes_runs.router)

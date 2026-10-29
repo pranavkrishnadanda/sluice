@@ -6,7 +6,8 @@ git-ignored) and ``<evals_dir>/published`` (committed). The newest ``agent`` sum
 ``sluice``) and every other system's summary for the same ``(split, limit)``, by name.
 
 Metrics come from the summary CIs. ``passHat4`` only exists for 4-trial runs: the bootstrap of
-the per-case pass^4 when ``results.jsonl`` is present, else the summary point (zero width).
+the per-case pass^4 when ``results.jsonl`` is present
+(``mean`` is always the summary's ``pass_hat_k``), else the summary point (zero width).
 ``p95LatencyMs`` is the 95th percentile of per-case latency (trials averaged) with a
 percentile-bootstrap CI, ``None`` without ``results.jsonl``. ``costPer1kRowsUsd`` is ``None``
 (rows per case are not recorded yet) and ``pareto`` is empty until the router exists.
@@ -26,7 +27,7 @@ from typing import Any, Final, get_args
 
 from fastapi import APIRouter, Request
 
-from sluice.api.app import ApiError
+from sluice.api.errors import ApiError
 from sluice.api.schemas import CI, EvalSummary, SystemMetrics
 from sluice.api.store import iso_utc
 from sluice.evals import runner
@@ -98,8 +99,14 @@ def p95_latency_ms(rows: Iterable[Mapping[str, Any]]) -> CI | None:
 
 
 def _pass_hat4(summary: Summary, rows: list[dict[str, Any]] | None) -> CI | None:
+    """``mean`` is exactly the summary's ``pass_hat_k``; only ``lo``/``hi`` are bootstrapped.
+
+    The interval comes from a bootstrap of the per-case pass^4 in ``results.jsonl`` (widened to
+    contain the point if needed); zero width at the point without per-case rows.
+    """
     if summary.trials != PASS_HAT_TRIALS or summary.pass_hat_k is None:
         return None
+    point = float(summary.pass_hat_k)
     if rows:
         counts: dict[str, tuple[int, int]] = {}
         for row in rows:
@@ -110,8 +117,7 @@ def _pass_hat4(summary: Summary, rows: list[dict[str, Any]] | None) -> CI | None
         ]
         found = bootstrap_ci(per_case, seed=runner.BOOTSTRAP_SEED)
         if found is not None:
-            return _ci(found)
-    point = float(summary.pass_hat_k)
+            return CI(mean=point, lo=min(found[1], point), hi=max(found[2], point))
     return CI(mean=point, lo=point, hi=point)
 
 

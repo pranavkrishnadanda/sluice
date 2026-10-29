@@ -179,10 +179,12 @@ def test_evals_summary_pass_hat4_when_four_trials(evals_dir: Path) -> None:
         for c in range(3)
         for t in range(4)
     ]
-    _write(evals_dir / "runs", "a", _summary("agent", trials=4, pass_hat_k=2 / 3), results=results)
+    # The summary's own point estimate wins even if it differs from the per-case mean (0.667).
+    _write(evals_dir / "runs", "a", _summary("agent", trials=4, pass_hat_k=0.6), results=results)
     sluice = _get(evals_dir).json()["systems"][0]
-    assert sluice["passHat4"]["mean"] == pytest.approx(2 / 3)
+    assert sluice["passHat4"]["mean"] == 0.6
     assert 0.0 <= sluice["passHat4"]["lo"] <= sluice["passHat4"]["hi"] <= 1.0
+    assert sluice["passHat4"]["hi"] > sluice["passHat4"]["lo"]  # bootstrapped, not zero width
     assert sluice["p95LatencyMs"] == {"mean": 1000.0, "lo": 1000.0, "hi": 1000.0}
 
 

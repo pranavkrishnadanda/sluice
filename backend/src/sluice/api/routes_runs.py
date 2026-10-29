@@ -41,8 +41,8 @@ from python_multipart.multipart import MultipartParser, parse_options_header
 
 from sluice.agent import events as ev
 from sluice.agent.events import TableName
-from sluice.api.app import ApiError
 from sluice.api.blobs import BlobStore, TooLarge
+from sluice.api.errors import ApiError
 from sluice.api.schemas import DataPreview, RunSummary, Transform
 from sluice.api.store import MAX_FILE_NAME_CHARS, TERMINAL_STATUSES, RunRow, RunStore
 from sluice.contracts.model import Contract, load_contract
