@@ -71,6 +71,11 @@ responses and its own connection copy for network errors and 5xx.
   (`Access-Control-Allow-Credentials` is not needed) and no auth in v1: the
   API is meant for localhost only. Non-`GET` requests from any other origin
   are refused with `403 forbidden_origin` (see [Errors](#errors)).
+- A refused **preflight** (an origin, method or request header that is not
+  allowed) is `400` with the usual body, e.g.
+  `{"detail": "Disallowed CORS origin.", "code": "cors_rejected"}`. It
+  carries no `Access-Control-Allow-Origin`, so the browser never exposes
+  it; it is there for curl and logs.
 
 ## Types
 

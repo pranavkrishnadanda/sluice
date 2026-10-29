@@ -201,6 +201,30 @@ def test_preflight_from_unknown_origin_is_not_allowed(client: TestClient) -> Non
     assert "access-control-allow-origin" not in response.headers
 
 
+def test_preflight_from_unknown_origin_gets_the_contract_error_body(client: TestClient) -> None:
+    response = client.options(
+        "/runs",
+        headers={"Origin": EVIL_ORIGIN, "Access-Control-Request-Method": "POST"},
+    )
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {"detail": "Disallowed CORS origin.", "code": "cors_rejected"}
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_preflight_with_a_disallowed_header_names_it_in_the_body(client: TestClient) -> None:
+    response = client.options(
+        "/runs",
+        headers={
+            "Origin": UI_ORIGIN,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-secret-header",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Disallowed CORS headers.", "code": "cors_rejected"}
+
+
 @pytest.mark.parametrize("path", ["/healthz", "/no/such/route", "/_test/items/abc", "/_test/boom"])
 def test_ui_origin_gets_cors_header_on_every_response(client: TestClient, path: str) -> None:
     response = client.get(path, headers={"Origin": UI_ORIGIN})

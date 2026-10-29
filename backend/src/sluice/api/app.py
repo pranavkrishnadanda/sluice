@@ -3,7 +3,7 @@
 Every 4xx/5xx body is ``{"detail": str, "code"?: str}`` (``docs/api/contract.md``). Middleware
 order, outermost first::
 
-    ServerErrorMiddleware (Starlette) -> CORSMiddleware -> OriginGuardMiddleware
+    ServerErrorMiddleware (Starlette) -> ContractCORSMiddleware -> OriginGuardMiddleware
         -> InternalErrorMiddleware -> routes
 
 An ``exception_handler(Exception)`` would run in Starlette's outermost ``ServerErrorMiddleware``,
@@ -30,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sluice import tracing
@@ -184,6 +185,28 @@ class InternalErrorMiddleware:
             await error_response(500, INTERNAL_DETAIL, "internal")(scope, receive, send)
 
 
+class ContractCORSMiddleware(CORSMiddleware):
+    """Starlette's CORS, with a refused preflight answered in the contract error shape.
+
+    Starlette answers ``400 text/plain "Disallowed CORS origin"``; this keeps the status and the
+    CORS headers it computed (a refused origin still gets no ``Access-Control-Allow-Origin``,
+    so the browser blocks the request exactly as before) and only swaps the body for
+    ``{"detail": "Disallowed CORS <what>.", "code": "cors_rejected"}``.
+    """
+
+    def preflight_response(self, request_headers: Headers) -> Response:
+        response = super().preflight_response(request_headers)
+        if response.status_code != 400:
+            return response
+        text = bytes(response.body).decode("utf-8", errors="replace").strip()
+        headers = {
+            name: value
+            for name, value in response.headers.items()
+            if name.lower() not in ("content-length", "content-type")
+        }
+        return error_response(400, f"{text}.", "cors_rejected", headers)
+
+
 class OriginGuardMiddleware:
     """Refuses unsafe-method requests whose ``Origin`` is not an allowed UI origin (Ruling F2p4).
 
@@ -294,7 +317,7 @@ def create_app(
     app.add_middleware(InternalErrorMiddleware)
     app.add_middleware(OriginGuardMiddleware, allowed_origins=list(settings.ui_origins))
     app.add_middleware(
-        CORSMiddleware,
+        ContractCORSMiddleware,
         allow_origins=list(settings.ui_origins),
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Last-Event-ID", "Content-Type"],
