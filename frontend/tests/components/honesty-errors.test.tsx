@@ -166,6 +166,32 @@ describe("API error details", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(detail);
   });
 
+  test.each([
+    [403, "forbidden_origin", "This origin may not call the API."],
+    [422, "too_large_decoded", "The Parquet file decodes to more than 1 GiB."],
+  ])(
+    "composer shows the HTTP client's %i %s detail",
+    async (status, code, detail) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>(async () => json({ detail, code }, status)),
+      );
+      render(
+        <ApiProvider client={new HttpApiClient("http://api.test")}>
+          <NewRunComposer />
+        </ApiProvider>,
+      );
+      const user = userEvent.setup();
+      await user.upload(
+        screen.getByLabelText("Attach a file"),
+        new File(["a"], "a.parquet"),
+      );
+      await user.click(screen.getByRole("button", { name: "Start run" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent(detail);
+      vi.unstubAllGlobals();
+    },
+  );
+
   test("composer refuses a file over 100 MB without uploading it", async () => {
     const createRun = vi.fn<ApiClient["createRun"]>();
     render(
