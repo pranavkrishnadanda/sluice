@@ -14,13 +14,12 @@ from typing import Any
 
 import polars as pl
 import pytest
+from model_fakes import output_part
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
-    TextPart,
-    ToolCallPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
@@ -67,19 +66,12 @@ ANSWERS: dict[str, dict[str, Any]] = {
 }
 
 
-def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
-    """The model's structured answer: the output tool call in tool mode, else JSON text."""
-    if info.output_tools:
-        return ToolCallPart(info.output_tools[0].name, payload)
-    return TextPart(payload)
-
-
 def _respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     request = messages[0]
     assert isinstance(request, ModelRequest)
     system = next(p.content for p in request.parts if isinstance(p, SystemPromptPart))
     return ModelResponse(
-        parts=[_output_part(info, json.dumps(ANSWERS[system]))],
+        parts=[output_part(info, json.dumps(ANSWERS[system]))],
         usage=RequestUsage(input_tokens=10, output_tokens=5),
     )
 

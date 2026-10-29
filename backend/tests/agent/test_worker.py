@@ -11,8 +11,9 @@ from typing import Any
 
 import polars as pl
 import pytest
+from model_fakes import output_part
 from pydantic import ValidationError
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -40,13 +41,6 @@ GOOD_CODE = (
 )
 
 
-def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
-    """The model's structured answer: the output tool call in tool mode, else JSON text."""
-    if info.output_tools:
-        return ToolCallPart(info.output_tools[0].name, payload)
-    return TextPart(payload)
-
-
 @dataclass(frozen=True)
 class Node:
     """Structural stand-in for `sluice.agent.plan.PlanNode` (Task 6)."""
@@ -71,7 +65,7 @@ class Capture:
     def _respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         self.requests.append(list(messages))
         return ModelResponse(
-            parts=[_output_part(info, json.dumps(self.queue.pop(0)))],
+            parts=[output_part(info, json.dumps(self.queue.pop(0)))],
             usage=RequestUsage(input_tokens=40, output_tokens=20),
         )
 

@@ -32,10 +32,15 @@ header (LiteLLM 1.106.5 sets it only on cached responses) and costs 0.
 
 from __future__ import annotations
 
-import json
+import asyncio
+import contextlib
 import math
 import time
+from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Final, Literal, Self
 
 import httpx2
@@ -88,8 +93,29 @@ GENERATION_RETRIES: Final = 1
 """Re-asks after the provider itself rejects the generation as unparseable (see the module doc)."""
 
 GENERATION_ERROR_CODES: Final = ("output_parse_failed", "json_validate_failed", "tool_use_failed")
-"""Groq error codes for a generation that did not parse / match the schema. LiteLLM relays them as
-an HTTP 400 whose body embeds the provider error, so they are matched as substrings of the body."""
+"""Groq error codes for a generation that did not parse / match the schema. Groq sends them as
+``error.code``; LiteLLM relays them inside ``error.message`` with ``error.code`` set to the HTTP
+status (``"400"``), so the message is searched only when the code is absent or numeric."""
+
+RATE_LIMIT_RETRIES: Final = 3
+"""Re-sends after a rate limit (HTTP 429, or the proxy's all-in-cooldown error with Retry-After)."""
+
+RATE_LIMIT_BACKOFF_S: Final = 2.0
+"""First wait without a usable Retry-After; doubles per retry, capped at `RATE_LIMIT_MAX_BACKOFF_S`.
+Also the minimum wait, so a Retry-After of 0 or in the past does not hot-loop the proxy."""
+
+RATE_LIMIT_MAX_BACKOFF_S: Final = 30.0
+"""Cap of the computed back-off (the hosted deployments' cooldown is 30 s). A Retry-After the
+provider sends is honoured as is, bounded only by the wall budget."""
+
+DEFAULT_WALL_BUDGET_S: Final = 120.0
+"""Rate-limit waiting allowed per call when no `LLM.wall_budget` is active. The pipeline sets the
+per-file budget (``caps.MAX_WALL_S_PER_FILE``) around each file, so this applies to ad-hoc use."""
+
+PROXY_COOLDOWN_MARKER: Final = "No deployments available"
+"""LiteLLM's router error when every deployment of the route is cooling down or over its limits.
+The proxy answers it with a ``retry-after`` header (``_apply_router_cooldown_retry_after`` in
+1.106.5 ``proxy/common_request_processing.py``); only then is it paced like a 429."""
 
 JSON_ONLY_NUDGE: Final = (
     "\n\nRespond with only the JSON object that matches the required schema: no prose, no "
@@ -115,7 +141,13 @@ _response_headers: ContextVar[list[httpx2.Headers] | None] = ContextVar(
 
 
 class CallRecord(BaseModel):
-    """Accounting for one `LLM.run` call (all HTTP requests it made, repair retry included)."""
+    """Accounting for one `LLM.run` call: every attempt it made.
+
+    Tokens and cost sum the responses the provider returned (schema-repair retries included).
+    An attempt the provider rejected as unparseable (`GENERATION_ERROR_CODES`) returns no usage,
+    so it adds nothing to tokens or cost and is counted in `rejected_attempts` instead. Rate-limited
+    sends are not billed and are not counted. `latency_ms` spans the whole call, back-off included.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -127,6 +159,11 @@ class CallRecord(BaseModel):
     cost_usd: float = Field(ge=0)
     latency_ms: int = Field(ge=0)
     cached: bool
+    rejected_attempts: int = Field(
+        default=0,
+        ge=0,
+        description="Attempts the provider rejected as unparseable; their tokens are unknown.",
+    )
 
 
 class LLMError(Exception):
@@ -149,10 +186,30 @@ class LLMUnavailable(LLMError):
         self.status_code = status_code
 
 
+_deadline: ContextVar[float | None] = ContextVar("sluice_llm_deadline", default=None)
+"""Absolute time (the client's clock) by which rate-limit waiting must end; see `wall_budget`."""
+
+
 async def _capture_headers(response: httpx2.Response) -> None:
+    """Keep the headers of successful responses only: cost, cache and deployment describe those."""
     sink = _response_headers.get()
-    if sink is not None:
+    if sink is not None and response.status_code < 400:
         sink.append(response.headers)
+
+
+type _Kind = Literal["ok", "invalid", "rejected", "throttled", "unavailable", "failed"]
+
+
+@dataclass(frozen=True, slots=True)
+class _Attempt:
+    """What one `agent.run` came to, as plain data: no exception object survives the handler."""
+
+    kind: _Kind
+    output: object = None
+    status: int | None = None
+    error_name: str = ""
+    code: str | None = None
+    retry_after: float | None = None
 
 
 class LLM:
@@ -168,6 +225,8 @@ class LLM:
         cache: Whether the proxy may answer from its response cache. Evals pass ``False`` so
             every trial measures the model, not the cache (Ruling F3); ``sluice run`` keeps it.
         output_mode: How the output schema is sent (`OutputMode`); ``native`` by default.
+        clock: Monotonic seconds for the rate-limit budget (tests inject a fake).
+        sleep: The rate-limit back-off wait (tests inject a fake).
 
     Event-loop lifetime: the HTTP client pools connections bound to the event loop that first
     uses them. Create, use and close (`aclose` / `async with`) an instance inside ONE event loop,
@@ -184,10 +243,14 @@ class LLM:
         http_client: httpx2.AsyncClient | None = None,
         cache: bool = True,
         output_mode: OutputMode = DEFAULT_OUTPUT_MODE,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.records: list[CallRecord] = []
         self.cache = cache
         self.output_mode: OutputMode = output_mode
+        self._clock = clock
+        self._sleep = sleep
         self._override = model_override
         self._owns_client = http_client is None
         self._http = http_client or httpx2.AsyncClient(
@@ -224,18 +287,36 @@ class LLM:
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
+    @contextlib.contextmanager
+    def wall_budget(self, seconds: float) -> Iterator[None]:
+        """Bound rate-limit waiting of every `run` inside this block (and tasks it starts).
+
+        A wait that would end more than `seconds` after entering the block is not started; the
+        call fails as `LLMUnavailable` instead, so a file's wall cap is not overrun by back-off.
+        """
+        token = _deadline.set(self._clock() + seconds)
+        try:
+            yield
+        finally:
+            _deadline.reset(token)
+
     async def run[T](
         self, role: str, tier: Tier, system: str, prompt: str, output_type: type[T]
     ) -> tuple[T, CallRecord]:
-        """Ask the `tier` model group for an `output_type`; one repair retry on invalid output.
+        """Ask the `tier` model group for an `output_type`.
 
-        A generation the provider rejects as unparseable (`GENERATION_ERROR_CODES`) is re-asked
-        once with `JSON_ONLY_NUDGE` appended to the prompt; the record covers every attempt.
+        Retries, each bounded: one schema-repair retry (validation error fed back); one re-ask
+        with `JSON_ONLY_NUDGE` after the provider rejects the generation as unparseable; up to
+        `RATE_LIMIT_RETRIES` re-sends after a rate limit, waiting Retry-After (else exponential
+        back-off) while the wait ends inside the active `wall_budget`.
+
+        Returns:
+            The output and a `CallRecord` covering every attempt (see `CallRecord`).
 
         Raises:
-            LLMOutputError: the output was invalid twice, or the provider rejected the generation
-                twice (its `record` carries the spent tokens).
-            LLMUnavailable: the proxy failed or was unreachable (nothing billed, no record).
+            LLMOutputError: the output was invalid after the repair retry, or the provider rejected
+                the generation twice. Its `record` carries the spent tokens and rejected attempts.
+            LLMUnavailable: the proxy failed, was unreachable, or stayed rate-limited (no record).
         """
         agent = Agent(
             self._override or self._models[tier],
@@ -247,58 +328,72 @@ class LLM:
         messages: list[ModelMessage] = []
         token = _response_headers.set(headers)
         start = time.perf_counter()
+        deadline = _deadline.get()
+        if deadline is None:
+            deadline = self._clock() + DEFAULT_WALL_BUDGET_S
+        rejected = throttled = 0
         try:
-            for attempt in range(GENERATION_RETRIES + 1):
-                failure: LLMError | None = None
-                retry_generation = False
-                with capture_run_messages() as attempt_messages:
-                    # Failures are built inside the handlers but raised after them: an exception
-                    # raised in an `except` block keeps the original as `__context__` (even with
-                    # `from None`), and a provider error body may echo a key.
-                    try:
-                        result = await agent.run(prompt + (JSON_ONLY_NUDGE if attempt else ""))
-                    except UnexpectedModelBehavior as exc:
-                        failure = LLMOutputError(
-                            f"{role}/{tier}: output failed validation after "
-                            f"{OUTPUT_REPAIR_RETRIES} repair retry ({type(exc).__name__})",
-                            record=self._record(
-                                role, tier, [*messages, *attempt_messages], headers, start
-                            ),
-                        )
-                    except ModelAPIError as exc:
-                        status = exc.status_code if isinstance(exc, ModelHTTPError) else None
-                        code = _generation_error_code(exc)
-                        if code is not None and attempt < GENERATION_RETRIES:
-                            retry_generation = True
-                        elif code is not None:
-                            failure = LLMOutputError(
-                                f"{role}/{tier}: provider rejected the generation "
-                                f"{GENERATION_RETRIES + 1} times (HTTP {status}, {code})",
-                                record=self._record(
-                                    role, tier, [*messages, *attempt_messages], headers, start
-                                ),
-                            )
-                        else:
-                            failure = LLMUnavailable(
-                                f"{role}/{tier}: LLM proxy unavailable ({type(exc).__name__}"
-                                + (f", HTTP {status})" if status is not None else ")"),
-                                status_code=status,
-                            )
-                    except (AgentRunError, TimeoutError, httpx2.HTTPError) as exc:
-                        failure = LLMUnavailable(
-                            f"{role}/{tier}: LLM call failed ({type(exc).__name__})"
-                        )
-                messages.extend(attempt_messages)
-                if failure is not None:
-                    raise failure
-                if not retry_generation:
-                    record = self._record(role, tier, messages, headers, start)
-                    return result.output, record
-            raise AssertionError(
-                "unreachable: the last attempt returns or raises"
-            )  # pragma: no cover
+            while True:
+                nudge = JSON_ONLY_NUDGE if rejected else ""
+                attempt = await self._attempt(agent, prompt + nudge, messages)
+                if attempt.kind == "ok":
+                    record = self._record(role, tier, messages, headers, start, rejected)
+                    return attempt.output, record  # type: ignore[return-value]  # agent output
+                if attempt.kind == "rejected":
+                    rejected += 1
+                    if rejected <= GENERATION_RETRIES:
+                        continue
+                    raise LLMOutputError(
+                        f"{role}/{tier}: provider rejected the generation {rejected} times "
+                        f"(HTTP {attempt.status}, {attempt.code})",
+                        record=self._record(role, tier, messages, headers, start, rejected),
+                    )
+                if attempt.kind == "throttled" and throttled < RATE_LIMIT_RETRIES:
+                    wait = _backoff_s(throttled, attempt.retry_after)
+                    if self._clock() + wait <= deadline:
+                        throttled += 1
+                        await self._sleep(wait)
+                        continue
+                if attempt.kind == "invalid":
+                    raise LLMOutputError(
+                        f"{role}/{tier}: output failed validation after "
+                        f"{OUTPUT_REPAIR_RETRIES} repair retry ({attempt.error_name})",
+                        record=self._record(role, tier, messages, headers, start, rejected),
+                    )
+                if attempt.kind == "failed":
+                    raise LLMUnavailable(f"{role}/{tier}: LLM call failed ({attempt.error_name})")
+                status = attempt.status
+                raise LLMUnavailable(
+                    f"{role}/{tier}: LLM proxy unavailable ({attempt.error_name}"
+                    + (f", HTTP {status})" if status is not None else ")")
+                    + (f" after {throttled} rate-limit retries" if throttled else ""),
+                    status_code=status,
+                )
         finally:
             _response_headers.reset(token)
+
+    async def _attempt(
+        self, agent: Agent[None, object], prompt: str, messages: list[ModelMessage]
+    ) -> _Attempt:
+        """One `agent.run`, its messages appended to `messages`, its outcome as plain data.
+
+        The caller raises from the returned data, outside any ``except`` block: an exception raised
+        in a handler keeps the original as ``__context__`` (even with ``from None``), and a provider
+        error body may echo a key.
+        """
+        with capture_run_messages() as attempt_messages:
+            try:
+                result = await agent.run(prompt)
+            except UnexpectedModelBehavior as exc:
+                outcome = _Attempt("invalid", error_name=type(exc).__name__)
+            except ModelAPIError as exc:
+                outcome = _classify(exc)
+            except (AgentRunError, TimeoutError, httpx2.HTTPError) as exc:
+                outcome = _Attempt("failed", error_name=type(exc).__name__)
+            else:
+                outcome = _Attempt("ok", output=result.output)
+        messages.extend(attempt_messages)
+        return outcome
 
     def _record(
         self,
@@ -307,6 +402,7 @@ class LLM:
         messages: list[ModelMessage],
         headers: list[httpx2.Headers],
         start: float,
+        rejected: int = 0,
     ) -> CallRecord:
         responses = [m for m in messages if isinstance(m, ModelResponse)]
         in_tok = sum(r.usage.input_tokens for r in responses)
@@ -324,6 +420,7 @@ class LLM:
             cost_usd=0.0 if cached else _cost(model, tier, in_tok, out_tok, headers),
             latency_ms=round((time.perf_counter() - start) * 1000),
             cached=cached,
+            rejected_attempts=rejected,
         )
         self.records.append(record)
         return record
@@ -338,15 +435,68 @@ def _wrap_output[T](output_type: type[T], mode: OutputMode) -> OutputSpec[T]:
     return output_type
 
 
-def _generation_error_code(exc: ModelAPIError) -> str | None:
-    """The `GENERATION_ERROR_CODES` entry a provider 400 carries, else None.
+def _classify(exc: ModelAPIError) -> _Attempt:
+    """Map a provider/proxy error onto an attempt outcome (status, code and wait only)."""
+    name = type(exc).__name__
+    if not isinstance(exc, ModelHTTPError):
+        return _Attempt("unavailable", error_name=name)
+    status = exc.status_code
+    if status == 400 and (code := _generation_error_code(exc)) is not None:
+        return _Attempt("rejected", status=status, error_name=name, code=code)
+    retry_after = _retry_after_s(exc.headers)
+    cooldown = retry_after is not None and PROXY_COOLDOWN_MARKER in _error_message(exc.body)
+    if status == 429 or cooldown:
+        return _Attempt("throttled", status=status, error_name=name, retry_after=retry_after)
+    return _Attempt("unavailable", status=status, error_name=name)
 
-    Only the code is returned (never body text), so a key echoed in the body cannot escape.
+
+def _generation_error_code(exc: ModelHTTPError) -> str | None:
+    """The `GENERATION_ERROR_CODES` entry a 400 carries, else None (see that constant).
+
+    The structured ``error.code`` decides when it is a provider code; the message is searched
+    only when the code is absent or just the HTTP status (LiteLLM's relay). Only the code is
+    returned, never body text, so a key echoed in the body cannot escape.
     """
-    if not isinstance(exc, ModelHTTPError) or exc.status_code != 400:
+    code = exc.provider_error_code
+    if code in GENERATION_ERROR_CODES:
+        return code
+    if code is not None and not code.isdecimal():
         return None
-    body = exc.body if isinstance(exc.body, str) else json.dumps(exc.body, default=str)
-    return next((code for code in GENERATION_ERROR_CODES if code in body), None)
+    message = _error_message(exc.body)
+    return next((c for c in GENERATION_ERROR_CODES if c in message), None)
+
+
+def _error_message(body: object) -> str:
+    """``error.message`` of an OpenAI-style error body (the SDK passes the inner ``error``)."""
+    if isinstance(body, dict):
+        message = body.get("message")
+        return message if isinstance(message, str) else ""
+    return body if isinstance(body, str) else ""
+
+
+def _retry_after_s(headers: dict[str, str] | None) -> float | None:
+    """Seconds from a ``retry-after`` header (delta-seconds or HTTP-date), else None."""
+    raw = (headers or {}).get("retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+        except TypeError, ValueError:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        seconds = (when - datetime.now(UTC)).total_seconds()
+    return seconds if math.isfinite(seconds) else None
+
+
+def _backoff_s(retry: int, retry_after: float | None) -> float:
+    """Wait before rate-limit retry number `retry` (0-based): Retry-After, else exponential."""
+    if retry_after is not None:
+        return max(retry_after, RATE_LIMIT_BACKOFF_S)
+    return min(RATE_LIMIT_BACKOFF_S * 2**retry, RATE_LIMIT_MAX_BACKOFF_S)
 
 
 def _header_cost(headers: list[httpx2.Headers]) -> float | None:

@@ -19,14 +19,13 @@ from typing import Any
 
 import polars as pl
 import pytest
+from model_fakes import output_part
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
-    TextPart,
-    ToolCallPart,
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -53,13 +52,6 @@ from sluice.systems.agent import AgentSystem
 from sluice.systems.rules_only import RulesOnlySystem
 
 TOKENS_PER_CALL = 150  # 100 in + 50 out, see Script.respond
-
-
-def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
-    """The model's structured answer: the output tool call in tool mode, else JSON text."""
-    if info.output_tools:
-        return ToolCallPart(info.output_tools[0].name, payload)
-    return TextPart(payload)
 
 
 def _module(body: str) -> str:
@@ -173,7 +165,7 @@ class Script:
             accept = self.verdicts.pop(0) if self.verdicts else True
             out = {"accept": accept, "reason": "pairs look right" if accept else "100x too large"}
         return ModelResponse(
-            parts=[_output_part(info, json.dumps(out))],
+            parts=[output_part(info, json.dumps(out))],
             usage=RequestUsage(input_tokens=100, output_tokens=50),
             model_name="script-model",
         )
@@ -1111,3 +1103,27 @@ def test_pipeline_parsed_cells_of_duplicate_rows_stay_unchanged(
     assert unflagged
     assert all(agent[k] == rules[k] for k in unflagged)
     assert all(agent[k] is not None for (k,) in flagged)
+
+
+def test_pipeline_bounds_rate_limit_waits_by_the_file_wall_cap(medium: Case) -> None:
+    """Every model call of a file runs inside `LLM.wall_budget(MAX_WALL_S_PER_FILE)`."""
+    from sluice.agent.caps import MAX_WALL_S_PER_FILE
+    from sluice.llm import client
+
+    script = Script(mapping=AMT_MAPPING, plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+    scripted_respond = script.respond
+    deadlines: list[float | None] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        deadlines.append(client._deadline.get())
+        return scripted_respond(messages, info)
+
+    script.respond = respond  # type: ignore[method-assign]
+    before = time.monotonic()
+    run(medium, script)
+    after = time.monotonic()
+
+    assert deadlines
+    for deadline in deadlines:
+        assert deadline is not None
+        assert before + MAX_WALL_S_PER_FILE <= deadline <= after + MAX_WALL_S_PER_FILE

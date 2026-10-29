@@ -10,8 +10,9 @@ from typing import Any
 
 import polars as pl
 import pytest
+from model_fakes import output_part
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -38,13 +39,6 @@ API_KEY = "sk-sluice-test-master-key-0123456789"
 ORDERS = load_contract("orders")
 
 # ---------------------------------------------------------------- helpers
-
-
-def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
-    """The model's structured answer: the output tool call in tool mode, else JSON text."""
-    if info.output_tools:
-        return ToolCallPart(info.output_tools[0].name, payload)
-    return TextPart(payload)
 
 
 def orders_frame(**renames: str) -> pl.DataFrame:
@@ -79,7 +73,7 @@ class Scripted:
         )
         answer = self.queue.pop(0)
         return ModelResponse(
-            parts=[_output_part(info, json.dumps(answer))],
+            parts=[output_part(info, json.dumps(answer))],
             usage=RequestUsage(input_tokens=40, output_tokens=8),
         )
 
