@@ -207,14 +207,27 @@ class EventLog:
     :meth:`emit` is guarded by a lock, so threads (and ``asyncio`` tasks) can share one log.
     Memory is O(events): a run emits a handful of events per plan node, which is bounded by
     ``MAX_ATTEMPTS`` times the plan size.
+
+    Args:
+        clock: Returns the current, timezone-aware time (stamped into ``at``).
+        on_emit: Called with each stamped event, after it is recorded and outside the lock (so
+            the callback may read :attr:`events` or emit into another log). Used to relay a
+            pipeline's events live (``sluice.runs.execute``). Its exceptions propagate to the
+            caller of :meth:`emit`. When threads share the log, callbacks may run in a different
+            order than ``seq``.
     """
 
-    __slots__ = ("_clock", "_events", "_lock")
+    __slots__ = ("_clock", "_events", "_lock", "_on_emit")
 
-    def __init__(self, clock: Callable[[], datetime] = _utc_now) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], datetime] = _utc_now,
+        on_emit: Callable[[EventModel], None] | None = None,
+    ) -> None:
         self._clock = clock
         self._events: list[EventModel] = []
         self._lock = threading.Lock()
+        self._on_emit = on_emit
 
     def emit[E: EventModel](self, event: E) -> E:
         """Stamp ``event`` with the next ``seq`` and the current time, record and return it.
@@ -227,6 +240,8 @@ class EventLog:
                 update={"seq": len(self._events) + 1, "at": _iso_utc(self._clock())}
             )
             self._events.append(stamped)
+        if self._on_emit is not None:
+            self._on_emit(stamped)
         return stamped
 
     @property

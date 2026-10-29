@@ -4,6 +4,7 @@ import {
   errorDetail,
   isNotFound,
   parseErrorBody,
+  retryWhileNotReady,
 } from "@/lib/api/errors";
 import { HttpApiClient } from "@/lib/api/http-client";
 
@@ -69,5 +70,74 @@ describe("HttpApiClient errors", () => {
       code: "format",
     });
     vi.unstubAllGlobals();
+  });
+});
+
+describe("retryWhileNotReady", () => {
+  const notReady = () =>
+    new ApiError(409, "/runs/x/preview", "409", { code: "not_ready" });
+
+  test("retries a 409 not_ready until the load succeeds", async () => {
+    const load = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(notReady())
+      .mockRejectedValueOnce(notReady())
+      .mockResolvedValue("ok");
+    await expect(retryWhileNotReady(load, [0, 0, 0])).resolves.toBe("ok");
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  test("gives up with the last error once the retries run out", async () => {
+    const load = vi.fn<() => Promise<string>>().mockRejectedValue(notReady());
+    await expect(retryWhileNotReady(load, [0, 0])).rejects.toMatchObject({
+      status: 409,
+      code: "not_ready",
+    });
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  test("does not retry any other error", async () => {
+    const other = new ApiError(409, "/runs/x/preview", "409", {
+      code: "no_preview",
+    });
+    const load = vi.fn<() => Promise<string>>().mockRejectedValue(other);
+    await expect(retryWhileNotReady(load, [0, 0])).rejects.toBe(other);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  test("an abort cancels the pending retry timer and stops retrying", async () => {
+    vi.useFakeTimers();
+    try {
+      const load = vi.fn<() => Promise<string>>().mockRejectedValue(notReady());
+      const controller = new AbortController();
+      const result = retryWhileNotReady(
+        load,
+        [1_000, 1_000],
+        controller.signal,
+      );
+      const settled = result.then(
+        () => null,
+        (err: unknown) => err,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
+
+      controller.abort();
+      expect(await settled).toMatchObject({ name: "AbortError" });
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(load).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an already-aborted signal does not call load", async () => {
+    const load = vi.fn<() => Promise<string>>().mockResolvedValue("ok");
+    await expect(
+      retryWhileNotReady(load, [0], AbortSignal.abort()),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(load).not.toHaveBeenCalled();
   });
 });

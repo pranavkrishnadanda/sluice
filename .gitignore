@@ -16,6 +16,7 @@ __pycache__/
 frontend/node_modules/
 frontend/.next/
 frontend/.next-e2e/
+frontend/.next-e2e-live/
 frontend/test-results/
 frontend/playwright-report/
 frontend/AGENTS.md

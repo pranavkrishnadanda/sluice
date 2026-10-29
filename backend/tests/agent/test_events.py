@@ -257,3 +257,23 @@ def test_events_are_frozen() -> None:
 def test_events_reject_invalid_input(build) -> None:
     with pytest.raises(ValidationError):
         build()
+
+
+def test_event_log_on_emit_receives_each_stamped_event_in_order() -> None:
+    seen: list[object] = []
+    log = EventLog(on_emit=seen.append)
+    first = log.emit(Verified(checks_passed=1, checks_total=1))
+    second = log.emit(Verified(checks_passed=0, checks_total=1))
+    assert seen == [first, second]
+    assert [e.seq for e in seen] == [1, 2]  # type: ignore[attr-defined]
+
+
+def test_event_log_on_emit_runs_outside_the_lock() -> None:
+    log: EventLog
+
+    def reenter(event: object) -> None:
+        # Would deadlock if the callback held the (non-reentrant) lock.
+        assert len(log.events) >= 1
+
+    log = EventLog(on_emit=reenter)
+    log.emit(Verified(checks_passed=1, checks_total=1))

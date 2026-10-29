@@ -12,6 +12,7 @@
       "!node_modules",
       "!.next",
       "!.next-e2e",
+      "!.next-e2e-live",
       "!next-env.d.ts",
       "!playwright-report",
       "!test-results"

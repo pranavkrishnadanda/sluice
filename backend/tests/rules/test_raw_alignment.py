@@ -58,3 +58,12 @@ def test_cell_texts_renders_typed_cells_and_rejects_unsupported() -> None:
     assert cell_texts(pl.Series([1, None])) == ["1", None]
     assert cell_texts(pl.Series(["a"])) == ["a"]
     assert cell_texts(pl.Series([1.5])) is None
+
+
+def test_raw_row_keys_parses_every_raw_row_and_marks_unkeyable_ones() -> None:
+    from sluice.rules.fixers import raw_row_keys
+
+    contract = load_contract("lineitem")
+    df = pl.DataFrame({"l_orderkey": [" 1", "1", "x", "2"], "l_linenumber": ["3", "3", "1", None]})
+    keys = raw_row_keys(df, contract, profile(df, contract))
+    assert keys == [(1, 3), (1, 3), None, None]  # duplicates kept; one key per raw row

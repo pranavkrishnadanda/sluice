@@ -20,7 +20,8 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``. Each
    attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
-   own reason).
+   own reason). The attempt's transform record (when it produced code) goes to
+   ``case.on_transform`` just before that event.
    A node whose dependency was not accepted never starts. ``depends_on`` only orders and
    gates: a dependent node still reads the mapped input frame (never its dependency's
    rewritten column), and every accepted column is applied together in rules pass 2.
@@ -80,6 +81,7 @@ from typing import Any, Final
 
 import polars as pl
 
+from sluice import tracing
 from sluice.agent import plan as planning
 from sluice.agent.caps import (
     MAX_ATTEMPTS,
@@ -190,6 +192,8 @@ class _Run:
     records_from: int
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     emitted: list[EventModel] = field(default_factory=list)
+    sources: dict[str, str | None] = field(default_factory=dict)
+    """Contract column -> the raw input column it is read from (``meta["mapping"]``)."""
     errors: list[str] = field(default_factory=list)
     sandbox_error: str | None = None
     finished: bool = False
@@ -238,8 +242,15 @@ def _spend(records: list[CallRecord]) -> tuple[int, float]:
 # --------------------------------------------------------------------------- entry point
 
 
-async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> SystemOutput:
+async def run_pipeline(
+    case: CaseInput, deps: PipelineDeps, log: EventLog, *, run_id: str | None = None
+) -> SystemOutput:
     """Run the agent pipeline over ``case.path`` (see the module docstring for the states).
+
+    ``run_id`` is the caller's run id (``[A-Za-z0-9_-]{1,64}``), used for ``run_started``,
+    ``meta["run_id"]`` and every transform id, so lineage, events and the API agree; ``None``
+    makes up a random one. Events go to ``log`` as they happen (give it an ``on_emit`` to relay
+    them live) and are also returned in ``meta["events"]``.
 
     Never raises for an ``Exception``: model and provider problems fall back as described in
     the module docstring, and anything unexpected (a read error, a sandbox or Docker API error,
@@ -247,7 +258,14 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
     ``failed``, the summary naming only the exception type) and a whole-file quarantine output.
     ``BaseException`` (``asyncio.CancelledError``, ``KeyboardInterrupt``) is never caught.
     """
-    run = _Run(case, deps, log, start=deps.clock(), records_from=len(deps.llm.records))
+    run = _Run(
+        case,
+        deps,
+        log,
+        start=deps.clock(),
+        records_from=len(deps.llm.records),
+        run_id=run_id or uuid.uuid4().hex,
+    )
     try:
         # Rate-limit back-off inside any model call must end within the file's wall cap. Requests
         # themselves are not cut off, so a file can overrun the cap by up to one request.
@@ -273,15 +291,19 @@ async def _pipeline(run: _Run) -> SystemOutput:
     mapping: ColumnMapping | None = None
     frame = raw
     try:
-        mapping, _ = await propose_mapping(raw, contract, deps.llm)
-        frame = apply_mapping(raw, mapping)
+        with tracing.step_span("mapping"):
+            mapping, _ = await propose_mapping(raw, contract, deps.llm)
+            frame = apply_mapping(raw, mapping)
     except (LLMUnavailable, LLMOutputError) as exc:
         run.llm_failed("mapping", exc)
     map_actions = _mapping_actions(mapping)
 
-    prof1 = profile(frame, contract)
+    with tracing.step_span("profile"):
+        prof1 = profile(frame, contract)
+    run.sources = raw_sources(contract, prof1, mapping)
     try:
-        pass1 = apply_rules(frame, contract, prof1, case.reference)
+        with tracing.step_span("rules_pass_1"):
+            pass1 = apply_rules(frame, contract, prof1, case.reference)
     except UnkeyableInputError as exc:
         reason = str(exc)
         actions = [*map_actions, f"file quarantined: {reason}"]
@@ -299,7 +321,8 @@ async def _pipeline(run: _Run) -> SystemOutput:
         run.errors.append("planning: skipped, no model route is available")
     else:
         try:
-            plan, _ = await planning.propose_plan(candidates, contract, deps.llm)
+            with tracing.step_span("plan"):
+                plan, _ = await planning.propose_plan(candidates, contract, deps.llm)
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
@@ -336,7 +359,8 @@ async def _pipeline(run: _Run) -> SystemOutput:
         rewritten = frame.with_columns(
             [values.alias(source[column]) for column, values in accepted.items()]
         )
-        final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
+        with tracing.step_span("rules_pass_2"):
+            final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
     actions = map_actions + final.actions
     return _finish(run, final, actions, plan, outcomes, mapping)
 
@@ -435,11 +459,12 @@ async def _run_node(
         started = run.deps.clock()
         run.emit(NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS))
         records: list[CallRecord] = []
-        error, rewritten = await _attempt(
+        error, rewritten = await _traced_attempt(
             run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
             values, frame, flagged_before, records,
         )  # fmt: skip
         tokens, cost = _spend(records)
+        _hand_over_transform(run, outcome, attempt)
         if error is None:
             if rewritten is None:
                 raise PipelineError(f"node {node.id}: accepted attempt without output")
@@ -473,6 +498,49 @@ async def _run_node(
     outcome.stop = f"no accepted transform after {MAX_ATTEMPTS} attempts"
     if run.halted is None:  # the contract's failure path: hold the whole input back
         run.halted = f"node {node.id} ({node.column}): {outcome.stop}"
+
+
+def _hand_over_transform(run: _Run, outcome: _NodeOutcome, attempt: int) -> None:
+    """Pass this attempt's transform record (if it produced code) to ``case.on_transform``.
+
+    Called once the attempt's outcome is known (``passed`` is final) and before its
+    ``node_finished``/``attempt_failed`` is emitted, so a consumer that persists the record
+    has it in place when the event announcing it is delivered. A copy is passed.
+    """
+    hook = run.case.on_transform
+    if hook is None or not outcome.transforms:
+        return
+    # _attempt appends at most one record per attempt, and attempts of a node run in order,
+    # so the last record is this attempt's if it produced code; else it is an earlier one's.
+    record = outcome.transforms[-1]
+    if record["attempt"] == attempt:
+        hook(dict(record))
+
+
+async def _traced_attempt(
+    run: _Run,
+    outcome: _NodeOutcome,
+    attempt: int,
+    tier: Tier,
+    spec: ColumnSpec,
+    source_name: str,
+    shown_name: str,
+    samples: list[str],
+    prior_error: str | None,
+    values: pl.Series,
+    frame: pl.DataFrame,
+    flagged_before: set[int],
+    records: list[CallRecord],
+) -> tuple[str | None, pl.Series | None]:
+    """`_attempt` inside its ``sluice.node.attempt`` span."""
+    attributes = {"sluice.node_id": outcome.node.id, "sluice.attempt": attempt, "sluice.tier": tier}
+    with tracing.span("sluice.node.attempt", attributes) as current:
+        error, rewritten = await _attempt(
+            run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
+            values, frame, flagged_before, records,
+        )  # fmt: skip
+        current.set_attribute("sluice.outcome", "accepted" if error is None else "failed")
+    return error, rewritten
 
 
 async def _attempt(
@@ -509,6 +577,7 @@ async def _attempt(
         return f"LLMUnavailable: {exc}", None
     records.append(record)
     transform = {
+        "transform_id": transform_id(run.run_id, node.id, attempt),
         "node_id": node.id,
         "attempt": attempt,
         "code": code.code,
@@ -651,6 +720,22 @@ def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | Non
         ):
             stats[f"{name}_{label}"] = None if value is None else float(value)  # type: ignore[arg-type]
     return stats
+
+
+def raw_sources(
+    contract: Contract, prof: Profile, mapping: ColumnMapping | None
+) -> dict[str, str | None]:
+    """Contract column -> the raw input column it is read from, in contract order.
+
+    ``prof`` profiles the mapped frame; a column the mapping renamed is traced back to its
+    original name (``amt`` for ``o_totalprice``). ``None`` when no input column holds it.
+    """
+    renamed = {} if mapping is None else {t: s for s, t in mapping.pairs.items() if t is not None}
+    matched = contract_sources(prof)
+    return {
+        c.name: renamed.get(matched[c.name], matched[c.name]) if c.name in matched else None
+        for c in contract.columns
+    }
 
 
 def _hints(mapping: ColumnMapping | None) -> dict[str, str]:
@@ -920,6 +1005,7 @@ def _meta(
         "records": [r.model_dump(mode="json") for r in run.records],
         "tokens": run.tokens(),
         "quarantine_reasons": quarantine_reasons,
+        "mapping": run.sources or dict.fromkeys(c.name for c in run.case.contract.columns),
         "mapping_truncated": [] if mapping is None else list(mapping.truncated),
     }
     if run.errors:

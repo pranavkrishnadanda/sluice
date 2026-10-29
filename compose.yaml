@@ -111,7 +111,38 @@ services:
     mem_limit: 768m
     restart: unless-stopped
 
+  # Trace UI and OTLP collector, opt-in: `make up-obs` (profile `observability`; `make up` does
+  # not start it). Phoenix serves the UI *and* the OTLP/HTTP collector (`/v1/traces`) on one
+  # container port, 6006 (gRPC OTLP on 4317 is not published). So the OTLP endpoint is
+  # http://127.0.0.1:56006 as well; no separate OTLP/HTTP host port is mapped. Ports verified
+  # for arizephoenix/phoenix version-20.26.1 (image EXPOSE 6006/4317/9090; Phoenix Docker docs:
+  # "6006:6006 # UI and OTLP HTTP collector"). Re-check on any image bump.
+  phoenix:
+    image: arizephoenix/phoenix:version-20.26.1@sha256:623813cbf1bbd4811456bb4936f21666ae50a1fbf862cf59ea0e3ca824b6b114
+    profiles: ["observability"]
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+      PHOENIX_TELEMETRY_ENABLED: "false"
+    ports:
+      - "127.0.0.1:56006:6006"
+    volumes:
+      - phoenixdata:/mnt/data
+    # The image is distroless (no shell or curl); its own Python does the probe.
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/python3.13
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:6006/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
   rustfsdata:
+  phoenixdata:
