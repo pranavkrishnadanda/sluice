@@ -1470,10 +1470,12 @@ def test_pipeline_announces_each_phase_once_when_it_starts(indian: Case) -> None
     assert [_activity(e) for e in seen] == [
         ("mapping", None, None, None, None),
         ("planning", None, "strong", None, None),
+        ("checking", None, None, None, None),  # finding the flagged rows before the first node
         ("writing", "n1", "small", 1, None),
         ("sandbox", "n1", "small", 1, None),
         ("checking", "n1", "small", 1, None),
         ("verifying", "n1", "small", 1, None),
+        ("verifying", None, None, None, None),  # rules pass 2 on the repaired data
     ]
     assert all(e.type == "activity" for e in seen)  # type: ignore[attr-defined]
 
@@ -1495,6 +1497,7 @@ def test_pipeline_activity_interleaves_with_the_milestone_events(indian: Case) -
         "rules_applied",
         "activity:planning",
         "plan_created",
+        "activity:checking",
         "node_started",
         "activity:writing",
         "activity:sandbox",
@@ -1505,6 +1508,7 @@ def test_pipeline_activity_interleaves_with_the_milestone_events(indian: Case) -
         "activity:checking",
         "activity:verifying",
         "node_finished",
+        "activity:verifying",
         "verified",
         "run_finished",
     ]
@@ -1516,13 +1520,18 @@ def test_pipeline_activity_copy_names_the_tier_column_and_rows(indian: Case) -> 
 
     result = run(indian, script, on_activity=seen.append)
 
-    messages = {e.phase: e.message for e in seen}  # type: ignore[attr-defined]
+    messages = {e.phase: e.message for e in seen if e.node_id is not None}  # type: ignore[attr-defined]
+    run_wide = [(e.phase, e.message) for e in seen if e.node_id is None]  # type: ignore[attr-defined]
     rows = result.events("run_started")[0].rows  # type: ignore[attr-defined]
+    assert run_wide[2:] == [
+        ("checking", f"Finding the cells the rules flagged in {rows:,} rows"),
+        ("verifying", "Re-running the rules on the repaired data"),
+    ]
     assert messages["writing"] == "Asking the small model to write a fix for o_totalprice"
     assert messages["sandbox"] == f"Running the fix in the sandbox on {rows:,} rows"
     assert messages["checking"] == "Checking the rewrite against the rules"
     assert messages["verifying"] == "The verifier is checking the result"
-    assert messages["planning"] == "Asking the strong model to plan repairs for 1 column"
+    assert run_wide[1] == ("planning", "Asking the strong model to plan repairs for 1 column")
 
 
 def test_pipeline_rate_limit_wait_is_announced_then_the_phase_resumes(indian: Case) -> None:

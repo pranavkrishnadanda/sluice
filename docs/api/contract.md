@@ -270,8 +270,10 @@ and does not change the order of the other events.
 
 - `nodeId` is the plan node the phase belongs to, or `null` for run-wide
   phases: `mapping` (schema mapping call), `planning` (planning call),
-  `loading` (writing to the warehouse) and `previewing` (building the
-  before/after preview).
+  `checking` (finding the cells the rules flagged, between `plan_created`
+  and the first `node_started`), `verifying` (re-running the rules on the
+  repaired data, just before `verified`), `loading` (writing to the
+  warehouse) and `previewing` (building the before/after preview).
 - Per-node phases, in the order an attempt goes through them: `writing`
   (the worker model writes the fix), `sandbox` (the fix runs in the
   sandbox), `checking` (the rewrite is checked against the rules),
@@ -285,9 +287,14 @@ and does not change the order of the other events.
   fix in the sandbox on 15,000 rows", "Rate limit reached on the small
   model — retrying in 14 s", "Loading 15,000 rows into the warehouse". It
   never contains prompts, model output, data values, paths or secrets.
-- The UI shows the latest `activity` (per node when `nodeId` is set, else
-  run-wide) until a later `activity`, a `node_finished` / `attempt_failed`
-  for that node, or a terminal event replaces it; `run_finished` clears all.
+- The UI shows the latest `activity` until something replaces it:
+  - a **node** activity (`nodeId` set) lasts until a later activity for
+    that node, or that node's `node_finished` / `attempt_failed`;
+  - a **run-wide** activity (`nodeId: null`) lasts until **any** later
+    event that is not an `activity` (e.g. `plan_created` ends `planning`,
+    `verified` ends the run-wide `verifying`), a later run-wide activity, or
+    a newer node activity;
+  - `run_finished` clears all.
 
 Independent nodes run concurrently, so the events of different nodes may
 interleave; the order above holds per node.

@@ -52,8 +52,10 @@ States, in order (each one emits the contract event named after it, see ``docs/a
 
 Activity (``case.on_activity``, live-only status, never in ``log`` or ``meta["events"]``): one
 ``activity`` event when each phase starts: ``mapping`` (before the mapping call), ``planning``
-(before a planning call), and per attempt, after its ``node_started``: ``writing`` (worker call),
-``sandbox``, ``checking`` (the effect check) and ``verifying`` (verifier call). A rate-limit
+(before a planning call), run-wide ``checking`` (finding the flagged rows, between
+``plan_created`` and the first node), per attempt, after its ``node_started``: ``writing``
+(worker call), ``sandbox``, ``checking`` (the effect check) and ``verifying`` (verifier call),
+and run-wide ``verifying`` before rules pass 2. A rate-limit
 back-off inside any of those model calls (``LLM.on_backoff``) announces ``waiting`` (with the
 wait in whole seconds) and then the interrupted phase again. The copy names tiers, contract
 column names and row counts only.
@@ -507,6 +509,7 @@ async def _pipeline(run: _Run) -> SystemOutput:
         rewritten = frame.with_columns(
             [values.alias(source[column]) for column, values in accepted.items()]
         )
+        run.activity("verifying", "Re-running the rules on the repaired data")
         with tracing.step_span("rules_pass_2"):
             final = apply_rules(rewritten, contract, profile(rewritten, contract), case.reference)
     actions = map_actions + final.actions
@@ -540,6 +543,8 @@ async def _run_nodes(
     pending = list(plan.nodes)
     done: set[str] = set()
     source = contract_sources(prof)
+    if plan.nodes:  # one rules pass over the whole frame: say so, it can take a while
+        run.activity("checking", f"Finding the cells the rules flagged in {frame.height:,} rows")
     flagged = flagged_raw_rows(frame, run.case.contract, prof)
     while pending:
         if run.halted is not None:  # a final failure: no new node starts
