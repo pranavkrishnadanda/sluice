@@ -142,13 +142,14 @@ def _every_event() -> list[ev.EventModel]:
         ev.Verified(checks_passed=3, checks_total=3),
         ev.Loaded(rows_loaded=10, rows_quarantined=0, snapshot_id="123"),
         ev.RunFinished(status="succeeded", summary="ok", cost_usd=0, tokens=0),
+        ev.Activity(node_id="n1", phase="writing", message="m", tier="small", attempt=1),
     ]
     return [e.model_copy(update={"seq": i, "at": AT}) for i, e in enumerate(built, start=1)]
 
 
 def test_every_event_type_is_covered() -> None:
     types = {e.type for e in _every_event()}  # type: ignore[attr-defined]
-    assert len(types) == 10
+    assert len(types) == 11
 
 
 @pytest.mark.parametrize("event", _every_event(), ids=lambda e: e.type)

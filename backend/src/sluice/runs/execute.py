@@ -11,8 +11,12 @@ stamped, in this order (``docs/api/contract.md``, "Event order"):
    **live**, renumbered into the public log as each event happens. A system that does not (the
    rules-only baseline) is replayed from ``meta["events"]`` when it returns, or gets a single
    ``rules_applied`` built from ``meta["actions"]``;
-3. ``loaded``, only when the load wrote a main-table snapshot;
+3. ``loaded``, only when the load wrote a main-table snapshot (then the ``on_loaded`` hook);
 4. exactly one ``run_finished``.
+
+With ``activity=True`` (the API worker) ``activity`` events are published too: the system's own
+(``CaseInput.on_activity``, stamped into the same log as they happen, so ``seq`` stays gapless)
+and ``activity(loading)`` just before the load. ``sluice run`` leaves it off.
 
 One run id end to end: the caller's ``run_id`` is the public ``runId``, the pipeline's run id
 (``meta["run_id"]``), the lineage ``run_id`` and the input of every transform id, so each
@@ -47,6 +51,7 @@ from typing import Any, Final, Literal
 from sluice import tracing
 from sluice.agent.events import (
     PIPELINE_EVENT_ADAPTER,
+    Activity,
     EventLog,
     EventModel,
     Loaded,
@@ -67,6 +72,7 @@ __all__ = [
     "RunOutcome",
     "execute_run",
     "file_sha256",
+    "join_summary",
     "replayed",
     "resolve_run_fn",
 ]
@@ -83,6 +89,7 @@ LoadFn = Callable[..., LoadResult]
 LoadedFn = Callable[..., LoadResult | None]
 Emit = Callable[[EventModel], None]
 OnTransform = Callable[[dict[str, Any]], None]
+OnLoaded = Callable[[SystemOutput], None]
 Status = Literal["succeeded", "quarantined", "failed"]
 
 
@@ -159,6 +166,17 @@ def _output_status(out: SystemOutput, final: RunFinished | None) -> Status:
     return "quarantined" if out.file_quarantined or out.quarantined else "succeeded"
 
 
+def join_summary(first: str, second: str) -> str:
+    """``first; second`` without repeating a ``;``-separated clause ``first`` already has.
+
+    The pipeline's own summary of a file of another table already ends "nothing loaded"
+    (Ruling H5), so the load's "nothing loaded; the file can be retried" adds only the rest.
+    """
+    seen = {clause.strip() for clause in first.split(";")}
+    extra = [c.strip() for c in second.split(";") if c.strip() and c.strip() not in seen]
+    return "; ".join([first, *extra]) if extra else first
+
+
 def _skip_summary(result: LoadResult) -> str:
     return f"file already loaded (snapshot {result.snapshot_id}); nothing written"
 
@@ -213,6 +231,8 @@ def execute_run(
     run_id: str,
     emit: Emit,
     on_transform: OnTransform | None = None,
+    activity: bool = False,
+    on_loaded: OnLoaded | None = None,
     contract_version: str = "v1",
     run_fn: RunFn | None = None,
     load_fn: LoadFn = load_output,
@@ -229,6 +249,12 @@ def execute_run(
         emit: Receives each public event, stamped, as it happens (from the calling thread).
         on_transform: Passed to the system as ``CaseInput.on_transform`` (each transform
             record, before the event that announces it); ``None`` (``sluice run``): not used.
+        activity: Publish ``activity`` events: the system's (``CaseInput.on_activity``,
+            stamped into this log as they happen) and ``loading`` before the load. The API
+            worker sets it; ``sluice run`` keeps its event lines as they were (``False``).
+        on_loaded: Called with the system's output after ``loaded`` is published and before
+            ``run_finished`` (the API worker builds the preview there). Only when a snapshot
+            was written; its exceptions are logged by type and never fail the run.
         contract_version: The contract version to load against.
         run_fn: The system to run (default: :func:`resolve_run_fn`, resolved only when needed).
         load_fn: Loads the output (``sluice.load.iceberg.load_output``).
@@ -255,7 +281,7 @@ def execute_run(
             check_decoded_size(path)  # footer only; _count_rows above already refused it
             ending = _run_and_load(
                 path, contract, run_id, log, run_fn, load_fn, loaded_fn, settings_fn,
-                reference_fn, on_transform,
+                reference_fn, on_transform, activity=activity,
             )  # fmt: skip
         except Exception as exc:
             root.set_attribute("sluice.status", "failed")
@@ -269,8 +295,24 @@ def execute_run(
         root.set_attribute("sluice.status", ending.outcome.status)
         if ending.loaded is not None:
             log.publish(ending.loaded)
+            if on_loaded is not None and ending.outcome.output is not None:
+                _call_on_loaded(on_loaded, ending.outcome.output, run_id)
         log.publish(ending.finished)
     return ending.outcome
+
+
+def _call_on_loaded(on_loaded: OnLoaded, out: SystemOutput, run_id: str) -> None:
+    """Run the ``on_loaded`` hook; the data is already loaded, so a failure only logs."""
+    try:
+        on_loaded(out)
+    except Exception as exc:
+        _log.warning("run %s: the on_loaded hook raised %s", run_id, type(exc).__name__)
+
+
+def _load_message(out: SystemOutput) -> str:
+    if out.file_quarantined:
+        return "Recording the held-back file; nothing is loaded"
+    return f"Loading {out.df.height:,} rows into the warehouse"
 
 
 def _run_and_load(
@@ -284,6 +326,8 @@ def _run_and_load(
     settings_fn: Callable[[], Settings],
     reference_fn: Callable[[str], dict[str, set[Any]]],
     on_transform: OnTransform | None,
+    *,
+    activity: bool = False,
 ) -> _Ending:
     """Everything between ``run_started`` and the final events; raises on any failure."""
     sha = file_sha256(path)
@@ -301,6 +345,7 @@ def _run_and_load(
         run_id=run_id,
         on_event=log.relay,
         on_transform=on_transform,
+        on_activity=log.publish if activity else None,
     )
     out = fn(case)
     log.cost = max(out.cost_usd, 0.0)
@@ -315,6 +360,8 @@ def _run_and_load(
         outcome = RunOutcome(None, "failed", out, log.cost, log.tokens)
         return _Ending(outcome, None, log.finished("failed", summary))
 
+    if activity:
+        log.publish(Activity(node_id=None, phase="loading", message=_load_message(out)))
     with tracing.step_span("load"):
         result = load_fn(
             out, contract, run_id=run_id, file_sha256=sha, settings=settings, status=status
@@ -335,7 +382,7 @@ def _run_and_load(
             " (recovered an earlier commit)" if result.recovered else ""
         )
     if final is not None and not result.skipped:
-        summary = f"{final.summary}; {summary}"
+        summary = join_summary(final.summary, summary)
     final_status: Status = "succeeded" if result.skipped else status
     outcome = RunOutcome(result, final_status, out, log.cost, log.tokens)
     return _Ending(outcome, loaded, log.finished(final_status, summary))

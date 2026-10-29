@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import textwrap
 from typing import Final, Protocol
 
 import polars as pl
@@ -238,10 +239,10 @@ class TransformCode(TransformDraft):
     @field_validator("code")
     @classmethod
     def _precheck(cls, code: str) -> str:
-        error = precheck_code(code)
+        prepared, error = prepare_code(code)
         if error is not None:
             raise ValueError(error)
-        return code
+        return prepared
 
 
 def clip(text: str, limit: int) -> str:
@@ -250,6 +251,34 @@ def clip(text: str, limit: int) -> str:
 
 
 # ---------------------------------------------------------------- static precheck (ast only)
+
+
+INDENT_HINT: Final = (
+    "start every top-level line at column 0 (imports and `def transform` unindented, the "
+    "function body indented by 4 spaces)"
+)
+"""Appended to an indentation error, which the models tend to repeat when not told how."""
+
+
+def prepare_code(code: str) -> tuple[str, str | None]:
+    """The code to run and :func:`precheck_code`'s reason for it (``None``: acceptable).
+
+    Models sometimes indent a whole module (it was inside a block in their head), which fails
+    with "unexpected indent" and costs an attempt. Then ``textwrap.dedent`` is tried once: if
+    the dedented module parses, it replaces the original (and is checked like any other code);
+    otherwise the original is rejected with its error and :data:`INDENT_HINT`. Never executes
+    anything. O(size of the code).
+    """
+    reason = precheck_code(code)
+    if reason is None or INDENT_HINT not in reason:
+        return code, reason
+    dedented = textwrap.dedent(code).lstrip("\n")
+    if dedented == code:
+        return code, reason
+    retry = precheck_code(dedented)
+    if retry is not None and INDENT_HINT in retry:
+        return code, reason
+    return dedented, retry
 
 
 def precheck_code(code: str) -> str | None:
@@ -265,6 +294,8 @@ def precheck_code(code: str) -> str | None:
         return f"code is too long ({len(code)} chars, max {MAX_CODE_CHARS})"
     try:
         tree = ast.parse(code, mode="exec")
+    except IndentationError as exc:  # before SyntaxError: it is a subclass
+        return f"syntax error at line {exc.lineno}: {exc.msg}; {INDENT_HINT}"
     except SyntaxError as exc:
         return f"syntax error at line {exc.lineno}: {exc.msg}"
     except ValueError:  # e.g. null bytes in the source

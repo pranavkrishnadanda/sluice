@@ -15,7 +15,7 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    model call and an empty plan.
 5. **work**, nodes in dependency waves, the nodes of one wave concurrently (``asyncio.gather``).
    Per node, up to ``MAX_ATTEMPTS`` x: ``route_tier`` -> ``write_transform`` (unchecked draft)
-   -> ``precheck_code``
+   -> ``prepare_code`` (``precheck_code``, after one dedent of a uniformly indented module)
    -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> keep only the rewritten
    cells pass 1 flagged, in every raw copy of a row (Ruling F2: parsed cells keep their raw
    text; duplicates stay identical, so dedupe is unchanged) -> an effect check (the
@@ -41,6 +41,14 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    checks on the final output) unless the run failed.
 7. ``run_finished``, exactly once (``loaded`` belongs to the loader / ``sluice run``). Its
    ``tokens``/``costUsd`` are the full run totals (mapping, planning and verifier calls too).
+
+Activity (``case.on_activity``, live-only status, never in ``log`` or ``meta["events"]``): one
+``activity`` event when each phase starts: ``mapping`` (before the mapping call), ``planning``
+(before a planning call), and per attempt, after its ``node_started``: ``writing`` (worker call),
+``sandbox``, ``checking`` (the effect check) and ``verifying`` (verifier call). A rate-limit
+back-off inside any of those model calls (``LLM.on_backoff``) announces ``waiting`` (with the
+wait in whole seconds) and then the interrupted phase again. The copy names tiers, contract
+column names and row counts only.
 
 Fallbacks: model and provider problems never raise. ``LLMUnavailable`` (every route failed) or
 ``LLMOutputError`` from mapping or planning skip that step: the frame stays as it was, so the
@@ -83,6 +91,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -99,10 +108,14 @@ from sluice.agent.caps import (
     MAX_WALL_S_PER_FILE,
 )
 from sluice.agent.events import (
+    ACTIVITY_MESSAGE_MAX_CHARS,
+    Activity,
+    ActivityPhase,
     AttemptFailed,
     EventLog,
     EventModel,
     Issue,
+    ModelTier,
     NodeFinished,
     NodeStarted,
     PlanCreated,
@@ -118,7 +131,7 @@ from sluice.agent.verifier import MAX_VERIFY_PAIRS, verify_node
 from sluice.agent.worker import (
     clip,
     guard_output,
-    precheck_code,
+    prepare_code,
     sandbox_feedback,
     write_transform,
 )
@@ -126,7 +139,16 @@ from sluice.contracts.model import ColumnSpec, Contract, known_contracts
 from sluice.contracts.validate import validate
 from sluice.evals.types import CaseInput, SystemOutput, pk_text
 from sluice.io import read_input
-from sluice.llm.client import LLM, CallRecord, LLMError, LLMOutputError, LLMUnavailable, Tier
+from sluice.llm.client import (
+    LLM,
+    Backoff,
+    BackoffHook,
+    CallRecord,
+    LLMError,
+    LLMOutputError,
+    LLMUnavailable,
+    Tier,
+)
 from sluice.rules.fixers import (
     RuleResult,
     UnkeyableInputError,
@@ -220,11 +242,65 @@ class _Run:
     """Set when a node's final attempt failed: no new node starts and the file is quarantined."""
     unavailable: bool = False
     cap: str | None = None
+    current: dict[str | None, Activity] = field(default_factory=dict)
+    """The latest announced phase per node id (``None``: run-wide), re-announced after a wait."""
 
     def emit[E: EventModel](self, event: E) -> E:
         stamped = self.log.emit(event)
         self.emitted.append(stamped)
         return stamped
+
+    def activity(
+        self,
+        phase: ActivityPhase,
+        message: str,
+        *,
+        node_id: str | None = None,
+        tier: ModelTier | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        """Announce that ``phase`` starts (``case.on_activity``); a no-op without a sink.
+
+        Activity is live-only status: it is not in :attr:`log` or ``meta["events"]``.
+        """
+        sink = self.case.on_activity
+        if sink is None:
+            return
+        event = Activity(
+            node_id=node_id,
+            phase=phase,
+            message=clip(message, ACTIVITY_MESSAGE_MAX_CHARS),
+            tier=tier,
+            attempt=attempt,
+        )
+        self.current[node_id] = event
+        sink(event)
+
+    def backoff_hook(self, node_id: str | None, attempt: int | None) -> BackoffHook:
+        """An ``LLM.on_backoff`` hook: ``waiting`` before a rate-limit wait, then the
+        interrupted phase again once the wait is over."""
+
+        def hook(wait: Backoff) -> None:
+            sink = self.case.on_activity
+            if sink is None:
+                return
+            if not wait.done:
+                seconds = math.ceil(wait.wait_s)
+                message = f"Rate limit reached on the {wait.tier} model — retrying in {seconds} s"
+                sink(
+                    Activity(
+                        node_id=node_id,
+                        phase="waiting",
+                        message=message,
+                        tier=wait.tier,
+                        attempt=attempt,
+                        retry_in_s=seconds,
+                    )
+                )
+            elif (resumed := self.current.get(node_id)) is not None:
+                sink(resumed)
+
+        return hook
 
     @property
     def records(self) -> list[CallRecord]:
@@ -318,8 +394,9 @@ async def _pipeline(run: _Run) -> SystemOutput:
 
     mapping: ColumnMapping | None = None
     frame = raw
+    run.activity("mapping", f"Matching the file's columns to the {contract.name} contract")
     try:
-        with tracing.step_span("mapping"):
+        with tracing.step_span("mapping"), deps.llm.on_backoff(run.backoff_hook(None, None)):
             mapping, _ = await propose_mapping(raw, contract, deps.llm)
             frame = apply_mapping(raw, mapping)
     except (LLMUnavailable, LLMOutputError) as exc:
@@ -348,8 +425,16 @@ async def _pipeline(run: _Run) -> SystemOutput:
     if candidates and run.unavailable:
         run.errors.append("planning: skipped, no model route is available")
     else:
+        if candidates:
+            n = len(candidates)
+            run.activity(
+                "planning",
+                f"Asking the {planning.PLAN_TIER} model to plan repairs for {n} "
+                + ("column" if n == 1 else "columns"),
+                tier=planning.PLAN_TIER,
+            )
         try:
-            with tracing.step_span("plan"):
+            with tracing.step_span("plan"), deps.llm.on_backoff(run.backoff_hook(None, None)):
                 plan, _ = await planning.propose_plan(
                     candidates,
                     contract,
@@ -494,12 +579,15 @@ async def _run_node(
         tier = planning.route_tier(node, attempt)
         outcome.attempts, outcome.tier = attempt, tier
         started = run.deps.clock()
-        run.emit(NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS))
+        run.emit(
+            NodeStarted(node_id=node.id, attempt=attempt, max_attempts=MAX_ATTEMPTS, tier=tier)
+        )
         records: list[CallRecord] = []
-        error, rewritten = await _traced_attempt(
-            run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
-            values, frame, flagged_before, records, unit_issue,
-        )  # fmt: skip
+        with run.deps.llm.on_backoff(run.backoff_hook(node.id, attempt)):
+            error, rewritten = await _traced_attempt(
+                run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
+                values, frame, flagged_before, records, unit_issue,
+            )  # fmt: skip
         tokens, cost = _spend(records)
         _hand_over_transform(run, outcome, attempt)
         if error is None:
@@ -603,6 +691,11 @@ async def _attempt(
     pointless (no model route, or the sandbox itself is down).
     """
     node, llm = outcome.node, run.deps.llm
+
+    def announce(phase: ActivityPhase, message: str) -> None:
+        run.activity(phase, message, node_id=node.id, tier=tier, attempt=attempt)
+
+    announce("writing", f"Asking the {tier} model to write a fix for {node.column}")
     try:
         code, record = await write_transform(
             node, spec, shown_name, samples, prior_error, tier, llm, checked=False,
@@ -616,21 +709,24 @@ async def _attempt(
         outcome.stop, outcome.outage = "no model route is available", True
         return f"LLMUnavailable: {exc}", None
     records.append(record)
+    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
+    # A uniformly indented module is dedented once (``prepare_code``); the record keeps the
+    # code that was actually checked and run.
+    source, reason = prepare_code(code.code)
     transform = {
         "transform_id": transform_id(run.run_id, node.id, attempt),
         "node_id": node.id,
         "attempt": attempt,
-        "code": code.code,
+        "code": source,
         "model": record.model or tier,
         "passed": False,
     }
     outcome.transforms.append(transform)
-
-    # Prechecked here, not in the output schema, so the exact reason reaches the next attempt.
-    if (reason := precheck_code(code.code)) is not None:
+    if reason is not None:
         return f"precheck: {reason}", None
+    announce("sandbox", f"Running the fix in the sandbox on {values.len():,} rows")
     try:
-        result = await asyncio.to_thread(run.deps.sandbox, code.code, values)
+        result = await asyncio.to_thread(run.deps.sandbox, source, values)
     except SandboxError as exc:
         run.sandbox_error = type(exc).__name__
         outcome.stop = "the sandbox is unavailable"
@@ -651,9 +747,11 @@ async def _attempt(
         else only_flagged(values, out.alias(source_name), flagged_before)
     )
 
+    announce("checking", "Checking the rewrite against the rules")
     effect = _effect(run.case, frame, source_name, spec, values, out, flagged_before, unit=unit)
     if effect.error is not None:
         return effect.error, None
+    announce("verifying", "The verifier is checking the result")
     try:
         verdict, vrecord = await verify_node(node, spec, effect.pairs, effect.stats, llm)
     except LLMOutputError as exc:

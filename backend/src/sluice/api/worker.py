@@ -19,10 +19,13 @@ Per run (each step blocking, so the whole run happens in one ``asyncio.to_thread
    (contract "Run summaries");
 5. artefacts: when the run emitted ``loaded``, the upload is read once more (accepted trade-off:
    :class:`~sluice.runs.execute.RunOutcome` carries no raw frame) to build the before/after
-   preview, stored at ``runs/<id>/preview.parquet``; the transforms (``meta["transforms"]``,
-   each with its ``transform_id``) are reconciled with the live ones by id (none dropped or
-   duplicated), in plan order, then attempt. This happens after ``run_finished`` is out: until
-   the key is saved the preview route answers ``409 not_ready``.
+   preview, stored at ``runs/<id>/preview.parquet``. ``execute`` runs with ``activity=True`` and
+   calls the worker's ``on_loaded`` hook between ``loaded`` and ``run_finished``: the worker
+   announces ``activity(previewing)`` and builds the preview there (an ``execute`` that never
+   calls the hook gets it built after it returns, as before). The transforms
+   (``meta["transforms"]``, each with its ``transform_id``) are reconciled with the live ones by
+   id (none dropped or duplicated), in plan order, then attempt. Both are saved after
+   ``run_finished`` is out: until the key is saved the preview route answers ``409 not_ready``.
 
 Exactly one terminal event (Ruling R4): the worker records whether a ``run_finished`` was
 appended. On any exception with none recorded it appends ``run_finished(failed,
@@ -49,6 +52,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from sluice.agent.events import (
+    Activity,
     AttemptFailed,
     EventModel,
     Loaded,
@@ -61,6 +65,7 @@ from sluice.api.blobs import BlobStore
 from sluice.api.hub import EventHub
 from sluice.api.store import DuplicateEvent, RunNotActive, RunRow, RunStore, iso_utc
 from sluice.contracts.model import load_contract
+from sluice.evals.types import SystemOutput
 from sluice.io import read_input
 from sluice.runs.execute import RunOutcome, execute_run
 from sluice.runs.preview import build_preview
@@ -108,6 +113,7 @@ class _RunState:
         "loaded",
         "lock",
         "plan",
+        "preview",
         "seq",
     )
 
@@ -123,6 +129,8 @@ class _RunState:
         self.finished_stored = False
         """``store.finish`` succeeded for :attr:`finished` (or the run was already finished)."""
         self.plan: list[str] = []
+        self.preview: tuple[str | None] | None = None
+        """``(key,)`` once the ``on_loaded`` hook built the preview (key ``None``: it failed)."""
 
 
 class Worker:
@@ -273,6 +281,8 @@ class Worker:
                     run_id=row.id,
                     emit=lambda event: self._emit(row.id, state, event),
                     on_transform=lambda record: self._on_transform(row.id, state, record),
+                    activity=True,
+                    on_loaded=lambda out: self._on_loaded(row, state, path, out),
                     settings_fn=self._settings_fn,
                 )
                 artefacts = self._artefacts(row, state, path, outcome)
@@ -431,6 +441,27 @@ class Worker:
             return terminal
         return None
 
+    def _on_loaded(self, row: RunRow, state: _RunState, path: Path, out: SystemOutput) -> None:
+        """``on_loaded``: announce ``previewing`` and build the preview before ``run_finished``,
+        so a client that asks for it on ``run_finished`` rarely meets ``not_ready``."""
+        message = "Building the before/after preview"
+        event = Activity(node_id=None, phase="previewing", message=message, at=_now())
+        self._emit(row.id, state, event)  # renumbered there; stamped here like execute's log
+        state.preview = (self._build_preview(row, path, out),)
+
+    def _build_preview(self, row: RunRow, path: Path, out: SystemOutput) -> str | None:
+        """Build and store the preview; its key, or ``None`` when that failed (logged)."""
+        try:
+            frame = build_preview(read_input(path), out, load_contract(row.table))
+            buffer = io.BytesIO()
+            frame.write_parquet(buffer)
+            key = preview_key(row.id)
+            self._blobs.put_bytes(key, buffer.getvalue())
+        except Exception as exc:
+            _log.error("run %s: building the preview failed: %s", row.id, _type_name(exc))
+            return None
+        return key
+
     def _artefacts(
         self, row: RunRow, state: _RunState, path: Path, outcome: RunOutcome
     ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -444,16 +475,10 @@ class Worker:
                 key=lambda t: (order.get(t.get("node_id"), len(order)), t.get("attempt", 0))
             )
         key: str | None = None
-        if state.loaded and out is not None:
-            try:
-                frame = build_preview(read_input(path), out, load_contract(row.table))
-                buffer = io.BytesIO()
-                frame.write_parquet(buffer)
-                key = preview_key(row.id)
-                self._blobs.put_bytes(key, buffer.getvalue())
-            except Exception as exc:
-                key = None
-                _log.error("run %s: building the preview failed: %s", row.id, _type_name(exc))
+        if state.preview is not None:  # built by the on_loaded hook
+            (key,) = state.preview
+        elif state.loaded and out is not None:  # an execute that does not call on_loaded
+            key = self._build_preview(row, path, out)
         return key, transforms
 
     def _save_and_finish(

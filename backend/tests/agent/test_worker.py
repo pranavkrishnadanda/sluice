@@ -28,6 +28,7 @@ from sluice.agent.worker import (
     build_worker_prompt,
     guard_output,
     precheck_code,
+    prepare_code,
     sandbox_feedback,
     sandbox_hint,
     write_transform,
@@ -524,3 +525,65 @@ def test_worker_unit_finding_says_divide_unconditionally_not_by_column_name() ->
     assert "unconditionally" in prompt
     assert "values.name" in prompt
     assert "never branch on `values.name`" in WORKER_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------- prepare_code (dedent once)
+
+INDENTED_CODE = "".join(f"    {line}\n" if line else "\n" for line in GOOD_CODE.splitlines())
+
+
+def test_prepare_code_leaves_well_formed_code_unchanged() -> None:
+    assert prepare_code(GOOD_CODE) == (GOOD_CODE, None)
+
+
+def test_prepare_code_dedents_a_uniformly_indented_module() -> None:
+    code, reason = prepare_code(INDENTED_CODE)
+
+    assert reason is None
+    assert code.startswith("import polars as pl\n")
+    assert precheck_code(code) is None
+
+
+def test_prepare_code_dedents_code_after_leading_blank_lines() -> None:
+    code, reason = prepare_code("\n\n" + INDENTED_CODE)
+
+    assert reason is None
+    assert precheck_code(code) is None
+
+
+def test_prepare_code_unfixable_indentation_gets_a_column_zero_hint() -> None:
+    broken = "import polars as pl\n  def transform(values):\n    return values\n"
+
+    code, reason = prepare_code(broken)
+
+    assert code == broken
+    assert reason is not None
+    assert "unexpected indent" in reason
+    assert "start every top-level line at column 0" in reason
+
+
+def test_precheck_code_indentation_error_carries_the_column_zero_hint() -> None:
+    reason = precheck_code(INDENTED_CODE)
+
+    assert reason is not None
+    assert "start every top-level line at column 0" in reason
+
+
+def test_prepare_code_other_syntax_errors_get_no_indent_hint() -> None:
+    code, reason = prepare_code("def transform(values:\n")
+
+    assert reason is not None and "syntax" in reason
+    assert "column 0" not in reason
+
+
+def test_prepare_code_dedented_code_still_runs_every_other_check() -> None:
+    code, reason = prepare_code("    import os\n" + INDENTED_CODE)
+
+    assert reason is not None
+    assert "os" in reason
+
+
+def test_transform_code_schema_stores_the_dedented_code() -> None:
+    parsed = TransformCode(code=INDENTED_CODE, explanation="strips commas")
+
+    assert parsed.code == prepare_code(INDENTED_CODE)[0]

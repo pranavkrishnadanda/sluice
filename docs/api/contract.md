@@ -46,12 +46,13 @@ responses and its own connection copy for network errors and 5xx.
 | Status | When |
 | --- | --- |
 | `403` | A non-`GET` request (e.g. `POST /runs`) whose `Origin` header is not an allowed UI origin: `code` is `forbidden_origin`, answered before the body is read. Requests without `Origin` (curl, scripts) are allowed |
-| `404` | Unknown run id (any `/runs/{id}/...` route) |
+| `404` | Unknown run id (any `/runs/{id}/...` route, `GET /runs/{id}/input` included) |
 | `404` | `GET /evals/summary` before any scored agent eval run exists: `code` is `no_evals` |
 | `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
 | `422` | Unknown `table`, a missing form field, a malformed multipart body (including a part header longer than **8 KiB** or more than 8 headers in one part; `code: "invalid_request"`), or a file that cannot be parsed in its format |
+| `422` | `code: "table_unknown"`: `table` was `auto` (or left out) and the file's column names do not clearly match one table's contract; `detail` is "Couldn't tell which table this file is for — pick one." |
 | `422` | `code: "too_large_decoded"`: a `.parquet` upload whose footer declares more than **5,000,000 rows** or more than **1 GiB** of decoded data (checked before the data is read) |
 
 ## Base URL, CORS and configuration
@@ -85,12 +86,16 @@ export const PREVIEW_MAX_LIMIT = 1_000;        // server max for ?limit=
 export const MAX_ATTEMPT_ERROR_CHARS = 2_000;  // attempt_failed.error cap
 
 export type TableName = "orders" | "lineitem";
+export type TableChoice = TableName | "auto";   // createRun: "auto" lets the server pick
 export type RunStatus = "queued" | "running" | "succeeded" | "quarantined" | "failed";
 export type ModelTier = "rules" | "small" | "strong";
 export type IssueKind =
   | "rename" | "type" | "unit" | "timezone" | "date_format" | "format" | "encoding"
   | "whitespace" | "case" | "destroyed" | "duplicates" | "foreign_key"
   | "missing_column" | "extra_column";
+export type ActivityPhase =
+  | "mapping" | "planning" | "writing" | "sandbox" | "checking" | "verifying"
+  | "waiting" | "loading" | "previewing";
 
 export interface RunSummary {
   id: string; fileName: string; table: TableName;
@@ -109,7 +114,8 @@ export type RunEvent = EventBase & (
   | { type: "profiled"; issues: Issue[] }
   | { type: "rules_applied"; actions: string[] }
   | { type: "plan_created"; nodes: PlanNode[] }
-  | { type: "node_started"; nodeId: string; attempt: number; maxAttempts: number }
+  | { type: "node_started"; nodeId: string; attempt: number; maxAttempts: number;
+      tier?: ModelTier | null }                     // this attempt's tier; null/absent on old runs
   | { type: "attempt_failed"; nodeId: string; attempt: number; maxAttempts: number;
       error: string;                               // at most 2,000 characters
       tokens: number; costUsd: number }
@@ -119,6 +125,8 @@ export type RunEvent = EventBase & (
   | { type: "loaded"; rowsLoaded: number; rowsQuarantined: number; snapshotId: string }
   | { type: "run_finished"; status: Exclude<RunStatus, "queued" | "running">; summary: string;
       costUsd: number; tokens: number }
+  | { type: "activity"; nodeId: string | null; phase: ActivityPhase; message: string;
+      tier: ModelTier | null; attempt: number | null; retryInS: number | null }
 );
 export interface Transform {
   id: string; nodeId: string; attempt: number; language: "polars" | "sql"; code: string;
@@ -133,6 +141,11 @@ export interface DataPreview {
   columns: string[]; rows: PreviewRow[]; totalRows: number; nextOffset: number | null;
 }
 export interface PreviewPage { offset: number; limit: number }
+export interface RawInput {                       // GET /runs/{id}/input
+  columns: string[];                              // the file's own columns, not the contract's
+  rows: (string | null)[][];                      // one array per row, in `columns` order
+  totalRows: number; nextOffset: number | null;
+}
 export interface CI { mean: number; lo: number; hi: number }
 export interface EvalSummary {
   split: "dev" | "holdout" | "ood"; n: number; generatedAt: string;
@@ -145,10 +158,11 @@ export interface EvalSummary {
 export interface ApiClient {
   readonly isDemo: boolean;
   listRuns(): Promise<RunSummary[]>;
-  createRun(file: File, table: TableName): Promise<RunSummary>;
+  createRun(file: File, table: TableChoice): Promise<RunSummary>;
   streamEvents(runId: string, onEvent: (e: RunEvent) => void, signal: AbortSignal): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
+  getInput(runId: string, page: PreviewPage): Promise<RawInput>;
   getEvalSummary(): Promise<EvalSummary>;
   isSampleReplay?(runId: string): boolean; // demo mock only, not an HTTP route
 }
@@ -159,10 +173,11 @@ export interface ApiClient {
 | `ApiClient` method | Request | Response |
 | --- | --- | --- |
 | `listRuns()` | `GET /runs` | `200` `RunSummary[]`, newest first (`createdAt` descending), at most 100 |
-| `createRun(file, table)` | `POST /runs`, `multipart/form-data` with fields `file` and `table` (`TableName`) | `201` `RunSummary` (status `queued`, `rows: null`) |
+| `createRun(file, table)` | `POST /runs`, `multipart/form-data` with fields `file` and `table` (`TableChoice`; may be left out, which means `"auto"`) | `201` `RunSummary` (status `queued`, `rows: null`, `table` the resolved table) |
 | `streamEvents(runId, onEvent, signal)` | `GET /runs/{id}/events` (`Accept: text/event-stream`) | `200` SSE stream of `RunEvent`, see below |
 | `getTransforms(runId)` | `GET /runs/{id}/transforms` | `200` `Transform[]`, see below |
 | `getPreview(runId, { offset, limit })` | `GET /runs/{id}/preview?offset=<n>&limit=<n>` | `200` `DataPreview`, see below; `409` before `loaded` |
+| `getInput(runId, { offset, limit })` | `GET /runs/{id}/input?offset=<n>&limit=<n>` | `200` `RawInput`, see [Uploaded file](#uploaded-file); available from creation |
 | `getEvalSummary()` | `GET /evals/summary` | `200` `EvalSummary`; `404` `no_evals` before any eval run |
 
 Path parameters are URL-encoded. Unknown run ids return `404`.
@@ -173,6 +188,16 @@ Path parameters are URL-encoded. Unknown run ids return `404`.
   may also check the content). Anything else is `415`.
 - Size limit: **100 MB**; larger uploads are `413`.
 - An unknown `table` or an unparseable file is `422`.
+- `table` may be `"auto"` or left out: the server then picks the table whose
+  contract the file's **column names** match best (exact or normalised
+  names, no model call). The best table must match at least 30% of its
+  contract's columns and beat every other table by at least 20 percentage
+  points; otherwise (a tie, a close call or a weak match) the upload is
+  `422` with `code: "table_unknown"` and nothing is kept, so the UI asks the
+  user to pick. `RunSummary.table` is the resolved table.
+- A named `table` is used as given. If the file clearly belongs to the other
+  table, the run is created and then ends `quarantined` with a summary saying
+  so ("this looks like a lineitem file, not orders; nothing loaded").
 - A `.parquet` file is also `422` (`too_large_decoded`) when its footer
   declares more than 5,000,000 rows or more than 1 GiB of decoded data: a
   small, highly compressed file can expand far beyond 100 MB in memory.
@@ -229,6 +254,40 @@ and no model was called.
 
 `node_started.maxAttempts` (equal to `attempt_failed.maxAttempts` for that
 node) lets the UI show "attempt 1/3" from the first attempt.
+`node_started.tier` is the tier that attempt runs on: a retry may escalate
+(`small` on attempt 1, `strong` after), so the UI shows the attempt's own
+tier rather than the planned `PlanNode.tier`. Runs stored before the field
+existed have no `tier` (or `null`); fall back to the planned tier.
+
+### Activity
+
+`activity` says what the run is busy with **right now**, so a long model or
+sandbox call never looks frozen. It is emitted once when each phase
+**starts** (never as a periodic heartbeat; the UI ticks its own timer from
+`at`), and it is stored and replayed like every other event (`seq` stays
+gapless). It may appear anywhere between `run_started` and `run_finished`
+and does not change the order of the other events.
+
+- `nodeId` is the plan node the phase belongs to, or `null` for run-wide
+  phases: `mapping` (schema mapping call), `planning` (planning call),
+  `loading` (writing to the warehouse) and `previewing` (building the
+  before/after preview).
+- Per-node phases, in the order an attempt goes through them: `writing`
+  (the worker model writes the fix), `sandbox` (the fix runs in the
+  sandbox), `checking` (the rewrite is checked against the rules),
+  `verifying` (the verifier model checks the result). `tier` and `attempt`
+  are set for these.
+- `waiting`: a rate-limit back-off before a model call is re-sent;
+  `retryInS` is the wait in whole seconds (`null` for every other phase).
+  When the wait ends, the interrupted phase is announced again.
+- `message` is short user-facing copy (at most 200 characters), e.g.
+  "Asking the strong model to write a fix for o_orderdate", "Running the
+  fix in the sandbox on 15,000 rows", "Rate limit reached on the small
+  model — retrying in 14 s", "Loading 15,000 rows into the warehouse". It
+  never contains prompts, model output, data values, paths or secrets.
+- The UI shows the latest `activity` (per node when `nodeId` is set, else
+  run-wide) until a later `activity`, a `node_finished` / `attempt_failed`
+  for that node, or a terminal event replaces it; `run_finished` clears all.
 
 Independent nodes run concurrently, so the events of different nodes may
 interleave; the order above holds per node.
@@ -321,6 +380,24 @@ before/after preview:
   as null and flagged for review.
 - `rows[].quarantined` is `true` when the whole row was held back from the
   load; `reason` says why (`null` otherwise).
+
+## Uploaded file
+
+`GET /runs/{id}/input?offset=<n>&limit=<n>` pages through the **uploaded
+file's raw rows**, as stored, from the moment the run is created (queued,
+running, held back, failed or loaded alike). The UI shows it before
+`loaded`, and for runs that never load, as "Uploaded file (not loaded)".
+
+- `404` for an unknown run id. Paging is as for the preview: `offset`
+  defaults to `0`; `limit` defaults to, and is capped at, **1,000**;
+  `nextOffset` is `null` after the last page; an `offset` past the end gives
+  `rows: []`.
+- `columns` are the **file's own column names** (nested JSON objects are
+  flattened to dotted names such as `customer.name`), not the contract's.
+- `rows[i][j]` is the text of column `columns[j]` in that row, or `null` for
+  an empty or missing cell. CSV and JSON cells are the raw text; Parquet
+  values are rendered as text (`"3.25"`, `"true"`).
+- `totalRows` is the number of rows in the file.
 
 ## Evals
 

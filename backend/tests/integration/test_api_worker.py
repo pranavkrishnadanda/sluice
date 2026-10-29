@@ -151,6 +151,9 @@ def test_worker_two_uploads_of_one_file_load_it_once(
     assert isinstance(other_final, ev.RunFinished)
     assert "file already loaded" in other_final.summary
 
+    phases = [e.phase for e in events[loader] if isinstance(e, ev.Activity)]
+    assert phases == ["loading", "previewing"]  # stored in Postgres and parsed back
+
     loader_artefacts = store.get_artefacts(loader)
     assert loader_artefacts is not None and loader_artefacts.preview_key == preview_key(loader)
     assert pl.read_parquet(blobs.get_bytes(preview_key(loader))).height == ROWS

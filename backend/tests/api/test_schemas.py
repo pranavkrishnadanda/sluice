@@ -12,6 +12,7 @@ from sluice.api.schemas import (
     ParetoSeries,
     PreviewCell,
     PreviewRow,
+    RawInput,
     RunSummary,
     SystemMetrics,
     Transform,
@@ -180,3 +181,10 @@ def test_pareto_point_rejects_quality_outside_unit_interval(value: float) -> Non
 
 def test_error_body_omits_code_when_absent() -> None:
     assert ErrorBody(detail="Bad.").model_dump(exclude_none=True) == {"detail": "Bad."}
+
+
+def test_raw_input_dumps_contract_keys_and_null_cells() -> None:
+    page = RawInput(columns=["a", "b"], rows=[["1", None]], total_rows=3, next_offset=1)
+    dumped = page.model_dump(mode="json", by_alias=True)
+    assert dumped == {"columns": ["a", "b"], "rows": [["1", None]], "totalRows": 3,
+                      "nextOffset": 1}  # fmt: skip

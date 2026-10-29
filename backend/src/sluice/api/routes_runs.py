@@ -12,10 +12,12 @@ Upload (``docs/api/contract.md``, "Upload"):
 * The blob key is generated (``uploads/<run_id>/input<ext>``); the client's name is only
   displayed (:func:`sanitise_file_name`) and never touches a path.
 * Order: ``unknown table`` is known as soon as the ``table`` field arrives (before the file when
-  the client sends it first); the extension is checked on the file part's headers, before any
-  of its bytes are stored. After the stream: parse check (``read_input``, which checks a
-  Parquet footer for a decompression bomb before reading the data) and SHA-256 in a
-  thread, then the row is inserted and the worker is woken. Any failure after the blob was
+  the client sends it first). ``table=auto`` (or no ``table`` field) is resolved from the file's
+  column names after the parse check (``resolve_table``; 422 ``table_unknown`` if unclear).
+  The extension is checked on the file part's headers, before any of its bytes are stored.
+  After the stream: parse check (``read_input``, which checks a Parquet footer for a
+  decompression bomb before reading the data) and SHA-256 in a thread, the table resolved,
+  then the row is inserted and the worker is woken. Any failure after the blob was
   written deletes it.
 
 Store and blob calls are blocking and run in ``asyncio.to_thread``.
@@ -43,15 +45,17 @@ from python_multipart.multipart import MultipartParser, parse_options_header
 
 from sluice.agent import events as ev
 from sluice.agent.events import TableName
+from sluice.agent.mapping import resolve_table
 from sluice.api.blobs import BlobStore, TooLarge
 from sluice.api.errors import ApiError
-from sluice.api.schemas import DataPreview, RunSummary, Transform
+from sluice.api.schemas import DataPreview, RawInput, RunSummary, Transform
 from sluice.api.settings import MAX_UPLOAD_BYTES
 from sluice.api.store import MAX_FILE_NAME_CHARS, TERMINAL_STATUSES, RunRow, RunStore
-from sluice.contracts.model import Contract, load_contract
+from sluice.contracts.model import Contract, known_contracts, load_contract
 from sluice.io import DecodedTooLarge, read_input
 from sluice.runs.execute import file_sha256
 from sluice.runs.preview import PREVIEW_MAX_LIMIT, page_preview
+from sluice.runs.raw_input import read_raw_page
 
 _log = logging.getLogger(__name__)
 
@@ -92,6 +96,10 @@ TOO_LARGE_DETAIL: Final = too_large_detail(MAX_UPLOAD_BYTES)
 """The 413 copy at the default limit (the contract's)."""
 UNSUPPORTED_DETAIL: Final = "Unsupported file format: upload a .csv, .json or .parquet file."
 UNKNOWN_TABLE_DETAIL: Final = "Unknown table: choose orders or lineitem."
+AUTO_TABLE: Final = "auto"
+"""``table`` value (or a missing ``table`` field) asking the server to pick the table."""
+TABLE_UNKNOWN_DETAIL: Final = "Couldn't tell which table this file is for — pick one."
+CONTRACT_VERSION: Final = "v1"
 UNPARSEABLE_DETAIL: Final = "The file could not be read in its format."
 DECODED_TOO_LARGE_DETAIL: Final = (
     "File too large once decoded: the limit is 5,000,000 rows or 1 GiB of data."
@@ -347,13 +355,16 @@ def _content_length(headers: Mapping[str, str]) -> int | None:
         raise BadForm("invalid Content-Length") from exc
 
 
-def _table(value: bytes | None) -> str:
+def _table(value: bytes | None) -> str | None:
+    """The named table, or ``None`` for :data:`AUTO_TABLE` (or no ``table`` field at all)."""
     if value is None:
-        raise BadForm('the form field "table" is required')
+        return None
     try:
         table = value.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BadForm('the form field "table" is not valid UTF-8') from exc
+    if table == AUTO_TABLE:
+        return None
     if table not in TABLES:
         raise ApiError(422, UNKNOWN_TABLE_DETAIL, "unknown_table")
     return table
@@ -361,7 +372,8 @@ def _table(value: bytes | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _Upload:
-    table: str
+    table: str | None
+    """``None``: resolve it from the file's columns (:data:`AUTO_TABLE`)."""
     file_name: str
     key: str
 
@@ -391,15 +403,21 @@ async def _receive(
     return _Upload(table=_table(table), file_name=upload[0], key=upload[1])
 
 
-def _check_and_hash(blobs: BlobStore, key: str) -> str:
-    """Parse-check the stored upload and return its SHA-256 (blocking).
+@dataclass(frozen=True, slots=True)
+class _Checked:
+    sha256: str
+    columns: list[str]
+
+
+def _check_and_hash(blobs: BlobStore, key: str) -> _Checked:
+    """Parse-check the stored upload; its SHA-256 and column names (blocking).
 
     A Parquet file is first checked from its footer (``read_input`` -> ``check_decoded_size``,
     Ruling F3p4), so a decompression bomb is refused without being read in full.
     """
     with blobs.open_local(key) as path:
         try:
-            read_input(path)
+            columns = list(read_input(path).columns)
         except DecodedTooLarge:
             _log.info("upload %s declares too much data", key)
             raise ApiError(422, DECODED_TOO_LARGE_DETAIL, "too_large_decoded") from None
@@ -408,7 +426,17 @@ def _check_and_hash(blobs: BlobStore, key: str) -> str:
         except Exception as exc:  # polars, decoding and shape errors alike mean "unparseable"
             _log.info("upload %s is unparseable: %s", key, type(exc).__name__)
             raise ApiError(422, UNPARSEABLE_DETAIL, "unparseable") from None
-        return file_sha256(path)
+        return _Checked(file_sha256(path), columns)
+
+
+def _resolve_table(upload: _Upload, columns: list[str]) -> str:
+    """The upload's table: the one named, else the one its columns match (``resolve_table``)."""
+    if upload.table is not None:
+        return upload.table
+    table = resolve_table(columns, known_contracts(CONTRACT_VERSION))
+    if table is None:
+        raise ApiError(422, TABLE_UNKNOWN_DETAIL, "table_unknown")
+    return table
 
 
 def _delete_quietly(blobs: BlobStore, keys: list[str]) -> None:
@@ -421,7 +449,11 @@ def _delete_quietly(blobs: BlobStore, keys: list[str]) -> None:
 
 @router.post("/runs", status_code=201, response_model=RunSummary)
 async def create_run(request: Request) -> RunSummary:
-    """Accept a multipart upload (``file``, ``table``) and queue a run for it."""
+    """Accept a multipart upload (``file``, ``table``) and queue a run for it.
+
+    ``table`` may be :data:`AUTO_TABLE` or left out: the table is then resolved from the file's
+    column names after the parse check (422 ``table_unknown`` when that is not clear).
+    """
     state = request.app.state
     store: RunStore = state.store
     blobs: BlobStore = state.blobs
@@ -436,14 +468,14 @@ async def create_run(request: Request) -> RunSummary:
         run_id = uuid.uuid4().hex
         form = MultipartStream(request.stream(), boundary, max_total)
         upload = await _receive(form, run_id, blobs, limit, written)
-        sha = await asyncio.to_thread(_check_and_hash, blobs, upload.key)
+        checked = await asyncio.to_thread(_check_and_hash, blobs, upload.key)
         summary = await asyncio.to_thread(
             store.create_run,
             run_id=run_id,
             file_name=upload.file_name,
-            table=upload.table,
+            table=_resolve_table(upload, checked.columns),
             blob_key=upload.key,
-            file_sha256=sha,
+            file_sha256=checked.sha256,
         )
     except BaseException as exc:
         if written:
@@ -567,3 +599,21 @@ async def get_preview(
     """A page of the before/after preview; ``409`` until the run has emitted ``loaded``."""
     state = request.app.state
     return await asyncio.to_thread(_preview, state.store, state.blobs, run_id, offset, limit)
+
+
+def _raw_input(store: RunStore, blobs: BlobStore, run_id: str, offset: int, limit: int) -> RawInput:
+    row = _run_or_404(store, run_id)
+    with blobs.open_local(row.blob_key) as path:
+        return read_raw_page(path, offset, min(limit, PREVIEW_MAX_LIMIT))
+
+
+@router.get("/runs/{run_id}/input", response_model=RawInput)
+async def get_input(
+    request: Request,
+    run_id: str,
+    offset: Annotated[int, Query(ge=0, le=MAX_OFFSET)] = 0,
+    limit: Annotated[int, Query(ge=1)] = PREVIEW_MAX_LIMIT,
+) -> RawInput:
+    """A page of the uploaded file's raw rows as text, from the moment the run exists."""
+    state = request.app.state
+    return await asyncio.to_thread(_raw_input, state.store, state.blobs, run_id, offset, limit)

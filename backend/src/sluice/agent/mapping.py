@@ -179,6 +179,29 @@ def table_mismatch(columns: list[str], contract: Contract, known: Iterable[Contr
     return f"this looks like {article} {best[1]} file, not {contract.name}; nothing loaded"
 
 
+TABLE_AUTO_MIN_MARGIN: Final = 0.2
+"""``resolve_table``: the best table's share must beat every other table's by this much."""
+
+
+def resolve_table(columns: list[str], known: Iterable[Contract]) -> str | None:
+    """The table whose contract ``columns`` match best, or ``None`` when that is not clear.
+
+    For ``POST /runs`` with ``table=auto``. Uses :func:`match_share` (deterministic name
+    matching, no model): the best table must match at least :data:`TABLE_CHOSEN_MAX_SHARE` of
+    its contract columns (below that Ruling H5 would not call the file that table either) and
+    beat every other table by :data:`TABLE_AUTO_MIN_MARGIN`. A tie, a close call or a weak
+    match is ``None``: the user picks. O(tables x columns).
+    """
+    shares = sorted(((match_share(columns, c), c.name) for c in known), reverse=True)
+    if not shares:
+        return None
+    best_share, best = shares[0]
+    runner_up = shares[1][0] if len(shares) > 1 else 0.0
+    if best_share < TABLE_CHOSEN_MAX_SHARE or best_share - runner_up < TABLE_AUTO_MIN_MARGIN:
+        return None
+    return best
+
+
 def _q(name: str) -> str:
     """Quote a (possibly model-supplied) name for an error message, bounded in length."""
     if len(name) > MAX_NAME_CHARS_IN_ERRORS:

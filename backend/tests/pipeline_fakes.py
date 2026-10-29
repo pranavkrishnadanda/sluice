@@ -63,6 +63,8 @@ OLD_STRIP_ERROR = (
 )
 NO_TRANSFORM = "import polars as pl\n\nx = 1\n"  # fails precheck: no `def transform`
 DOWN = "<provider outage>"  # a worker queue entry that makes that call fail with HTTP 503
+THROTTLED = "<rate limited>"  # a worker queue entry answered with HTTP 429, Retry-After 14 s
+THROTTLE_WAIT_S = 14
 
 _ROLE_BY_PROMPT = {
     MAPPER_PROMPT: "mapper",
@@ -168,6 +170,9 @@ class Script:
             code = queue.pop(0) if len(queue) > 1 else queue[0]
             if code == DOWN:
                 raise ModelHTTPError(503, "script")
+            if code == THROTTLED:
+                headers = {"retry-after": str(THROTTLE_WAIT_S)}
+                raise ModelHTTPError(429, "script", headers=headers)
             out = {"code": code, "explanation": "fix"}
         else:
             accept = self.verdicts.pop(0) if self.verdicts else True

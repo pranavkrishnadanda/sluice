@@ -220,9 +220,19 @@ def test_slow_errors_can_hit_the_client_timeout_and_degrade(
     assert slow_error_worst_case_s(config, tier) >= REQUEST_TIMEOUT_S
 
 
-def test_every_deployment_has_its_own_short_timeout(config: dict[str, Any]) -> None:
-    for group in GROUPS:
-        assert _deployment(config, group)["litellm_params"]["timeout"] == 30
+STRONG_GROUPS = ("strong", "strong-fallback")
+"""The strong chain's own deployments: large files need more than 30 s (round 2, item 7)."""
+SMALL_GROUPS = ("small", "small-fallback")
+
+
+@pytest.mark.parametrize("group", STRONG_GROUPS)
+def test_strong_deployments_allow_60_s_per_attempt(config: dict[str, Any], group: str) -> None:
+    assert _deployment(config, group)["litellm_params"]["timeout"] == 60
+
+
+@pytest.mark.parametrize("group", SMALL_GROUPS)
+def test_small_deployments_keep_their_short_timeout(config: dict[str, Any], group: str) -> None:
+    assert _deployment(config, group)["litellm_params"]["timeout"] == 30
 
 
 @pytest.mark.parametrize("group", GROUPS)
@@ -231,8 +241,8 @@ def test_a_timeout_is_retried_at_most_once(config: dict[str, Any], group: str) -
 
 
 def test_worst_case_paths_are_the_documented_ones(config: dict[str, Any]) -> None:
-    assert worst_case_proxy_s(config, "strong") == 90  # 120b, Gemini, qwen: 30 s each
-    assert worst_case_proxy_s(config, "small") == 60  # 20b, qwen
+    assert worst_case_proxy_s(config, "strong") == 150  # 120b 60 + Gemini 60 + qwen 30
+    assert worst_case_proxy_s(config, "small") == 60  # 20b, qwen: 30 s each
 
 
 @pytest.mark.parametrize("tier", TIERS)
@@ -240,6 +250,13 @@ def test_client_timeout_covers_the_worst_case_proxy_path(config: dict[str, Any],
     from sluice.llm.client import REQUEST_TIMEOUT_S
 
     assert worst_case_proxy_s(config, tier) < REQUEST_TIMEOUT_S
+
+
+def test_client_timeout_is_180_s_and_the_wall_cap_300_s() -> None:
+    from sluice.agent.caps import MAX_WALL_S_PER_FILE
+    from sluice.llm.client import REQUEST_TIMEOUT_S
+
+    assert (REQUEST_TIMEOUT_S, MAX_WALL_S_PER_FILE) == (180.0, 300)
 
 
 def test_wall_cap_exceeds_the_client_timeout() -> None:
