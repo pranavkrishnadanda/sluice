@@ -31,6 +31,8 @@ from pipeline_fakes import (
     NOOP,
     OLD_STRIP,
     STRIP_COMMAS,
+    THROTTLE_WAIT_S,
+    THROTTLED,
     TOKENS_PER_CALL,
     FakeSandbox,
     Script,
@@ -89,10 +91,16 @@ def run(
     run_id: str | None = None,
     on_emit: Callable[[EventModel], None] | None = None,
     on_transform: Callable[[dict[str, Any]], None] | None = None,
+    on_activity: Callable[[EventModel], None] | None = None,
+    sleeps: list[float] | None = None,
 ) -> Result:
+    async def sleep(seconds: float) -> None:  # rate-limit back-off without waiting
+        if sleeps is not None:
+            sleeps.append(seconds)
+
     async def go() -> Result:
         model = FunctionModel(script.respond, model_name="script-model")
-        async with LLM("http://litellm.test", "k", model_override=model) as llm:
+        async with LLM("http://litellm.test", "k", model_override=model, sleep=sleep) as llm:
             log = EventLog(on_emit=on_emit)
             deps = PipelineDeps(llm=llm, sandbox=sandbox or FakeSandbox(), clock=clock)
             case_input = CaseInput(
@@ -100,6 +108,7 @@ def run(
                 contract or load_contract(case.table),
                 reference or {},
                 on_transform=on_transform,
+                on_activity=on_activity,
             )
             out = await run_pipeline(case_input, deps, log, run_id=run_id)
             return Result(out, log, llm)
@@ -1379,3 +1388,106 @@ def test_pipeline_node_started_carries_the_attempts_tier(indian: Case) -> None:
 
     tiers = [(e.attempt, e.tier) for e in result.events("node_started")]  # type: ignore[attr-defined]
     assert tiers == [(1, "small"), (2, "strong")]  # an easy node escalates on its retry
+
+
+# --- round 2: activity ----------------------------------------------------------------------
+
+
+def _activity(event: EventModel) -> tuple[Any, ...]:
+    a: Any = event
+    return (a.phase, a.node_id, a.tier, a.attempt, a.retry_in_s)
+
+
+def test_pipeline_announces_each_phase_once_when_it_starts(indian: Case) -> None:
+    seen: list[EventModel] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    run(indian, script, on_activity=seen.append)
+
+    assert [_activity(e) for e in seen] == [
+        ("mapping", None, None, None, None),
+        ("planning", None, "strong", None, None),
+        ("writing", "n1", "small", 1, None),
+        ("sandbox", "n1", "small", 1, None),
+        ("checking", "n1", "small", 1, None),
+        ("verifying", "n1", "small", 1, None),
+    ]
+    assert all(e.type == "activity" for e in seen)  # type: ignore[attr-defined]
+
+
+def test_pipeline_activity_interleaves_with_the_milestone_events(indian: Case) -> None:
+    both: list[str] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [CRASH, STRIP_COMMAS]})
+
+    def note(event: EventModel) -> None:
+        a: Any = event
+        both.append(a.type if a.type != "activity" else f"activity:{a.phase}")
+
+    run(indian, script, on_emit=note, on_activity=note)
+
+    assert both == [
+        "run_started",
+        "activity:mapping",
+        "profiled",
+        "rules_applied",
+        "activity:planning",
+        "plan_created",
+        "node_started",
+        "activity:writing",
+        "activity:sandbox",
+        "attempt_failed",
+        "node_started",
+        "activity:writing",
+        "activity:sandbox",
+        "activity:checking",
+        "activity:verifying",
+        "node_finished",
+        "verified",
+        "run_finished",
+    ]
+
+
+def test_pipeline_activity_copy_names_the_tier_column_and_rows(indian: Case) -> None:
+    seen: list[EventModel] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    result = run(indian, script, on_activity=seen.append)
+
+    messages = {e.phase: e.message for e in seen}  # type: ignore[attr-defined]
+    rows = result.events("run_started")[0].rows  # type: ignore[attr-defined]
+    assert messages["writing"] == "Asking the small model to write a fix for o_totalprice"
+    assert messages["sandbox"] == f"Running the fix in the sandbox on {rows:,} rows"
+    assert messages["checking"] == "Checking the rewrite against the rules"
+    assert messages["verifying"] == "The verifier is checking the result"
+    assert messages["planning"] == "Asking the strong model to plan repairs for 1 column"
+
+
+def test_pipeline_rate_limit_wait_is_announced_then_the_phase_resumes(indian: Case) -> None:
+    seen: list[EventModel] = []
+    sleeps: list[float] = []
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [THROTTLED, STRIP_COMMAS]})
+
+    result = run(indian, script, on_activity=seen.append, sleeps=sleeps)
+
+    phases = [_activity(e) for e in seen if e.node_id == "n1"]  # type: ignore[attr-defined]
+    assert phases[:3] == [
+        ("writing", "n1", "small", 1, None),
+        ("waiting", "n1", "small", 1, THROTTLE_WAIT_S),
+        ("writing", "n1", "small", 1, None),
+    ]
+    (waiting,) = [e for e in seen if e.phase == "waiting"]  # type: ignore[attr-defined]
+    assert waiting.message == (  # type: ignore[attr-defined]
+        f"Rate limit reached on the small model — retrying in {THROTTLE_WAIT_S} s"
+    )
+    assert sleeps == [float(THROTTLE_WAIT_S)]
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]  # a wait is not a failed attempt
+
+
+def test_pipeline_without_an_activity_sink_is_unchanged(indian: Case) -> None:
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS]})
+
+    result = run(indian, script)
+
+    assert "activity" not in [e.type for e in result.log.events]  # type: ignore[attr-defined]
+    assert "activity" not in [e["type"] for e in result.out.meta["events"]]
