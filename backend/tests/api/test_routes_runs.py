@@ -1060,3 +1060,45 @@ def test_get_input_json_nested_fields_are_flattened(client: TestClient) -> None:
 
     assert page["columns"] == ["o_orderkey", "who.name"]
     assert page["rows"] == [["1", "a"]]
+
+
+def test_get_input_decoded_too_large_is_422_too_large_decoded(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stored Parquet whose footer fails the decoded-size check is a 422, never a 500."""
+    from sluice.io import DecodedTooLarge
+    from sluice.runs import raw_input
+
+    buffer = io.BytesIO()
+    pl.DataFrame({"o_orderkey": [1]}).write_parquet(buffer)
+    run_id = _post(client, name="o.parquet", data=buffer.getvalue()).json()["id"]
+
+    def refuse(_path: Path) -> None:
+        raise DecodedTooLarge("declares too much")
+
+    monkeypatch.setattr(raw_input, "check_decoded_size", refuse)
+    res = client.get(f"/runs/{run_id}/input")
+
+    assert res.status_code == 422
+    assert res.json() == {"detail": DECODED_TOO_LARGE_DETAIL, "code": "too_large_decoded"}
+
+
+def test_post_runs_resolves_the_table_off_the_event_loop(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sluice.api import routes_runs
+
+    on_loop: list[bool] = []
+    original = routes_runs._resolve_table
+
+    def spy(*args: Any) -> str:
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return original(*args)
+
+    monkeypatch.setattr(routes_runs, "_resolve_table", spy)
+    assert _post(client).status_code == 201
+    assert on_loop == [False]

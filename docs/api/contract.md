@@ -201,6 +201,8 @@ Path parameters are URL-encoded. Unknown run ids return `404`.
 - A `.parquet` file is also `422` (`too_large_decoded`) when its footer
   declares more than 5,000,000 rows or more than 1 GiB of decoded data: a
   small, highly compressed file can expand far beyond 100 MB in memory.
+  `GET /runs/{id}/input` answers the same `422` (`too_large_decoded`) for a
+  stored file that fails this check, never a `500`.
 - The new run's `rows` is `null` until the file has been profiled.
 
 ### Run summaries
