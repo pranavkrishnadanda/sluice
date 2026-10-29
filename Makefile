@@ -1,4 +1,4 @@
-.PHONY: test test-all test-integration lint fmt cases eval-rules results up up-obs down ps sandbox-image api
+.PHONY: test test-all test-integration lint fmt cases eval-rules results up up-obs down ps sandbox-image api demo-gif
 
 # Default selection (pyproject addopts) excludes integration, live and slow.
 test:
@@ -60,3 +60,18 @@ SANDBOX_IMAGE = sluice-sandbox:dev
 sandbox-image:
 	cd backend && PYTHONPATH=src uv run python -m sluice.sandbox.image uv.lock > sandbox/requirements.txt
 	docker build --pull=false -t $(SANDBOX_IMAGE) backend/sandbox
+
+# README demo: one real file through the live UI, recorded at 1440x900, then a 960px GIF. Needs
+# `make up` and the API started with the UI's origin allowed:
+#   SLUICE_UI_ORIGINS=http://localhost:3210,http://127.0.0.1:3210 make api
+# The case must be one the backend hasn't loaded yet (SLUICE_DEMO_CASE, default dev-0039). Video
+# capture needs Playwright's encoder once: `cd frontend && bunx playwright install ffmpeg`.
+# The palette is built from frame differences and applied with ordered dithering to changed
+# rectangles only: the frosted-glass gradients otherwise re-dither every frame (12.6 MB vs 3.4 MB).
+DEMO_VIDEO = frontend/test-results/demo/sluice-demo.webm
+FFMPEG ?= ffmpeg
+
+demo-gif:
+	cd frontend && FFMPEG=$(FFMPEG) bun scripts/record-demo.ts
+	mkdir -p docs/media
+	$(FFMPEG) -y -i $(DEMO_VIDEO) -vf "fps=12,scale=960:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" docs/media/sluice-demo.gif
