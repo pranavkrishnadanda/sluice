@@ -46,7 +46,7 @@ responses and its own connection copy for network errors and 5xx.
 | Status | When |
 | --- | --- |
 | `404` | Unknown run id (any `/runs/{id}/...` route) |
-| `409` | `GET /runs/{id}/preview` before the run has emitted `loaded` |
+| `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
 | `422` | Unknown `table`, a missing form field, or a file that cannot be parsed in its format |
@@ -284,8 +284,15 @@ before/after preview:
 - `offset` defaults to `0`; `limit` defaults to, and is capped at, **1,000**
   (`PREVIEW_MAX_LIMIT`).
 - `nextOffset` is the `offset` of the next page, or `null` after the last.
-- `409` until the run has emitted `loaded` (a run that never loads has no
-  preview).
+- `409` while there is no preview to page, with `code`:
+  - `not_loaded`: the run has not emitted `loaded` yet (a run that never
+    loads has no preview, so this stays the answer for it);
+  - `not_ready`: the run has emitted `loaded` but the preview is still
+    being written; retry shortly;
+  - `no_preview`: the run finished after `loaded` without a stored preview
+    (building it failed); retrying will not help.
+
+  As for every 4xx, `detail` is written for the user.
 - `columns` are the **target contract columns** for the run's table, in
   contract order.
 - `totalRows` is the number of rows in the uploaded file.

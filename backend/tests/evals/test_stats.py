@@ -225,3 +225,39 @@ def test_clopper_pearson_returns_python_floats():
 def test_clopper_pearson_rejects_invalid(k, n):
     with pytest.raises(ValueError):
         clopper_pearson(k, n)
+
+
+def test_bootstrap_quantile_ci_constant_is_exact() -> None:
+    from sluice.evals.stats import bootstrap_quantile_ci
+
+    assert bootstrap_quantile_ci([2.5] * 10, 0.95) == (2.5, 2.5, 2.5)
+
+
+def test_bootstrap_quantile_ci_point_is_sample_quantile_and_brackets() -> None:
+    import numpy as np
+
+    from sluice.evals.stats import bootstrap_quantile_ci
+
+    values = [float(v) for v in range(1, 41)]
+    ci = bootstrap_quantile_ci(values, 0.95)
+    assert ci is not None
+    point, lo, hi = ci
+    assert point == float(np.quantile(values, 0.95))
+    assert min(values) <= lo <= point <= hi <= max(values)
+    assert bootstrap_quantile_ci(values, 0.95) == ci  # deterministic (seed)
+
+
+def test_bootstrap_quantile_ci_drops_none_and_empty() -> None:
+    from sluice.evals.stats import bootstrap_quantile_ci
+
+    assert bootstrap_quantile_ci([None, None], 0.5) is None
+    assert bootstrap_quantile_ci([None, 1.0, 1.0], 0.5) == (1.0, 1.0, 1.0)
+
+
+def test_bootstrap_quantile_ci_rejects_bad_q() -> None:
+    import pytest
+
+    from sluice.evals.stats import bootstrap_quantile_ci
+
+    with pytest.raises(ValueError):
+        bootstrap_quantile_ci([1.0, 2.0], 1.5)
