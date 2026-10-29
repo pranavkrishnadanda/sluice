@@ -28,6 +28,7 @@ from sluice.agent.mapping import (
     apply_mapping,
     build_prompt,
     propose_mapping,
+    resolve_table,
     table_mismatch,
     validate_mapping,
 )
@@ -497,3 +498,35 @@ def test_table_mismatch_none_when_no_other_table_matches_well() -> None:
 
 def test_known_contracts_lists_every_table_of_a_version() -> None:
     assert sorted(c.name for c in known_contracts("v1")) == ["lineitem", "orders"]
+
+
+# --- round 2: resolve_table (POST /runs with table=auto) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("columns", "table"), [(ORDERS_COLUMNS, "orders"), (LINEITEM_COLUMNS, "lineitem")]
+)
+def test_resolve_table_picks_the_table_whose_contract_the_columns_match(
+    columns: list[str], table: str
+) -> None:
+    assert resolve_table(columns, known_contracts("v1")) == table
+
+
+def test_resolve_table_picks_a_partly_renamed_file() -> None:
+    # 4 of 10 orders columns match by name (the demo files match 70-80%), none of lineitem's.
+    columns = [*ORDERS_COLUMNS[:6], "amt", "when", "who"]
+    assert resolve_table(columns, known_contracts("v1")) == "orders"
+
+
+def test_resolve_table_weak_match_is_none() -> None:
+    assert resolve_table(["o_orderkey", "a", "b", "c"], known_contracts("v1")) is None
+
+
+def test_resolve_table_close_call_is_none() -> None:
+    # Both files' columns side by side: each table matches about 80%, neither is clear.
+    mixed = [*ORDERS_COLUMNS, *LINEITEM_COLUMNS]
+    assert resolve_table(mixed, known_contracts("v1")) is None
+
+
+def test_resolve_table_no_columns_is_none() -> None:
+    assert resolve_table([], known_contracts("v1")) is None

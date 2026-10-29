@@ -31,6 +31,7 @@ from sluice.api.routes_runs import (
     MAX_FIELD_BYTES,
     MAX_PART_HEADER_BYTES,
     PREVIEW_SAVE_GRACE_S,
+    TABLE_UNKNOWN_DETAIL,
     TOO_LARGE_DETAIL,
     sanitise_file_name,
     too_large_detail,
@@ -231,13 +232,49 @@ def test_post_runs_unknown_table_is_422_unknown_table(
     _assert_nothing_kept(store, blobs)
 
 
-def test_post_runs_missing_table_is_422_invalid_request(
+def test_post_runs_missing_table_means_auto_and_a_weak_match_is_422_table_unknown(
     client: TestClient, store: RouteStore, blobs: LocalBlobStore
 ) -> None:
-    res = _post(client, table=None)
+    res = _post(client, table=None)  # CSV has 2 of 10 orders columns: not clearly any table
     assert res.status_code == 422
-    assert res.json()["code"] == "invalid_request"
+    assert res.json() == {"detail": TABLE_UNKNOWN_DETAIL, "code": "table_unknown"}
     _assert_nothing_kept(store, blobs)
+
+
+def _table_csv(table: str) -> bytes:
+    names = [c.name for c in load_contract(table).columns]
+    return (",".join(names) + "\n" + ",".join("1" for _ in names) + "\n").encode()
+
+
+@pytest.mark.parametrize("table", ["orders", "lineitem"])
+@pytest.mark.parametrize("field", ["auto", None])
+def test_post_runs_auto_table_resolves_from_the_columns(
+    client: TestClient, store: RouteStore, table: str, field: str | None
+) -> None:
+    res = _post(client, name="upload.csv", data=_table_csv(table), table=field)
+    assert res.status_code == 201
+    assert res.json()["table"] == table
+    assert store.runs[res.json()["id"]].table == table
+
+
+def test_post_runs_auto_table_close_call_is_422_table_unknown(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore
+) -> None:
+    orders, lineitem = (_table_csv(t).decode().splitlines() for t in ("orders", "lineitem"))
+    both = f"{orders[0]},{lineitem[0]}\n{orders[1]},{lineitem[1]}\n".encode()
+    res = _post(client, data=both, table="auto")
+    assert res.status_code == 422
+    assert res.json()["code"] == "table_unknown"
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_named_table_is_kept_even_when_the_file_looks_like_another(
+    client: TestClient, store: RouteStore
+) -> None:
+    # The user insisted: the run is created, and the pipeline quarantines it (Ruling H5).
+    res = _post(client, data=_table_csv("lineitem"), table="orders")
+    assert res.status_code == 201
+    assert res.json()["table"] == "orders"
 
 
 def test_post_runs_missing_file_is_422_invalid_request(

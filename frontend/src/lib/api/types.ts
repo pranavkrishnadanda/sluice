@@ -11,6 +11,11 @@ export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 export const MAX_ATTEMPT_ERROR_CHARS = 2_000;
 
 export type TableName = "orders" | "lineitem";
+/**
+ * `POST /runs` `table` field: a table, or `"auto"` to let the server pick it
+ * from the file's column names (422 `table_unknown` when that is unclear).
+ */
+export type TableChoice = TableName | "auto";
 export type RunStatus =
   | "queued"
   | "running"

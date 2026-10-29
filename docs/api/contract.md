@@ -52,6 +52,7 @@ responses and its own connection copy for network errors and 5xx.
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
 | `422` | Unknown `table`, a missing form field, a malformed multipart body (including a part header longer than **8 KiB** or more than 8 headers in one part; `code: "invalid_request"`), or a file that cannot be parsed in its format |
+| `422` | `code: "table_unknown"`: `table` was `auto` (or left out) and the file's column names do not clearly match one table's contract; `detail` is "Couldn't tell which table this file is for — pick one." |
 | `422` | `code: "too_large_decoded"`: a `.parquet` upload whose footer declares more than **5,000,000 rows** or more than **1 GiB** of decoded data (checked before the data is read) |
 
 ## Base URL, CORS and configuration
@@ -85,6 +86,7 @@ export const PREVIEW_MAX_LIMIT = 1_000;        // server max for ?limit=
 export const MAX_ATTEMPT_ERROR_CHARS = 2_000;  // attempt_failed.error cap
 
 export type TableName = "orders" | "lineitem";
+export type TableChoice = TableName | "auto";   // createRun: "auto" lets the server pick
 export type RunStatus = "queued" | "running" | "succeeded" | "quarantined" | "failed";
 export type ModelTier = "rules" | "small" | "strong";
 export type IssueKind =
@@ -151,7 +153,7 @@ export interface EvalSummary {
 export interface ApiClient {
   readonly isDemo: boolean;
   listRuns(): Promise<RunSummary[]>;
-  createRun(file: File, table: TableName): Promise<RunSummary>;
+  createRun(file: File, table: TableChoice): Promise<RunSummary>;
   streamEvents(runId: string, onEvent: (e: RunEvent) => void, signal: AbortSignal): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
@@ -165,7 +167,7 @@ export interface ApiClient {
 | `ApiClient` method | Request | Response |
 | --- | --- | --- |
 | `listRuns()` | `GET /runs` | `200` `RunSummary[]`, newest first (`createdAt` descending), at most 100 |
-| `createRun(file, table)` | `POST /runs`, `multipart/form-data` with fields `file` and `table` (`TableName`) | `201` `RunSummary` (status `queued`, `rows: null`) |
+| `createRun(file, table)` | `POST /runs`, `multipart/form-data` with fields `file` and `table` (`TableChoice`; may be left out, which means `"auto"`) | `201` `RunSummary` (status `queued`, `rows: null`, `table` the resolved table) |
 | `streamEvents(runId, onEvent, signal)` | `GET /runs/{id}/events` (`Accept: text/event-stream`) | `200` SSE stream of `RunEvent`, see below |
 | `getTransforms(runId)` | `GET /runs/{id}/transforms` | `200` `Transform[]`, see below |
 | `getPreview(runId, { offset, limit })` | `GET /runs/{id}/preview?offset=<n>&limit=<n>` | `200` `DataPreview`, see below; `409` before `loaded` |
@@ -179,6 +181,16 @@ Path parameters are URL-encoded. Unknown run ids return `404`.
   may also check the content). Anything else is `415`.
 - Size limit: **100 MB**; larger uploads are `413`.
 - An unknown `table` or an unparseable file is `422`.
+- `table` may be `"auto"` or left out: the server then picks the table whose
+  contract the file's **column names** match best (exact or normalised
+  names, no model call). The best table must match at least 30% of its
+  contract's columns and beat every other table by at least 20 percentage
+  points; otherwise (a tie, a close call or a weak match) the upload is
+  `422` with `code: "table_unknown"` and nothing is kept, so the UI asks the
+  user to pick. `RunSummary.table` is the resolved table.
+- A named `table` is used as given. If the file clearly belongs to the other
+  table, the run is created and then ends `quarantined` with a summary saying
+  so ("this looks like a lineitem file, not orders; nothing loaded").
 - A `.parquet` file is also `422` (`too_large_decoded`) when its footer
   declares more than 5,000,000 rows or more than 1 GiB of decoded data: a
   small, highly compressed file can expand far beyond 100 MB in memory.
