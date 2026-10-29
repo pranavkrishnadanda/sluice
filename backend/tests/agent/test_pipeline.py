@@ -1132,3 +1132,25 @@ def test_pipeline_verifier_stats_never_mix_raw_and_deduplicated_row_counts(
     (done,) = result.events("node_finished")
     assert done.attempt == 1  # type: ignore[attr-defined]
     assert price_flags(result.out) == 0
+
+
+# --------------------------------------------------------------------------- H2: unit drift
+
+
+PAISE = ("unit_paise", {"column": "o_totalprice", "hinted": False})
+
+
+def _paise_case(cases_dir: Path, orders_df: pl.DataFrame, case_id: str, ops: list[Any]) -> Case:
+    return _build(cases_dir, orders_df, case_id, ops, n=80)
+
+
+def test_pipeline_profiled_reports_the_unit_issue(cases_dir: Path, orders_df: pl.DataFrame) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0201", [PAISE, INDIAN])
+    script = Script()
+    result = run(case, script)
+    (profiled,) = result.events("profiled")
+    units = [i for i in profiled.issues if i.kind == "unit"]  # type: ignore[attr-defined]
+    assert [i.column for i in units] == ["o_totalprice"]
+    assert units[0].detail.startswith("values look like paise: 100% whole numbers")
+    (plan_prompt,) = script.roles("orchestrator")
+    assert json.dumps(units[0].detail) in plan_prompt

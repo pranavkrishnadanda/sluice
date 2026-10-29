@@ -322,7 +322,9 @@ async def _pipeline(run: _Run) -> SystemOutput:
     else:
         try:
             with tracing.step_span("plan"):
-                plan, _ = await planning.propose_plan(candidates, contract, deps.llm)
+                plan, _ = await planning.propose_plan(
+                    candidates, contract, deps.llm, issues=prof1.unit_issues
+                )
         except (LLMUnavailable, LLMOutputError) as exc:
             run.llm_failed("planning", exc)
     if plan is None:
@@ -797,6 +799,10 @@ def _issues(
     ]
     issues += [
         Issue(column=c, kind="extra_column", detail="not in the contract") for c in prof.extra
+    ]
+    issues += [
+        Issue(column=c, kind="unit", detail=detail[:MAX_ISSUE_DETAIL_CHARS])
+        for c, detail in prof.unit_issues.items()
     ]
     counts: dict[str, int] = {}
     for _, column in result.flags:

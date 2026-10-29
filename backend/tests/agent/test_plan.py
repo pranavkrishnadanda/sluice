@@ -363,3 +363,41 @@ def test_route_tier_rejects_non_positive_attempt(attempt: int) -> None:
 
     with pytest.raises(ValueError, match="attempt"):
         route_tier(n, attempt)
+
+
+# ---------------------------------------------------------------- H2b: unit issues
+
+
+def _paise_texts(n: int) -> list[str | None]:
+    return [f"{100_000 + 1_237 * i}.00" for i in range(n)]  # parsed, in range
+
+
+def test_candidates_include_a_unit_issue_column_without_flags(orders: Contract) -> None:
+    raw = frame(60, o_totalprice=_paise_texts(60))
+    result = rules(raw, orders)
+    assert not any(col == "o_totalprice" for _, col in result.flags)
+
+    got = candidate_columns(raw, result, orders)
+
+    assert list(got) == ["o_totalprice"]
+    assert got["o_totalprice"] == sorted(set(_paise_texts(60)))[:MAX_SAMPLES]  # all rows
+
+
+def test_candidates_unit_issue_samples_skip_destroyed_tokens(orders: Contract) -> None:
+    raw = frame(64, o_totalprice=["N/A", "", None, "-1", *_paise_texts(60)])
+    got = candidate_columns(raw, rules(raw, orders), orders)
+    assert not {"N/A", "", "-1"} & set(got["o_totalprice"])
+
+
+def test_propose_plan_prompt_carries_the_profiler_issue(orders: Contract) -> None:
+    script = Scripted({"nodes": [node("n1", "o_totalprice")]})
+    issues = {"o_totalprice": "values look like paise: 100% whole numbers, median 1036492"}
+
+    run(propose_plan(CANDS, orders, script.llm(), issues=issues))
+
+    (prompt,) = script.prompts
+    assert json.dumps(issues["o_totalprice"]) in prompt
+    data = json.loads(prompt.split("\n", 1)[1].split("\n\n")[0])
+    by_column = {c["column"]: c for c in data["candidates"]}
+    assert by_column["o_totalprice"]["profiler_issue"] == issues["o_totalprice"]
+    assert by_column["o_orderdate"]["profiler_issue"] is None
