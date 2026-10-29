@@ -6,7 +6,8 @@ Tables (created by :meth:`RunStore.ensure_schema`, idempotent, under an advisory
 * ``run_events``: every pipeline event of a run, keyed ``(run_id, seq)``; ``payload`` is the
   contract JSON (camelCase), parsed back with :data:`~sluice.agent.events.PIPELINE_EVENT_ADAPTER`,
   which covers all ten contract event types.
-* ``run_artefacts``: the preview blob key and the transforms of a finished run.
+* ``run_artefacts``: the preview blob key and the transforms of a run (transforms are appended
+  live, one per attempt that produced code; the preview key is set when the run has finished).
 
 Connections: every method opens one short-lived connection and one short transaction (the API
 is a single process with a concurrency of at most four runs, so a pool is not worth a new
@@ -75,8 +76,12 @@ CREATE TABLE IF NOT EXISTS run_events (
 CREATE TABLE IF NOT EXISTS run_artefacts (
     run_id       text PRIMARY KEY REFERENCES api_runs (id),
     preview_key  text,
-    transforms   jsonb NOT NULL DEFAULT '[]'
+    transforms   jsonb NOT NULL DEFAULT '[]',
+    saved        boolean NOT NULL DEFAULT false
 );
+-- Before the column existed a row was only written by the end-of-run save: those are saved.
+ALTER TABLE run_artefacts ADD COLUMN IF NOT EXISTS saved boolean NOT NULL DEFAULT true;
+ALTER TABLE run_artefacts ALTER COLUMN saved SET DEFAULT false;
 """
 
 # clock_timestamp(), not now(): runs created in one transaction still get distinct times.
@@ -113,12 +118,34 @@ _FINISH: Final = (
     " WHERE id = %s AND status IN ('queued', 'running')"
 )
 _EXISTS: Final = "SELECT 1 FROM api_runs WHERE id = %s"
+# The end-of-run save: ``transforms`` win by ``transform_id``; a live-appended record whose id
+# is not among them is kept (after them). Re-running it with the same arguments is a no-op.
 _SAVE_ARTEFACTS: Final = (
-    "INSERT INTO run_artefacts (run_id, preview_key, transforms) VALUES (%s, %s, %s)"
+    "INSERT INTO run_artefacts (run_id, preview_key, transforms, saved)"
+    " VALUES (%s, %s, %s, true)"
     " ON CONFLICT (run_id) DO UPDATE"
-    " SET preview_key = EXCLUDED.preview_key, transforms = EXCLUDED.transforms"
+    " SET preview_key = EXCLUDED.preview_key, saved = true,"
+    " transforms = EXCLUDED.transforms || COALESCE(("
+    "  SELECT jsonb_agg(kept.t ORDER BY kept.n)"
+    "  FROM jsonb_array_elements(run_artefacts.transforms) WITH ORDINALITY AS kept(t, n)"
+    "  WHERE NOT EXISTS ("
+    "   SELECT 1 FROM jsonb_array_elements(EXCLUDED.transforms) AS given(t)"
+    "   WHERE given.t->>'transform_id' = kept.t->>'transform_id')"
+    " ), '[]'::jsonb)"
 )
-_GET_ARTEFACTS: Final = "SELECT preview_key, transforms FROM run_artefacts WHERE run_id = %s"
+# One live transform: create the row if missing, else append unless its id is already there.
+# The row lock taken by ON CONFLICT DO UPDATE serialises concurrent appends of one run.
+_APPEND_TRANSFORM: Final = (
+    "INSERT INTO run_artefacts (run_id, preview_key, transforms)"
+    " VALUES (%s, NULL, jsonb_build_array(%s::jsonb))"
+    " ON CONFLICT (run_id) DO UPDATE"
+    " SET transforms = run_artefacts.transforms || EXCLUDED.transforms"
+    " WHERE NOT run_artefacts.transforms @> jsonb_build_array("
+    "  jsonb_build_object('transform_id', %s::text))"
+)
+TRANSFORM_KEYS: Final = frozenset({"transform_id", "node_id", "attempt", "code", "passed"})
+"""Keys every transform record carries (``meta["transforms"]``, ``TransformRecord``)."""
+_GET_ARTEFACTS: Final = "SELECT preview_key, transforms, saved FROM run_artefacts WHERE run_id = %s"
 
 
 # --------------------------------------------------------------------------------------------
@@ -163,10 +190,15 @@ class RunRow(RunSummary):
 
 
 class Artefacts(ApiModel):
-    """What a finished run left behind for the preview and transforms routes."""
+    """What a run left behind for the preview and transforms routes.
+
+    ``saved`` is set by the end-of-run :meth:`RunStore.save_artefacts`; until then the row
+    holds only the transforms appended live, and ``preview_key`` is ``None`` (not final).
+    """
 
     preview_key: str | None
     transforms: list[dict[str, Any]] = Field(default_factory=list)
+    saved: bool = False
 
 
 # --------------------------------------------------------------------------------------------
@@ -365,10 +397,35 @@ class RunStore:
                 raise RunNotFound(run_id)
             raise RunNotActive(run_id)
 
+    def append_transform(self, run_id: str, record: dict[str, Any]) -> None:
+        """Append one transform record while the run is live (one atomic statement).
+
+        Creates the ``run_artefacts`` row (no preview yet) when missing. Idempotent: a record
+        whose ``transform_id`` is already stored is ignored. Raises ``ValueError`` for a record
+        missing a :data:`TRANSFORM_KEYS` key or with a malformed ``transform_id``, and
+        :class:`RunNotFound`.
+        """
+        _check_run_id(run_id)
+        missing = TRANSFORM_KEYS - record.keys()
+        if missing:
+            raise ValueError(f"transform record lacks {sorted(missing)}")
+        tid = record["transform_id"]
+        if not isinstance(tid, str) or not _RUN_ID.fullmatch(tid):
+            raise ValueError("transform_id must match [A-Za-z0-9_-]{1,64}")
+        try:
+            self._execute(_APPEND_TRANSFORM, (run_id, Jsonb(record), tid))
+        except errors.ForeignKeyViolation as exc:
+            raise RunNotFound(run_id) from exc
+
     def save_artefacts(
         self, run_id: str, *, preview_key: str | None, transforms: list[dict[str, Any]]
     ) -> None:
-        """Insert or replace the run's artefacts."""
+        """Set the preview key and reconcile the transforms at the end of a run.
+
+        ``transforms`` replace stored records with the same ``transform_id``; stored records
+        whose id is not among them (appended live by :meth:`append_transform`) are kept, so
+        nothing is dropped or duplicated. Marks the artefacts ``saved``. Idempotent.
+        """
         _check_run_id(run_id)
         try:
             self._execute(_SAVE_ARTEFACTS, (run_id, preview_key, Jsonb(transforms)))
@@ -382,5 +439,5 @@ class RunStore:
         recs = self._execute(_GET_ARTEFACTS, (run_id,))
         if not recs:
             return None
-        preview_key, transforms = recs[0]
-        return Artefacts(preview_key=preview_key, transforms=transforms)
+        preview_key, transforms, saved = recs[0]
+        return Artefacts(preview_key=preview_key, transforms=transforms, saved=saved)

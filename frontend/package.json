@@ -13,7 +13,8 @@
     "pretypecheck": "[ -d .next/types ] && find .next/types -type f -regex '.* [0-9][0-9]*\\.[^/]*' -delete; next typegen",
     "typecheck": "tsgo --noEmit",
     "test": "vitest run",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "e2e:live": "playwright test --config playwright.live.config.ts"
   },
   "dependencies": {
     "@radix-ui/react-tabs": "1.2.1",

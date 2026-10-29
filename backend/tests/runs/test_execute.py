@@ -225,3 +225,39 @@ def test_execute_run_already_loaded_skips_the_pipeline(indian: Case) -> None:
         result=prior, status="succeeded", output=None, cost_usd=0.0, tokens=0
     )
     assert _types(emitted) == ["run_started", "run_finished"]
+
+
+def test_execute_run_hands_on_transform_to_the_system(indian: Case) -> None:
+    seen: list[Any] = []
+
+    def hook(_record: dict[str, Any]) -> None:
+        return None
+
+    def system(case: CaseInput) -> SystemOutput:
+        seen.append(case.on_transform)
+        return RulesOnlySystem().run(case)
+
+    execute_run(
+        indian.input_path,
+        "orders",
+        run_id="run-1",
+        emit=lambda _e: None,
+        on_transform=hook,
+        run_fn=system,
+        load_fn=Loads(),
+        loaded_fn=lambda *_a, **_k: None,
+        settings_fn=lambda: object(),  # type: ignore[arg-type, return-value]
+        reference_fn=lambda _t: {},
+    )
+    assert seen == [hook]
+
+
+def test_execute_run_without_on_transform_gives_the_system_none(indian: Case) -> None:
+    seen: list[Any] = []
+
+    def system(case: CaseInput) -> SystemOutput:
+        seen.append(case.on_transform)
+        return RulesOnlySystem().run(case)
+
+    _execute(indian.input_path, system, lambda _e: None)
+    assert seen == [None]

@@ -4,6 +4,7 @@ import {
   errorDetail,
   isNotFound,
   parseErrorBody,
+  retryWhileNotReady,
 } from "@/lib/api/errors";
 import { HttpApiClient } from "@/lib/api/http-client";
 
@@ -69,5 +70,38 @@ describe("HttpApiClient errors", () => {
       code: "format",
     });
     vi.unstubAllGlobals();
+  });
+});
+
+describe("retryWhileNotReady", () => {
+  const notReady = () =>
+    new ApiError(409, "/runs/x/preview", "409", { code: "not_ready" });
+
+  test("retries a 409 not_ready until the load succeeds", async () => {
+    const load = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(notReady())
+      .mockRejectedValueOnce(notReady())
+      .mockResolvedValue("ok");
+    await expect(retryWhileNotReady(load, [0, 0, 0])).resolves.toBe("ok");
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  test("gives up with the last error once the retries run out", async () => {
+    const load = vi.fn<() => Promise<string>>().mockRejectedValue(notReady());
+    await expect(retryWhileNotReady(load, [0, 0])).rejects.toMatchObject({
+      status: 409,
+      code: "not_ready",
+    });
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  test("does not retry any other error", async () => {
+    const other = new ApiError(409, "/runs/x/preview", "409", {
+      code: "no_preview",
+    });
+    const load = vi.fn<() => Promise<string>>().mockRejectedValue(other);
+    await expect(retryWhileNotReady(load, [0, 0])).rejects.toBe(other);
+    expect(load).toHaveBeenCalledTimes(1);
   });
 });

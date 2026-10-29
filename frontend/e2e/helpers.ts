@@ -1,3 +1,4 @@
+import { AxeBuilder } from "@axe-core/playwright";
 import { expect, type Page } from "@playwright/test";
 
 /**
@@ -42,4 +43,60 @@ export async function emulateReducedTransparency(page: Page) {
         ? real("all")
         : real(query);
   });
+}
+
+const TAGS = [
+  "wcag2a",
+  "wcag2aa",
+  "wcag21a",
+  "wcag21aa",
+  "wcag22aa",
+  "best-practice",
+];
+
+/**
+ * Rules that fail at any impact. Everything else fails only when serious or
+ * critical. `heading-order` (moderate, best-practice) guards the panel's
+ * heading levels under the run's h1.
+ */
+const ALWAYS_BLOCKING = new Set(["heading-order"]);
+
+export interface Scan {
+  /** Blocking violations, summarised for a readable diff. */
+  blocking: { id: string; impact: string; help: string; targets: string[] }[];
+  /** Text nodes whose contrast axe actually measured (and passed). */
+  contrastChecked: number;
+  /** Text nodes axe could not measure, with axe's reason. */
+  contrastIncomplete: string[];
+}
+
+/** Runs axe over the page (see `a11y.spec.ts` for how results are judged). */
+export async function scan(page: Page): Promise<Scan> {
+  const { violations, passes, incomplete } = await new AxeBuilder({ page })
+    .withTags(TAGS)
+    .analyze();
+  return {
+    blocking: violations
+      .filter(
+        (v) =>
+          v.impact === "serious" ||
+          v.impact === "critical" ||
+          ALWAYS_BLOCKING.has(v.id),
+      )
+      .map((v) => ({
+        id: v.id,
+        impact: v.impact ?? "",
+        help: v.help,
+        targets: v.nodes.map((n) => n.target.join(" ")),
+      })),
+    contrastChecked:
+      passes.find((p) => p.id === "color-contrast")?.nodes.length ?? 0,
+    contrastIncomplete:
+      incomplete
+        .find((p) => p.id === "color-contrast")
+        ?.nodes.map(
+          (n) =>
+            `${n.target.join(" ")}: ${n.any.map((c) => c.message).join("; ")}`,
+        ) ?? [],
+  };
 }

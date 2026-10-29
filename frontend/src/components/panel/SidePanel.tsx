@@ -5,7 +5,7 @@ import { type ReactNode, useMemo, useState } from "react";
 import { useApi } from "@/components/api/ApiProvider";
 import { DemoBadge } from "@/components/shell/DemoBadge";
 import { useRunStream } from "@/components/thread/run-stream";
-import { errorDetail } from "@/lib/api/errors";
+import { errorDetail, retryWhileNotReady } from "@/lib/api/errors";
 import type { Transform } from "@/lib/api/types";
 import type { RunViewState } from "@/lib/run-state";
 import { CodeTab, type NoCodeReason } from "./CodeTab";
@@ -222,7 +222,10 @@ export function SidePanel({
   const loaded = state === null || state.loaded !== null;
   const pages = usePreviewPages(
     opened.has("data") && loaded ? runId : null,
-    (offset, limit) => api.getPreview(runId, { offset, limit }),
+    // Just after `loaded` the preview may still be being written: the API
+    // answers 409 `not_ready` and the contract says to retry shortly.
+    (offset, limit) =>
+      retryWhileNotReady(() => api.getPreview(runId, { offset, limit })),
   );
   const transforms = useResource(
     opened.has("code") ? `${runId}|${transformsKey(state)}` : null,
