@@ -47,6 +47,7 @@ responses and its own connection copy for network errors and 5xx.
 | --- | --- |
 | `403` | A non-`GET` request (e.g. `POST /runs`) whose `Origin` header is not an allowed UI origin: `code` is `forbidden_origin`, answered before the body is read. Requests without `Origin` (curl, scripts) are allowed |
 | `404` | Unknown run id (any `/runs/{id}/...` route) |
+| `404` | `GET /evals/summary` before any scored agent eval run exists: `code` is `no_evals` |
 | `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
@@ -162,7 +163,7 @@ export interface ApiClient {
 | `streamEvents(runId, onEvent, signal)` | `GET /runs/{id}/events` (`Accept: text/event-stream`) | `200` SSE stream of `RunEvent`, see below |
 | `getTransforms(runId)` | `GET /runs/{id}/transforms` | `200` `Transform[]`, see below |
 | `getPreview(runId, { offset, limit })` | `GET /runs/{id}/preview?offset=<n>&limit=<n>` | `200` `DataPreview`, see below; `409` before `loaded` |
-| `getEvalSummary()` | `GET /evals/summary` | `200` `EvalSummary` |
+| `getEvalSummary()` | `GET /evals/summary` | `200` `EvalSummary`; `404` `no_evals` before any eval run |
 
 Path parameters are URL-encoded. Unknown run ids return `404`.
 
