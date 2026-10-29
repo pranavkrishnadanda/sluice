@@ -205,6 +205,23 @@ BEGIN
             UNIQUE (iceberg_table, file_sha256, contract_version);
     END IF;
 END $$;
+-- Plan 4: the contract transform id of each attempt (``node_finished.transformId``). Nullable,
+-- since rows written before it have none; unique, since ids are global. Guarded like the
+-- migration above, so the usual path takes no ALTER TABLE lock.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'transforms'
+          AND column_name = 'transform_id'
+    ) THEN
+        ALTER TABLE transforms ADD COLUMN IF NOT EXISTS transform_id text;
+    END IF;
+    IF to_regclass('transforms_transform_id_key') IS NULL THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS transforms_transform_id_key
+            ON transforms (transform_id);
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS flags (
     run_id       text NOT NULL REFERENCES runs (run_id),
     pk           text NOT NULL,
@@ -253,10 +270,15 @@ class PlanNodeRecord(BaseModel):
 
 
 class TransformRecord(BaseModel):
-    """One ``transforms`` lineage row, read from ``SystemOutput.meta["transforms"]``."""
+    """One ``transforms`` lineage row, read from ``SystemOutput.meta["transforms"]``.
+
+    ``transform_id`` is the attempt's contract id (``sluice.agent.pipeline.transform_id``): the
+    accepted attempt's equals its ``node_finished.transformId``.
+    """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
+    transform_id: OpaqueId
     node_id: OpaqueId
     attempt: Annotated[int, Field(ge=1)]
     code: Annotated[str, Field(max_length=MAX_CODE_CHARS)]
@@ -579,7 +601,8 @@ def _record_run(conn: psycopg.Connection, rec: _Record) -> None:
         if rec.transforms:
             cur.executemany(
                 "INSERT INTO transforms (run_id, node_id, attempt, code_sha256, code, model, "
-                "passed) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                "passed, transform_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT DO NOTHING",
                 [
                     (
                         rec.run_id,
@@ -589,6 +612,7 @@ def _record_run(conn: psycopg.Connection, rec: _Record) -> None:
                         t.code,
                         t.model,
                         t.passed,
+                        t.transform_id,
                     )
                     for t in rec.transforms
                 ],

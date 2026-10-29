@@ -191,6 +191,8 @@ class _Run:
     records_from: int
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     emitted: list[EventModel] = field(default_factory=list)
+    sources: dict[str, str | None] = field(default_factory=dict)
+    """Contract column -> the raw input column it is read from (``meta["mapping"]``)."""
     errors: list[str] = field(default_factory=list)
     sandbox_error: str | None = None
     finished: bool = False
@@ -239,8 +241,15 @@ def _spend(records: list[CallRecord]) -> tuple[int, float]:
 # --------------------------------------------------------------------------- entry point
 
 
-async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> SystemOutput:
+async def run_pipeline(
+    case: CaseInput, deps: PipelineDeps, log: EventLog, *, run_id: str | None = None
+) -> SystemOutput:
     """Run the agent pipeline over ``case.path`` (see the module docstring for the states).
+
+    ``run_id`` is the caller's run id (``[A-Za-z0-9_-]{1,64}``), used for ``run_started``,
+    ``meta["run_id"]`` and every transform id, so lineage, events and the API agree; ``None``
+    makes up a random one. Events go to ``log`` as they happen (give it an ``on_emit`` to relay
+    them live) and are also returned in ``meta["events"]``.
 
     Never raises for an ``Exception``: model and provider problems fall back as described in
     the module docstring, and anything unexpected (a read error, a sandbox or Docker API error,
@@ -248,24 +257,21 @@ async def run_pipeline(case: CaseInput, deps: PipelineDeps, log: EventLog) -> Sy
     ``failed``, the summary naming only the exception type) and a whole-file quarantine output.
     ``BaseException`` (``asyncio.CancelledError``, ``KeyboardInterrupt``) is never caught.
     """
-    run = _Run(case, deps, log, start=deps.clock(), records_from=len(deps.llm.records))
-    attributes = {"sluice.run_id": run.run_id, "sluice.table": case.contract.name}
-    with tracing.span("sluice.run", attributes) as root:
-        try:
-            # Rate-limit back-off inside any model call must end within the file's wall cap.
-            # Requests are not cut off, so a file can overrun the cap by up to one request.
-            with deps.llm.wall_budget(MAX_WALL_S_PER_FILE):
-                output = await _pipeline(run)
-        except Exception as exc:  # not BaseException: cancellation and interrupts propagate
-            output = _crashed(run, exc)
-        root.set_attribute("sluice.status", _final_status(run))
-    return output
-
-
-def _final_status(run: _Run) -> str:
-    """The status of the run's ``run_finished`` event (for the run span)."""
-    finished = [e for e in run.emitted if isinstance(e, RunFinished)]
-    return finished[-1].status if finished else "unknown"
+    run = _Run(
+        case,
+        deps,
+        log,
+        start=deps.clock(),
+        records_from=len(deps.llm.records),
+        run_id=run_id or uuid.uuid4().hex,
+    )
+    try:
+        # Rate-limit back-off inside any model call must end within the file's wall cap. Requests
+        # themselves are not cut off, so a file can overrun the cap by up to one request.
+        with deps.llm.wall_budget(MAX_WALL_S_PER_FILE):
+            return await _pipeline(run)
+    except Exception as exc:  # not BaseException: cancellation and interrupts propagate
+        return _crashed(run, exc)
 
 
 async def _pipeline(run: _Run) -> SystemOutput:
@@ -293,6 +299,7 @@ async def _pipeline(run: _Run) -> SystemOutput:
 
     with tracing.step_span("profile"):
         prof1 = profile(frame, contract)
+    run.sources = raw_sources(contract, prof1, mapping)
     try:
         with tracing.step_span("rules_pass_1"):
             pass1 = apply_rules(frame, contract, prof1, case.reference)
@@ -536,6 +543,7 @@ async def _attempt(
         return f"LLMUnavailable: {exc}", None
     records.append(record)
     transform = {
+        "transform_id": transform_id(run.run_id, node.id, attempt),
         "node_id": node.id,
         "attempt": attempt,
         "code": code.code,
@@ -678,6 +686,22 @@ def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | Non
         ):
             stats[f"{name}_{label}"] = None if value is None else float(value)  # type: ignore[arg-type]
     return stats
+
+
+def raw_sources(
+    contract: Contract, prof: Profile, mapping: ColumnMapping | None
+) -> dict[str, str | None]:
+    """Contract column -> the raw input column it is read from, in contract order.
+
+    ``prof`` profiles the mapped frame; a column the mapping renamed is traced back to its
+    original name (``amt`` for ``o_totalprice``). ``None`` when no input column holds it.
+    """
+    renamed = {} if mapping is None else {t: s for s, t in mapping.pairs.items() if t is not None}
+    matched = contract_sources(prof)
+    return {
+        c.name: renamed.get(matched[c.name], matched[c.name]) if c.name in matched else None
+        for c in contract.columns
+    }
 
 
 def _hints(mapping: ColumnMapping | None) -> dict[str, str]:
@@ -947,6 +971,7 @@ def _meta(
         "records": [r.model_dump(mode="json") for r in run.records],
         "tokens": run.tokens(),
         "quarantine_reasons": quarantine_reasons,
+        "mapping": run.sources or dict.fromkeys(c.name for c in run.case.contract.columns),
         "mapping_truncated": [] if mapping is None else list(mapping.truncated),
     }
     if run.errors:
