@@ -15,6 +15,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     UserPromptPart,
 )
@@ -36,6 +37,13 @@ from sluice.contracts.model import Contract, load_contract
 from sluice.llm.client import LLM, LLMOutputError, LLMUnavailable
 from sluice.rules.fixers import RuleResult, apply_rules
 from sluice.rules.profile import profile
+
+
+def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
+    """The model's structured answer: the output tool call in tool mode, else JSON text."""
+    if info.output_tools:
+        return ToolCallPart(info.output_tools[0].name, payload)
+    return TextPart(payload)
 
 
 @pytest.fixture(scope="module")
@@ -223,9 +231,8 @@ class Scripted:
         for msg in messages:
             if isinstance(msg, ModelRequest):
                 self.prompts += [str(p.content) for p in msg.parts if isinstance(p, UserPromptPart)]
-        tool = info.output_tools[0].name
         return ModelResponse(
-            parts=[ToolCallPart(tool, json.dumps(self.queue.pop(0)))],
+            parts=[_output_part(info, json.dumps(self.queue.pop(0)))],
             usage=RequestUsage(input_tokens=40, output_tokens=8),
         )
 

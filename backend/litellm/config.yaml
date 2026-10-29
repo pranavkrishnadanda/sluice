@@ -12,7 +12,8 @@
 #     $0.75/$3.75 per 1M tokens on the paid tier until 2026-12-31.
 #   Local worker: spec §7.4 default Qwen3.5-4B-MLX-4bit on vllm-metal. Start it with
 #     `--served-model-name Qwen3.5-4B-MLX-4bit --enable-auto-tool-choice --tool-call-parser hermes`
-#     on port 58000, since Pydantic AI returns typed output through a required tool call.
+#     on port 58000. The client sends a json_schema response_format by default (vLLM structured
+#     outputs); the tool-call flags are only needed for `LLM(output_mode="tool")`.
 #
 # Rate limits are per deployment, enforced by the router before each call. Usage is counted in
 # Redis (router_settings.redis_*) so every proxy worker and restart shares one budget. This

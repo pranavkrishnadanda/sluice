@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -23,6 +23,13 @@ from sluice.llm.client import LLM, CallRecord
 
 BASE_URL = "http://litellm.test"
 API_KEY = "sk-sluice-test-master-key-0123456789"
+
+
+def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
+    """The model's structured answer: the output tool call in tool mode, else JSON text."""
+    if info.output_tools:
+        return ToolCallPart(info.output_tools[0].name, payload)
+    return TextPart(payload)
 
 
 @dataclass(frozen=True)
@@ -50,9 +57,8 @@ class Capture:
 
     def _respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         self.requests.append(list(messages))
-        tool = info.output_tools[0].name
         return ModelResponse(
-            parts=[ToolCallPart(tool, json.dumps(self.queue.pop(0)))],
+            parts=[_output_part(info, json.dumps(self.queue.pop(0)))],
             usage=RequestUsage(input_tokens=30, output_tokens=5),
         )
 

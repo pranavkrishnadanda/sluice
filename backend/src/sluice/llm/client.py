@@ -6,6 +6,19 @@ limits and a Redis response cache (`backend/litellm/config.yaml`). The client it
 transport errors (that is LiteLLM's job): it retries only an output that fails schema validation,
 once, with the validation error fed back to the model.
 
+Structured output (`OutputMode`, default ``"native"``): the output schema is sent as an OpenAI
+``response_format`` of type ``json_schema`` (Pydantic AI `NativeOutput`), not as a required output
+tool. Groq documents json_schema structured outputs for ``openai/gpt-oss-120b`` and ``-20b``
+(https://console.groq.com/docs/structured-outputs, read 2026-10-29), LiteLLM 1.106.5 passes the
+``response_format`` through for both (``litellm.supports_response_schema`` is true, so its Groq
+tool-call workaround stays off) and maps it to Gemini's ``responseJsonSchema`` for the fallback. In
+tool mode gpt-oss sometimes wrote reasoning prose instead of the tool call (first live eval: 3 of 37
+calls). ``strict`` is sent as false (Groq best-effort mode), because strict mode rejects schemas
+with optional fields or defaults. When the provider still reports an unparseable generation (HTTP
+400 with ``output_parse_failed`` / ``json_validate_failed`` / ``tool_use_failed``), the call is
+retried once with a "respond with only the JSON object" nudge, and a second such failure is an
+`LLMOutputError`.
+
 Failures map onto two exceptions the pipeline handles by falling back to rules-only output:
 `LLMOutputError` (still invalid after the repair) and `LLMUnavailable` (the proxy answered with an
 error, or could not be reached). Their messages are built here from the status code and error class
@@ -19,6 +32,7 @@ header (LiteLLM 1.106.5 sets it only on cached responses) and costs 0.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from contextvars import ContextVar
@@ -26,7 +40,7 @@ from typing import Final, Literal, Self
 
 import httpx2
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai import Agent, capture_run_messages
+from pydantic_ai import Agent, NativeOutput, PromptedOutput, capture_run_messages
 from pydantic_ai.exceptions import (
     AgentRunError,
     ModelAPIError,
@@ -36,12 +50,19 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.output import OutputSpec
 from pydantic_ai.providers.litellm import LiteLLMProvider
 from pydantic_ai.settings import ModelSettings
 
 from sluice.llm import prices
 
 Tier = Literal["small", "strong"]
+
+OutputMode = Literal["native", "prompted", "tool"]
+"""How the output schema reaches the model: a json_schema ``response_format`` (``native``), a
+schema in the prompt (``prompted``), or Pydantic AI's required output tool (``tool``)."""
+
+DEFAULT_OUTPUT_MODE: Final[OutputMode] = "native"
 
 REQUEST_TIMEOUT_S: Final = 90.0
 """Client-side cap on one proxy request (LiteLLM's own retries and fallbacks included).
@@ -62,6 +83,18 @@ CONNECT_TIMEOUT_S: Final = 5.0
 
 OUTPUT_REPAIR_RETRIES: Final = 1
 """Re-asks after an output fails schema validation, before `LLMOutputError`."""
+
+GENERATION_RETRIES: Final = 1
+"""Re-asks after the provider itself rejects the generation as unparseable (see the module doc)."""
+
+GENERATION_ERROR_CODES: Final = ("output_parse_failed", "json_validate_failed", "tool_use_failed")
+"""Groq error codes for a generation that did not parse / match the schema. LiteLLM relays them as
+an HTTP 400 whose body embeds the provider error, so they are matched as substrings of the body."""
+
+JSON_ONLY_NUDGE: Final = (
+    "\n\nRespond with only the JSON object that matches the required schema: no prose, no "
+    "reasoning, no markdown."
+)
 
 COST_HEADER: Final = "x-litellm-response-cost"
 CACHE_KEY_HEADER: Final = "x-litellm-cache-key"
@@ -134,6 +167,7 @@ class LLM:
             A client passed in stays the caller's to close; one created here is closed by `aclose`.
         cache: Whether the proxy may answer from its response cache. Evals pass ``False`` so
             every trial measures the model, not the cache (Ruling F3); ``sluice run`` keeps it.
+        output_mode: How the output schema is sent (`OutputMode`); ``native`` by default.
 
     Event-loop lifetime: the HTTP client pools connections bound to the event loop that first
     uses them. Create, use and close (`aclose` / `async with`) an instance inside ONE event loop,
@@ -149,9 +183,11 @@ class LLM:
         model_override: Model | None = None,
         http_client: httpx2.AsyncClient | None = None,
         cache: bool = True,
+        output_mode: OutputMode = DEFAULT_OUTPUT_MODE,
     ) -> None:
         self.records: list[CallRecord] = []
         self.cache = cache
+        self.output_mode: OutputMode = output_mode
         self._override = model_override
         self._owns_client = http_client is None
         self._http = http_client or httpx2.AsyncClient(
@@ -174,7 +210,7 @@ class LLM:
     def __repr__(self) -> str:
         return (
             f"LLM(records={len(self.records)}, override={self._override is not None}, "
-            f"cache={self.cache})"
+            f"cache={self.cache}, output_mode={self.output_mode})"
         )
 
     async def aclose(self) -> None:
@@ -193,48 +229,74 @@ class LLM:
     ) -> tuple[T, CallRecord]:
         """Ask the `tier` model group for an `output_type`; one repair retry on invalid output.
 
+        A generation the provider rejects as unparseable (`GENERATION_ERROR_CODES`) is re-asked
+        once with `JSON_ONLY_NUDGE` appended to the prompt; the record covers every attempt.
+
         Raises:
-            LLMOutputError: the output was invalid twice (its `record` carries the spent tokens).
+            LLMOutputError: the output was invalid twice, or the provider rejected the generation
+                twice (its `record` carries the spent tokens).
             LLMUnavailable: the proxy failed or was unreachable (nothing billed, no record).
         """
         agent = Agent(
             self._override or self._models[tier],
-            output_type=output_type,
+            output_type=_wrap_output(output_type, self.output_mode),
             system_prompt=system,
             retries={"output": OUTPUT_REPAIR_RETRIES},
         )
         headers: list[httpx2.Headers] = []
+        messages: list[ModelMessage] = []
         token = _response_headers.set(headers)
         start = time.perf_counter()
-        failure: LLMError | None = None
         try:
-            with capture_run_messages() as messages:
-                # Failures are built inside the handlers but raised after them: an exception
-                # raised in an `except` block keeps the original as `__context__` (even with
-                # `from None`), and a provider error body may echo a key.
-                try:
-                    result = await agent.run(prompt)
-                except UnexpectedModelBehavior as exc:
-                    failure = LLMOutputError(
-                        f"{role}/{tier}: output failed validation after "
-                        f"{OUTPUT_REPAIR_RETRIES} repair retry ({type(exc).__name__})",
-                        record=self._record(role, tier, messages, headers, start),
-                    )
-                except ModelAPIError as exc:
-                    status = exc.status_code if isinstance(exc, ModelHTTPError) else None
-                    failure = LLMUnavailable(
-                        f"{role}/{tier}: LLM proxy unavailable ({type(exc).__name__}"
-                        + (f", HTTP {status})" if status is not None else ")"),
-                        status_code=status,
-                    )
-                except (AgentRunError, TimeoutError, httpx2.HTTPError) as exc:
-                    failure = LLMUnavailable(
-                        f"{role}/{tier}: LLM call failed ({type(exc).__name__})"
-                    )
-            if failure is not None:
-                raise failure
-            record = self._record(role, tier, messages, headers, start)
-            return result.output, record
+            for attempt in range(GENERATION_RETRIES + 1):
+                failure: LLMError | None = None
+                retry_generation = False
+                with capture_run_messages() as attempt_messages:
+                    # Failures are built inside the handlers but raised after them: an exception
+                    # raised in an `except` block keeps the original as `__context__` (even with
+                    # `from None`), and a provider error body may echo a key.
+                    try:
+                        result = await agent.run(prompt + (JSON_ONLY_NUDGE if attempt else ""))
+                    except UnexpectedModelBehavior as exc:
+                        failure = LLMOutputError(
+                            f"{role}/{tier}: output failed validation after "
+                            f"{OUTPUT_REPAIR_RETRIES} repair retry ({type(exc).__name__})",
+                            record=self._record(
+                                role, tier, [*messages, *attempt_messages], headers, start
+                            ),
+                        )
+                    except ModelAPIError as exc:
+                        status = exc.status_code if isinstance(exc, ModelHTTPError) else None
+                        code = _generation_error_code(exc)
+                        if code is not None and attempt < GENERATION_RETRIES:
+                            retry_generation = True
+                        elif code is not None:
+                            failure = LLMOutputError(
+                                f"{role}/{tier}: provider rejected the generation "
+                                f"{GENERATION_RETRIES + 1} times (HTTP {status}, {code})",
+                                record=self._record(
+                                    role, tier, [*messages, *attempt_messages], headers, start
+                                ),
+                            )
+                        else:
+                            failure = LLMUnavailable(
+                                f"{role}/{tier}: LLM proxy unavailable ({type(exc).__name__}"
+                                + (f", HTTP {status})" if status is not None else ")"),
+                                status_code=status,
+                            )
+                    except (AgentRunError, TimeoutError, httpx2.HTTPError) as exc:
+                        failure = LLMUnavailable(
+                            f"{role}/{tier}: LLM call failed ({type(exc).__name__})"
+                        )
+                messages.extend(attempt_messages)
+                if failure is not None:
+                    raise failure
+                if not retry_generation:
+                    record = self._record(role, tier, messages, headers, start)
+                    return result.output, record
+            raise AssertionError(
+                "unreachable: the last attempt returns or raises"
+            )  # pragma: no cover
         finally:
             _response_headers.reset(token)
 
@@ -265,6 +327,26 @@ class LLM:
         )
         self.records.append(record)
         return record
+
+
+def _wrap_output[T](output_type: type[T], mode: OutputMode) -> OutputSpec[T]:
+    """The Pydantic AI output spec for `output_type` in `mode`."""
+    if mode == "native":
+        return NativeOutput(output_type, strict=False)
+    if mode == "prompted":
+        return PromptedOutput(output_type)
+    return output_type
+
+
+def _generation_error_code(exc: ModelAPIError) -> str | None:
+    """The `GENERATION_ERROR_CODES` entry a provider 400 carries, else None.
+
+    Only the code is returned (never body text), so a key echoed in the body cannot escape.
+    """
+    if not isinstance(exc, ModelHTTPError) or exc.status_code != 400:
+        return None
+    body = exc.body if isinstance(exc.body, str) else json.dumps(exc.body, default=str)
+    return next((code for code in GENERATION_ERROR_CODES if code in body), None)
 
 
 def _header_cost(headers: list[httpx2.Headers]) -> float | None:

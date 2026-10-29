@@ -25,6 +25,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
+    TextPart,
     ToolCallPart,
     UserPromptPart,
 )
@@ -52,6 +53,13 @@ from sluice.systems.agent import AgentSystem
 from sluice.systems.rules_only import RulesOnlySystem
 
 TOKENS_PER_CALL = 150  # 100 in + 50 out, see Script.respond
+
+
+def _output_part(info: AgentInfo, payload: str) -> TextPart | ToolCallPart:
+    """The model's structured answer: the output tool call in tool mode, else JSON text."""
+    if info.output_tools:
+        return ToolCallPart(info.output_tools[0].name, payload)
+    return TextPart(payload)
 
 
 def _module(body: str) -> str:
@@ -165,7 +173,7 @@ class Script:
             accept = self.verdicts.pop(0) if self.verdicts else True
             out = {"accept": accept, "reason": "pairs look right" if accept else "100x too large"}
         return ModelResponse(
-            parts=[ToolCallPart(info.output_tools[0].name, json.dumps(out))],
+            parts=[_output_part(info, json.dumps(out))],
             usage=RequestUsage(input_tokens=100, output_tokens=50),
             model_name="script-model",
         )

@@ -14,7 +14,7 @@ import httpx2
 import pytest
 import respx
 from pydantic import BaseModel, Field
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -56,12 +56,36 @@ class RespxBridge(httpx2.AsyncBaseTransport):
         )
 
 
-def proxy_llm(router: respx.Router) -> LLM:
+def proxy_llm(router: respx.Router, **kwargs: Any) -> LLM:
     client = httpx2.AsyncClient(transport=RespxBridge(router))
-    return LLM(BASE_URL, API_KEY, http_client=client)
+    return LLM(BASE_URL, API_KEY, http_client=client, **kwargs)
 
 
 def completion(arguments: dict[str, Any], *, prompt_tokens: int, completion_tokens: int) -> dict:
+    """An OpenAI chat completion whose content is the JSON object (native structured output)."""
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1_761_609_600,
+        "model": "strong",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": json.dumps(arguments)},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def tool_completion(
+    arguments: dict[str, Any], *, prompt_tokens: int, completion_tokens: int
+) -> dict:
     """An OpenAI chat completion whose only content is a call to Pydantic AI's output tool."""
     return {
         "id": "chatcmpl-1",
@@ -101,10 +125,14 @@ def scripted(*outputs: dict[str, Any], in_tok: int = 50, out_tok: int = 10) -> F
     queue = list(outputs)
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        tool = info.output_tools[0].name
+        payload = json.dumps(queue.pop(0))
+        part = (
+            ToolCallPart(info.output_tools[0].name, payload)
+            if info.output_tools
+            else TextPart(payload)
+        )
         return ModelResponse(
-            parts=[ToolCallPart(tool, json.dumps(queue.pop(0)))],
-            usage=RequestUsage(input_tokens=in_tok, output_tokens=out_tok),
+            parts=[part], usage=RequestUsage(input_tokens=in_tok, output_tokens=out_tok)
         )
 
     return FunctionModel(respond, model_name="scripted")
@@ -402,3 +430,151 @@ def test_request_timeout_is_below_the_per_file_wall_cap() -> None:
     llm = LLM(BASE_URL, API_KEY)
     assert llm._http.timeout.read == REQUEST_TIMEOUT_S
     run(llm.aclose())
+
+
+# ---------------------------------------------------------------- structured-output mode (gpt-oss)
+
+PARSE_FAILED = {
+    # LiteLLM 1.106.5 relaying Groq's 400 when gpt-oss wrote prose instead of the structured output
+    "error": {
+        "message": (
+            'litellm.BadRequestError: GroqException - {"error":{"message":"Parsing failed. The '
+            'model generated output that could not be parsed.","type":'
+            '"invalid_request_error","code":"output_parse_failed",'
+            f'"failed_generation":"We need to write a transform function {API_KEY}"}}}}'
+        ),
+        "type": None,
+        "param": None,
+        "code": "400",
+    }
+}
+
+
+def _parse_failed() -> httpx.Response:
+    return httpx.Response(400, json=PARSE_FAILED)
+
+
+def _ok() -> httpx.Response:
+    return httpx.Response(200, json=completion(OK, prompt_tokens=7, completion_tokens=3))
+
+
+def test_default_output_mode_sends_json_schema_response_format_and_no_tools() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+
+    out, _ = run(proxy_llm(router).run("mapper", "strong", "s", "p", Answer))
+
+    body = json.loads(route.calls.last.request.content)
+    assert out == Answer(**OK)
+    assert body["response_format"]["type"] == "json_schema"
+    assert set(body["response_format"]["json_schema"]["schema"]["properties"]) == {
+        "column",
+        "confidence",
+    }
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+def test_tool_output_mode_sends_the_output_tool() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200, json=tool_completion(OK, prompt_tokens=1, completion_tokens=1)
+        )
+    )
+
+    out, _ = run(proxy_llm(router, output_mode="tool").run("mapper", "strong", "s", "p", Answer))
+
+    body = json.loads(route.calls.last.request.content)
+    assert out == Answer(**OK)
+    assert body["tools"][0]["function"]["name"] == "final_result"
+    assert "response_format" not in body
+
+
+def test_output_parse_failed_is_retried_once_with_a_json_only_nudge() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[_parse_failed(), _ok()]
+    )
+    llm = proxy_llm(router)
+
+    out, record = run(llm.run("worker", "small", "s", "map amt", Answer))
+
+    assert out == Answer(**OK)
+    assert route.call_count == 2
+    retried = json.dumps(json.loads(route.calls.last.request.content)["messages"])
+    assert "only the JSON object" in retried
+    assert (record.input_tokens, record.output_tokens) == (7, 3)
+    assert llm.records == [record]
+
+
+def test_output_parse_failed_twice_raises_output_error_not_unavailable() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_parse_failed())
+    llm = proxy_llm(router)
+
+    with pytest.raises(LLMOutputError) as caught:
+        run(llm.run("worker", "small", "s", "p", Answer))
+
+    assert route.call_count == 2
+    assert caught.value.record is not None
+    assert llm.records == [caught.value.record]
+    assert "output_parse_failed" in str(caught.value)
+    assert_no_key_reachable(caught.value)
+
+
+def test_other_400_is_still_unavailable_and_not_retried() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        return_value=httpx.Response(400, json={"error": {"message": "bad model", "code": "400"}})
+    )
+
+    with pytest.raises(LLMUnavailable) as caught:
+        run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert caught.value.status_code == 400
+    assert route.call_count == 1
+
+
+def test_native_output_sends_strict_false_for_groq_best_effort_mode() -> None:
+    # Groq strict mode rejects schemas with optional fields; best-effort accepts any schema.
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+
+    run(proxy_llm(router).run("mapper", "strong", "s", "p", Answer))
+
+    schema = json.loads(route.calls.last.request.content)["response_format"]["json_schema"]
+    assert schema["strict"] is False
+
+
+def test_json_validate_failed_is_also_a_retryable_generation_error() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(
+        side_effect=[
+            httpx.Response(
+                400,
+                json={"error": {"message": "GroqException - json_validate_failed", "code": "400"}},
+            ),
+            _ok(),
+        ]
+    )
+
+    out, _ = run(proxy_llm(router).run("worker", "small", "s", "p", Answer))
+
+    assert out == Answer(**OK)
+    assert route.call_count == 2
+
+
+def test_prompted_output_mode_puts_the_schema_in_the_prompt() -> None:
+    router = respx.Router(assert_all_called=False)
+    route = router.post(f"{BASE_URL}/v1/chat/completions").mock(return_value=_ok())
+
+    out, _ = run(
+        proxy_llm(router, output_mode="prompted").run("mapper", "strong", "s", "p", Answer)
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert out == Answer(**OK)
+    assert "confidence" in json.dumps(body["messages"])
+    assert "tools" not in body
+    assert body.get("response_format", {}).get("type") != "json_schema"
