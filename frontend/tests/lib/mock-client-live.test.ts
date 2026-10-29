@@ -143,4 +143,14 @@ describe("mock raw input", () => {
       new MockApiClient().getInput("run-nope", { offset: 0, limit: 5 }),
     ).rejects.toMatchObject({ status: 404 });
   });
+
+  test("an aborted request rejects instead of answering", async () => {
+    await expect(
+      new MockApiClient().getInput(
+        "run-repaired",
+        { offset: 0, limit: 5 },
+        AbortSignal.abort(),
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
 });

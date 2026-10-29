@@ -245,8 +245,15 @@ export interface ApiClient {
   ): Promise<void>;
   getTransforms(runId: string): Promise<Transform[]>;
   getPreview(runId: string, page: PreviewPage): Promise<DataPreview>;
-  /** The uploaded file's raw rows (`GET /runs/{id}/input`), from creation. */
-  getInput(runId: string, page: PreviewPage): Promise<RawInput>;
+  /**
+   * The uploaded file's raw rows (`GET /runs/{id}/input`), from creation.
+   * `signal` aborts the request (the server reads the whole upload).
+   */
+  getInput(
+    runId: string,
+    page: PreviewPage,
+    signal?: AbortSignal,
+  ): Promise<RawInput>;
   getEvalSummary(): Promise<EvalSummary>;
   /**
    * Demo only, never part of the HTTP API: `true` when `runId` was created

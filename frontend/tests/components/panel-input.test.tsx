@@ -44,7 +44,7 @@ function client(over: Partial<ApiClient> = {}): ApiClient {
     streamEvents: (id, on, s) => base.streamEvents(id, on, s),
     getTransforms: (id) => base.getTransforms(id),
     getPreview: (id, p) => base.getPreview(id, p),
-    getInput: (id, p) => base.getInput(id, p),
+    getInput: (id, p, s) => base.getInput(id, p, s),
     getEvalSummary: () => base.getEvalSummary(),
     ...over,
   };
@@ -165,5 +165,82 @@ describe("raw uploaded file in the Data tab", () => {
     expect(
       screen.getByText(/Sample run · showing 1,000 of 48,210 sample rows/),
     ).toBeInTheDocument();
+  });
+
+  describe("fetching the upload only while it is wanted", () => {
+    const LOADED = stateOf(RUN_REPAIRED_EVENTS);
+    const onePage = async (): Promise<RawInput> => ({
+      columns: ["a"],
+      rows: [["1"]],
+      totalRows: 1,
+      nextOffset: null,
+    });
+    const panel = (state: RunViewState, runId = "run-repaired") => (
+      <SidePanel runId={runId} state={state} dataViewportHeight={480} />
+    );
+
+    test("reopening a finished, loaded run never asks for the upload", async () => {
+      const getInput = vi.fn<ApiClient["getInput"]>(onePage);
+      const api = client({ getInput });
+      // A run page starts from the initial state; the replay delivers the
+      // rest (here in one later render, as a burst would).
+      const view = render(
+        <ApiProvider client={api}>{panel(INITIAL_RUN_VIEW_STATE)}</ApiProvider>,
+      );
+      expect(
+        screen.queryByRole("status", { name: "Loading the uploaded file" }),
+      ).not.toBeInTheDocument();
+      view.rerender(
+        <ApiProvider client={api}>
+          {panel(stateOf(RUN_REPAIRED_EVENTS.slice(0, 1)))}
+        </ApiProvider>,
+      );
+      view.rerender(<ApiProvider client={api}>{panel(LOADED)}</ApiProvider>);
+      expect(
+        await screen.findByRole("table", { name: "Before and after values" }),
+      ).toBeInTheDocument();
+      await new Promise((r) => setTimeout(r, 400));
+      expect(getInput).not.toHaveBeenCalled();
+    });
+
+    test("a running run that has not loaded asks for it once", async () => {
+      const getInput = vi.fn<ApiClient["getInput"]>(onePage);
+      renderPanel(BEFORE_LOAD, client({ getInput }));
+      await screen.findByRole("table", { name: "Uploaded file" });
+      await new Promise((r) => setTimeout(r, 100));
+      expect(getInput).toHaveBeenCalledTimes(1);
+      expect(getInput.mock.calls[0]?.[2]).toBeInstanceOf(AbortSignal);
+    });
+
+    test("a pending request aborts when the run loads, changes or the panel closes", async () => {
+      const signals: AbortSignal[] = [];
+      const getInput = vi.fn<ApiClient["getInput"]>((_id, _p, signal) => {
+        if (signal) signals.push(signal);
+        return new Promise(() => {});
+      });
+      const api = client({ getInput });
+      const view = render(
+        <ApiProvider client={api}>{panel(BEFORE_LOAD)}</ApiProvider>,
+      );
+      await waitFor(() => expect(signals).toHaveLength(1));
+      view.rerender(<ApiProvider client={api}>{panel(LOADED)}</ApiProvider>);
+      await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+
+      view.rerender(
+        <ApiProvider client={api}>
+          {panel(BEFORE_LOAD, "run-other")}
+        </ApiProvider>,
+      );
+      await waitFor(() => expect(signals).toHaveLength(2));
+      view.rerender(
+        <ApiProvider client={api}>
+          {panel(BEFORE_LOAD, "run-third")}
+        </ApiProvider>,
+      );
+      await waitFor(() => expect(signals[1]?.aborted).toBe(true));
+      await waitFor(() => expect(signals).toHaveLength(3));
+      view.unmount();
+      expect(signals[2]?.aborted).toBe(true);
+    });
   });
 });
