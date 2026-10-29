@@ -153,3 +153,9 @@ def test_verifier_prompt_explains_each_row_count_base() -> None:
     for key in ("rows_raw", "rows_after_dedupe", "non_null_after", "null_after"):
         assert key in VERIFIER_SYSTEM_PROMPT
     assert "duplicate" in VERIFIER_SYSTEM_PROMPT
+
+
+def test_verifier_prompt_rejects_money_still_in_whole_paise() -> None:
+    for key in ("median_before", "median_after", "whole_share_after", "p95_after"):
+        assert key in VERIFIER_SYSTEM_PROMPT
+    assert "whole-number paise" in VERIFIER_SYSTEM_PROMPT

@@ -1243,3 +1243,26 @@ def test_pipeline_paise_rewrite_still_meets_the_fabrication_guard(
     (failed,) = result.events("attempt_failed")
     assert "fabrication" in failed.error  # type: ignore[attr-defined]
     assert grade(case, result.out, {}).fabrication_rate in (None, 0.0)
+
+
+def test_pipeline_verifier_sees_magnitude_stats_and_unit_for_a_money_column(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0207", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100]})
+    run(case, script)
+
+    stats = verifier_stats(script)
+    assert stats["unit"] == "INR"
+    assert stats["whole_share_before"] == 1.0
+    assert stats["whole_share_after"] < 0.5
+    assert stats["median_before"] / stats["median_after"] == pytest.approx(100, rel=0.01)
+    for key in ("p5_before", "p95_before", "p5_after", "p95_after"):
+        assert isinstance(stats[key], float)
+
+
+def test_pipeline_verifier_gets_no_magnitude_stats_for_a_date_column(two_columns: Case) -> None:
+    plan = {"nodes": [node("n2", "o_orderdate")]}
+    script = Script(plan=plan, workers={"o_orderdate": [ISO_DATES]})
+    run(two_columns, script)
+    assert "median_before" not in verifier_stats(script)

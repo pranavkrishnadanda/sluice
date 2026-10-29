@@ -734,6 +734,8 @@ def _effect(
         )
         return _Effect(error, [], stats)
     stats |= _numeric_stats(after.df[spec.name], "after")
+    if spec.unit is not None:
+        stats |= _magnitude_stats(spec, raw, out)
 
     raw_list, out_list = raw.to_list(), out.to_list()
     changed = [i for i, (a, b) in enumerate(zip(raw_list, out_list, strict=True)) if a != b]
@@ -769,6 +771,27 @@ def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
             f"by 100 (expected factor {UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
         )
     return None
+
+
+def _magnitude_stats(
+    spec: ColumnSpec, raw: pl.Series, out: pl.Series
+) -> dict[str, float | int | str | None]:
+    """The contract unit and before/after size statistics of a money column (Ruling H2d).
+
+    ``median``, ``p5`` and ``p95`` (absolute values) and ``whole_share`` (share of values with no
+    fractional part) of the numbers in the raw and in the rewritten text, over raw rows: an
+    INR column still in paise shows a whole share near 1 and a median 100x too large.
+    """
+    stats: dict[str, float | int | str | None] = {"unit": spec.unit}
+    for label, series in (("before", raw), ("after", out)):
+        m = magnitude(series)
+        stats |= {
+            f"median_{label}": None if m is None else m.median,
+            f"p5_{label}": None if m is None else m.p5,
+            f"p95_{label}": None if m is None else m.p95,
+            f"whole_share_{label}": None if m is None else round(m.whole_share, 4),
+        }
+    return stats
 
 
 def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | str | None]:
