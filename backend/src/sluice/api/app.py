@@ -11,10 +11,13 @@ network error. ``InternalErrorMiddleware`` sits *inside* CORS instead, so the ge
 the CORS headers like every other response.
 """
 
+import asyncio
 import itertools
 import logging
 import traceback
-from typing import Any, Final
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Final
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -24,8 +27,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sluice import tracing
+from sluice.api.blobs import BlobStore, S3BlobStore
+from sluice.api.hub import EventHub
 from sluice.api.schemas import ErrorBody
 from sluice.api.settings import ApiSettings
+from sluice.api.store import RunStore
+from sluice.api.worker import ExecuteFn, Worker
+from sluice.runs.execute import execute_run
+from sluice.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -189,29 +198,75 @@ class InternalErrorMiddleware:
             await error_response(500, INTERNAL_DETAIL, "internal")(scope, receive, send)
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create the event hub; with the worker enabled, recover interrupted runs, then start it.
+
+    A store or blob store not injected is built from the service settings (``make api``):
+    :class:`RunStore` on the stack Postgres (schema ensured) and :class:`S3BlobStore` on the
+    landing bucket. Both are built in a thread: each does blocking I/O.
+    """
+    state = app.state
+    state.hub = EventHub()
+    state.worker = None
+    if state.worker_enabled:
+        if state.store is None:
+            store = RunStore(get_settings().postgres_dsn)
+            await asyncio.to_thread(store.ensure_schema)
+            state.store = store
+        if state.blobs is None:
+            state.blobs = await asyncio.to_thread(
+                S3BlobStore.from_settings, get_settings(), state.settings.landing_bucket
+            )
+        worker = Worker(
+            state.store,
+            state.blobs,
+            state.hub,
+            concurrency=state.settings.concurrency,
+            execute=state.execute,
+        )
+        await worker.recover()
+        await worker.start()
+        state.worker = worker
+    try:
+        yield
+    finally:
+        if state.worker is not None:
+            await state.worker.stop()
+
+
 def create_app(
     *,
     settings: ApiSettings | None = None,
-    store: Any | None = None,
-    blobs: Any | None = None,
+    store: RunStore | None = None,
+    blobs: BlobStore | None = None,
     worker: bool = True,
+    execute: ExecuteFn = execute_run,
 ) -> FastAPI:
-    """Build the API app. Later tasks register their routers and lifespan here.
+    """Build the API app; its lifespan owns the event hub and the job worker.
 
     Args:
         settings: API knobs; read from the environment when ``None``.
-        store: The run store (typed in Task 2); kept on ``app.state.store``.
-        blobs: The blob store (typed in Task 2); kept on ``app.state.blobs``.
-        worker: Start the in-process job worker. Tests pass ``False``.
+        store: The run store, kept on ``app.state.store``; built from the service settings at
+            startup when ``None`` and the worker is enabled.
+        blobs: The blob store, kept on ``app.state.blobs``; the RustFS landing bucket at
+            startup when ``None`` and the worker is enabled.
+        worker: Recover interrupted runs and start the in-process job worker
+            (``app.state.worker``). Tests pass ``False``. The hub (``app.state.hub``) is
+            created either way.
+        execute: The execution core the worker calls (injectable for tests).
     """
     tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
     if settings is None:
         settings = ApiSettings()
-    app = FastAPI(title="Sluice API", version="1")
+    app = FastAPI(title="Sluice API", version="1", lifespan=_lifespan)
     app.state.settings = settings
     app.state.store = store
     app.state.blobs = blobs
     app.state.worker_enabled = worker
+    app.state.execute = execute
+    app.state.hub = None
+    app.state.worker = None
 
     app.add_exception_handler(StarletteHTTPException, _http_exception)
     app.add_exception_handler(RequestValidationError, _request_validation)
