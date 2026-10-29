@@ -23,6 +23,7 @@ from sluice.agent.worker import (
     MAX_PROMPT_SAMPLES,
     WORKER_SYSTEM_PROMPT,
     TransformCode,
+    build_worker_prompt,
     guard_output,
     precheck_code,
     write_transform,
@@ -393,3 +394,11 @@ def test_write_transform_code_invalid_twice_raises_output_error() -> None:
     cap = Capture(bad, bad)
     with pytest.raises(LLMOutputError):
         _write(cap)
+
+
+def test_worker_prompt_carries_a_unit_finding_only_when_given() -> None:
+    finding = "values look like paise: 100% whole numbers, median 1036492"
+    with_finding = build_worker_prompt(NODE, SPEC, "amount", ["1,24,500"], None, finding)
+    assert json.dumps(finding) in with_finding
+    assert "divide by 100" in with_finding
+    assert "Profiler finding" not in build_worker_prompt(NODE, SPEC, "amount", ["1"], None)

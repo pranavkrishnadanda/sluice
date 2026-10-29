@@ -22,6 +22,8 @@ from pipeline_fakes import (
     ALL_NULL,
     CANNED,
     CRASH,
+    DIVIDE_100,
+    DIVIDE_100_LOSSY,
     DOWN,
     FILL_ZERO,
     ISO_DATES,
@@ -1154,3 +1156,90 @@ def test_pipeline_profiled_reports_the_unit_issue(cases_dir: Path, orders_df: pl
     assert units[0].detail.startswith("values look like paise: 100% whole numbers")
     (plan_prompt,) = script.roles("orchestrator")
     assert json.dumps(units[0].detail) in plan_prompt
+
+
+def _lineitem_paise_case(cases_dir: Path, lineitem_df: pl.DataFrame, case_id: str) -> Case:
+    """Unhinted paise rendered with a ``.00`` suffix: the rules parse every value (no flags)."""
+    ops: list[Any] = [("unit_paise", {"column": "l_extendedprice", "hinted": False})]
+    recipe = Recipe("lineitem", "medium", ops, "csv", "utf-8", 80)
+    case = build_case(case_id, "dev", recipe, {"lineitem": lineitem_df}, 7, cases_dir)
+    raw = pl.read_csv(case.input_path, infer_schema=False)
+    raw = raw.with_columns(pl.col("l_extendedprice") + ".00")
+    raw.write_csv(case.input_path)
+    return case
+
+
+LINE_PLAN = {"nodes": [node("n1", "l_extendedprice")]}
+
+
+def test_pipeline_repairs_paise_the_rules_parse_in_every_row(
+    cases_dir: Path, lineitem_df: pl.DataFrame
+) -> None:
+    case = _lineitem_paise_case(cases_dir, lineitem_df, "dev-0202")
+    rules_out = rules_only(case)
+    assert not any(col == "l_extendedprice" for _, col in rules_out.flags)  # parsed, 100x off
+
+    script = Script(plan=LINE_PLAN, workers={"l_extendedprice": [DIVIDE_100]})
+    result = run(case, script, contract=load_contract("lineitem"))
+
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    assert "values look like paise" in script.roles("worker")[0]  # the finding reaches the worker
+    agent_grade = grade(case, result.out, {})
+    assert agent_grade.cell_accuracy == 1.0
+    assert agent_grade.fabrication_rate in (None, 0.0)
+    assert grade(case, rules_out, {}).cell_accuracy < 1.0  # type: ignore[operator]
+
+
+def test_pipeline_repairs_indian_grouped_paise_to_rupees(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0203", [PAISE, INDIAN, DESTROY])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100]})
+    result = run(case, script)
+
+    (done,) = result.events("node_finished")
+    assert done.attempt == 1  # type: ignore[attr-defined]
+    agent_grade = grade(case, result.out, {})
+    assert agent_grade.cell_accuracy == 1.0
+    assert agent_grade.fabrication_rate in (None, 0.0)
+
+
+def test_pipeline_rejects_a_paise_rewrite_that_only_strips_commas(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0204", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [STRIP_COMMAS, DIVIDE_100]})
+    result = run(case, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert "median" in failed.error and "factor" in failed.error  # type: ignore[attr-defined]
+    assert len(script.roles("verifier")) == 1  # the code rejected attempt 1 before the verifier
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]
+    assert grade(case, result.out, {}).cell_accuracy == 1.0
+
+
+def test_pipeline_rejects_a_paise_rewrite_that_drops_values(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0205", [PAISE, INDIAN])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [DIVIDE_100_LOSSY, DIVIDE_100]})
+    result = run(case, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert "lost" in failed.error  # type: ignore[attr-defined]
+    (done,) = result.events("node_finished")
+    assert done.attempt == 2  # type: ignore[attr-defined]
+
+
+def test_pipeline_paise_rewrite_still_meets_the_fabrication_guard(
+    cases_dir: Path, orders_df: pl.DataFrame
+) -> None:
+    case = _paise_case(cases_dir, orders_df, "dev-0206", [PAISE, INDIAN, DESTROY])
+    script = Script(plan=PRICE_PLAN, workers={"o_totalprice": [FILL_ZERO, DIVIDE_100]})
+    result = run(case, script)
+
+    (failed,) = result.events("attempt_failed")
+    assert "fabrication" in failed.error  # type: ignore[attr-defined]
+    assert grade(case, result.out, {}).fabrication_rate in (None, 0.0)

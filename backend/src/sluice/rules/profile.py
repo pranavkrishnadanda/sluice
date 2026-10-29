@@ -126,6 +126,19 @@ def contract_sources(prof: Profile) -> dict[str, str]:
     }
 
 
+def _number_texts(series: pl.Series) -> pl.Series:
+    """Cells as text with grouping commas and whitespace removed; destroyed tokens -> null."""
+    texts = series if series.dtype == pl.String else series.cast(pl.String, strict=False)
+    destroyed = texts.str.strip_chars().is_in(pl.Series(sorted(SENTINEL_TOKENS)).implode())
+    cleaned = texts.str.replace_all(_NUMBER_NOISE, "")
+    return pl.select(pl.when(destroyed).then(None).otherwise(cleaned)).to_series()
+
+
+def number_mask(series: pl.Series) -> pl.Series:
+    """Per row: the cell reads as a plain number once grouping commas are removed (no nulls)."""
+    return _number_texts(series).str.contains(_NUMBER).fill_null(False)
+
+
 @dataclass(frozen=True, slots=True)
 class Magnitude:
     """Size statistics of the numbers in a column (absolute values; see :func:`magnitude`)."""
@@ -145,10 +158,8 @@ def magnitude(series: pl.Series) -> Magnitude | None:
     *whole* when it has no fractional part or only zeros after the point. ``None`` when no cell
     parses. Vectorised: O(rows), plus O(rows log rows) for the median and quantiles.
     """
-    texts = series if series.dtype == pl.String else series.cast(pl.String, strict=False)
-    destroyed = texts.str.strip_chars().is_in(pl.Series(sorted(SENTINEL_TOKENS)).implode())
-    cleaned = texts.filter(~destroyed.fill_null(True)).str.replace_all(_NUMBER_NOISE, "")
-    numbers = cleaned.filter(cleaned.str.contains(_NUMBER))
+    cleaned = _number_texts(series)
+    numbers = cleaned.filter(number_mask(series))
     if numbers.len() == 0:
         return None
     values = numbers.cast(pl.Float64, strict=False).abs()

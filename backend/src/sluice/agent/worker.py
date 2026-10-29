@@ -276,8 +276,13 @@ def build_worker_prompt(
     source_name: str,
     samples: list[str],
     prior_error: str | None,
+    finding: str | None = None,
 ) -> str:
-    """The user prompt for one transform attempt. Samples and errors are capped and JSON-quoted."""
+    """The user prompt for one transform attempt. Samples and errors are capped and JSON-quoted.
+
+    ``finding`` is a deterministic profiler finding about the whole column (the unit issue of
+    Ruling H2c); when set, the prompt says that every value must be converted.
+    """
     contract = {
         "name": spec.name,
         "dtype": spec.dtype,
@@ -293,9 +298,19 @@ def build_worker_prompt(
         if prior_error is None
         else json.dumps(clip(prior_error, MAX_ERROR_CHARS))
     )
+    profiler = (
+        ""
+        if finding is None
+        else (
+            f"Profiler finding for the whole column: {json.dumps(finding)}. Every row is "
+            "rewritten, so convert every value (paise -> rupees: divide by 100, keep 2 "
+            "fractional digits), not only the samples' format.\n"
+        )
+    )
     return (
         f"Plan node {json.dumps(node.id)}: column {json.dumps(node.column)}\n"
         f"Issue: {json.dumps(node.issue)}\n"
+        f"{profiler}"
         f"Source column name: {json.dumps(source_name)}\n"
         f"Contract column spec: {json.dumps(contract)}\n"
         f"Target format for dtype {spec.dtype}: {_target_format(spec)}\n"
@@ -316,6 +331,7 @@ async def write_transform(
     llm: LLM,
     *,
     checked: bool = True,
+    finding: str | None = None,
 ) -> tuple[TransformDraft, CallRecord]:
     """Ask the `tier` model for a transform for `node`'s column; the code is never run here.
 
@@ -329,6 +345,6 @@ async def write_transform(
             after the repair retry.
         LLMUnavailable: no route could serve the call.
     """
-    prompt = build_worker_prompt(node, spec, source_name, samples, prior_error)
+    prompt = build_worker_prompt(node, spec, source_name, samples, prior_error, finding)
     output_type: type[TransformDraft] = TransformCode if checked else TransformDraft
     return await llm.run(WORKER_ROLE, tier, WORKER_SYSTEM_PROMPT, prompt, output_type)

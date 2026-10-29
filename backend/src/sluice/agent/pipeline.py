@@ -17,7 +17,14 @@ States, in order (each one emits the contract event named after it, see ``docs/a
    -> ``deps.sandbox`` (in a worker thread) -> ``guard_output`` -> keep only the rewritten
    cells pass 1 flagged, in every raw copy of a row (Ruling F2: parsed cells keep their raw
    text; duplicates stay identical, so dedupe is unchanged) -> an effect check (the
-   rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``. Each
+   rewrite must recover a flagged cell and break no parsed one) -> ``verify_node``.
+   **Unit exception (Ruling H2c, deliberate).** For a node whose column has a profiler unit
+   issue (values that look like whole paise for an INR column), the accepted rewrite applies to
+   every row of the column, not only the flagged ones, because every value is in the wrong
+   unit (the rules may parse paise rendered as ``12450050.00`` without flagging them). The
+   fabrication guard still covers every row (destroyed tokens and nulls stay null), and the
+   effect check instead requires that no cell becomes unparseable or loses its number and
+   that the column median shrinks by a factor in [80, 120] (≈ ÷100). Every other node keeps F2. Each
    attempt emits ``node_started`` then ``node_finished`` or ``attempt_failed``; a failure's
    reason is fed to the next attempt as ``prior_error`` (the precheck's, guard's or verifier's
    own reason). The attempt's transform record (when it produced code) goes to
@@ -119,7 +126,7 @@ from sluice.rules.fixers import (
     cell_texts,
     flagged_raw_rows,
 )
-from sluice.rules.profile import Profile, contract_sources, profile
+from sluice.rules.profile import Profile, contract_sources, magnitude, number_mask, profile
 from sluice.sandbox.runner import SandboxError, SandboxResult
 
 __all__ = ["MAX_TOKENS_PER_FILE", "MAX_WALL_S_PER_FILE", "PipelineDeps", "run_pipeline"]
@@ -128,6 +135,10 @@ MAX_LLM_ERROR_CHARS: Final = 300
 """``meta["llm_error"]`` is cut to this length (the client's messages carry no provider text)."""
 
 MAX_ISSUE_DETAIL_CHARS: Final = 200
+
+UNIT_FACTOR_MIN: Final = 80.0
+UNIT_FACTOR_MAX: Final = 120.0
+"""A unit node's rewrite must shrink the column median by a factor in this range (≈ ÷100)."""
 
 Sandbox = Callable[[str, pl.Series], SandboxResult]
 
@@ -421,6 +432,7 @@ async def _run_nodes(
                         hints.get(n.column, source[n.column]),
                         candidates[n.column],
                         flagged.get(n.column, set()),
+                        prof.unit_issues.get(n.column),
                     )
                 )
         done.update(n.id for n in wave)
@@ -435,11 +447,13 @@ async def _run_node(
     shown_name: str,
     samples: list[str],
     flagged_before: set[int],
+    unit_issue: str | None,
 ) -> None:
     """Attempt one node until it is accepted, runs out of attempts, or a cap/outage stops it.
 
     ``source_name`` is the column in ``frame``; ``shown_name`` is the input file's own name for
-    it (with any unit hint), passed to the worker.
+    it (with any unit hint), passed to the worker. ``unit_issue`` is the profiler's unit finding
+    for the column (Ruling H2c: the rewrite then covers every row), else ``None``.
     """
     node = outcome.node
     contract = run.case.contract
@@ -463,7 +477,7 @@ async def _run_node(
         records: list[CallRecord] = []
         error, rewritten = await _traced_attempt(
             run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
-            values, frame, flagged_before, records,
+            values, frame, flagged_before, records, unit_issue,
         )  # fmt: skip
         tokens, cost = _spend(records)
         _hand_over_transform(run, outcome, attempt)
@@ -533,13 +547,14 @@ async def _traced_attempt(
     frame: pl.DataFrame,
     flagged_before: set[int],
     records: list[CallRecord],
+    unit_issue: str | None,
 ) -> tuple[str | None, pl.Series | None]:
     """`_attempt` inside its ``sluice.node.attempt`` span."""
     attributes = {"sluice.node_id": outcome.node.id, "sluice.attempt": attempt, "sluice.tier": tier}
     with tracing.span("sluice.node.attempt", attributes) as current:
         error, rewritten = await _attempt(
             run, outcome, attempt, tier, spec, source_name, shown_name, samples, prior_error,
-            values, frame, flagged_before, records,
+            values, frame, flagged_before, records, unit_issue,
         )  # fmt: skip
         current.set_attribute("sluice.outcome", "accepted" if error is None else "failed")
     return error, rewritten
@@ -559,6 +574,7 @@ async def _attempt(
     frame: pl.DataFrame,
     flagged_before: set[int],
     records: list[CallRecord],
+    unit_issue: str | None,
 ) -> tuple[str | None, pl.Series | None]:
     """One attempt: ``(None, rewritten values)`` when accepted, else ``(why, None)``.
 
@@ -568,8 +584,9 @@ async def _attempt(
     node, llm = outcome.node, run.deps.llm
     try:
         code, record = await write_transform(
-            node, spec, shown_name, samples, prior_error, tier, llm, checked=False
-        )
+            node, spec, shown_name, samples, prior_error, tier, llm, checked=False,
+            finding=unit_issue,
+        )  # fmt: skip
     except LLMOutputError as exc:
         records.append(exc.record)
         return f"the worker's output did not match the transform schema: {exc}", None
@@ -604,9 +621,16 @@ async def _attempt(
         out = out.cast(pl.String)
     if (reason := guard_output(values, out)) is not None:
         return reason, None
-    out = only_flagged(values, out.alias(source_name), flagged_before)  # Ruling F2
+    unit = unit_issue is not None
+    # Ruling F2: only flagged cells change, except for a unit node (Ruling H2c): every value
+    # of its column is in the wrong unit, so the rewrite covers every row.
+    out = (
+        out.alias(source_name)
+        if unit
+        else only_flagged(values, out.alias(source_name), flagged_before)
+    )
 
-    effect = _effect(run.case, frame, source_name, spec, values, out, flagged_before)
+    effect = _effect(run.case, frame, source_name, spec, values, out, flagged_before, unit=unit)
     if effect.error is not None:
         return effect.error, None
     try:
@@ -637,8 +661,8 @@ def only_flagged(raw: pl.Series, out: pl.Series, flagged: set[int]) -> pl.Series
 
     A rewrite may only change the cells rules pass 1 flagged for its column: a cell the rules
     parsed keeps its raw text, so a transform cannot alter a value the rules already read
-    (whatever the verifier sees). Every whole-column repair the drift ops need (paise, IST)
-    flags every row, so nothing a valid rewrite needs is lost. O(rows).
+    (whatever the verifier sees). Paise the rules can parse are the one whole-column repair
+    that needs unflagged rows; unit nodes skip this function (Ruling H2c). O(rows).
     """
     mask = pl.Series([i in flagged for i in range(raw.len())], dtype=pl.Boolean)
     merged = pl.select(pl.when(mask).then(out).otherwise(raw)).to_series()
@@ -660,14 +684,19 @@ def _effect(
     raw: pl.Series,
     out: pl.Series,
     flagged_before: set[int],
+    *,
+    unit: bool = False,
 ) -> _Effect:
     """What a rewrite does to the rules' parse of its column (one extra rules pass).
 
-    Rejects a rewrite that recovers no flagged cell, or that makes the rules flag a cell they
-    parsed before. Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a
-    duplicate copy is never mistaken for a newly broken cell. Builds the verifier's evidence:
-    raw -> rewritten pairs (flagged rows first,
-    then other changed rows, at most ``MAX_VERIFY_PAIRS``) and before/after statistics.
+    Rejects a rewrite that makes the rules flag a cell they parsed before, and then, for an
+    ordinary node, one that recovers no flagged cell. For a unit node (``unit``, Ruling H2c) the
+    second check is instead :func:`_unit_error`: no cell that held a number may lose it, and the
+    median must shrink by a factor in [:data:`UNIT_FACTOR_MIN`, :data:`UNIT_FACTOR_MAX`].
+    Flags are compared per raw row (``flagged_raw_rows``, before dedupe), so a duplicate copy
+    is never mistaken for a newly broken cell. Builds the verifier's evidence: raw ->
+    rewritten pairs (flagged rows first, then other changed rows, at most
+    ``MAX_VERIFY_PAIRS``) and before/after statistics.
     """
     contract = case.contract
     rewritten = frame.with_columns(out)
@@ -687,10 +716,18 @@ def _effect(
     if broken:
         error = (
             f"the rewrite made {len(broken)} cell(s) unparseable that the rules parsed before "
-            f"(rows {broken[:5]}); leave cells you do not need to change as they are"
+            f"(rows {broken[:5]}); "
+            + (
+                "every rewritten value must be a plain decimal the rules parse"
+                if unit
+                else "leave cells you do not need to change as they are"
+            )
         )
         return _Effect(error, [], stats)
-    if recovered == 0:
+    if unit:
+        if (error := _unit_error(raw, out)) is not None:
+            return _Effect(error, [], stats)
+    elif recovered == 0:
         error = (
             f"the rewrite recovered none of the {len(flagged_before)} flagged cell(s): the rules "
             "still cannot parse its output; follow the target format exactly"
@@ -708,6 +745,30 @@ def _effect(
             if len(pairs) == MAX_VERIFY_PAIRS:
                 break
     return _Effect(None, pairs, stats)
+
+
+def _unit_error(raw: pl.Series, out: pl.Series) -> str | None:
+    """Why a unit node's rewrite (paise -> rupees, every row) is not a ÷100 rescale, or None.
+
+    Vectorised, O(rows) plus two medians. Counts are over raw rows.
+    """
+    lost = (number_mask(raw) & ~number_mask(out)).arg_true()
+    if lost.len():
+        return (
+            f"the rewrite lost the value of {lost.len()} cell(s) that held a number "
+            f"(rows {lost.head(5).to_list()}); convert every value of this column"
+        )
+    before, after = magnitude(raw), magnitude(out)
+    if before is None or after is None or after.median == 0:
+        return "the rewrite left no number to compare: convert every value of this column"
+    factor = before.median / after.median
+    if not UNIT_FACTOR_MIN <= factor <= UNIT_FACTOR_MAX:
+        return (
+            f"the values are in paise, but the rewrite changed the median by a factor of "
+            f"{factor:.2f} (from {before.median:.2f} to {after.median:.2f}); divide every value "
+            f"by 100 (expected factor {UNIT_FACTOR_MIN:g}-{UNIT_FACTOR_MAX:g})"
+        )
+    return None
 
 
 def _numeric_stats(series: pl.Series, label: str) -> dict[str, float | int | str | None]:
