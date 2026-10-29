@@ -29,7 +29,9 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts",
     ".next-e2e/types/**/*.ts",
-    ".next-e2e/dev/types/**/*.ts"
+    ".next-e2e/dev/types/**/*.ts",
+    ".next-e2e-live/types/**/*.ts",
+    ".next-e2e-live/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules", ".next-e2e"]
+  "exclude": ["node_modules", ".next-e2e", ".next-e2e-live"]
 }
