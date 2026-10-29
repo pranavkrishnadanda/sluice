@@ -3,12 +3,17 @@
 Every 4xx/5xx body is ``{"detail": str, "code"?: str}`` (``docs/api/contract.md``). Middleware
 order, outermost first::
 
-    ServerErrorMiddleware (Starlette) -> CORSMiddleware -> InternalErrorMiddleware -> routes
+    ServerErrorMiddleware (Starlette) -> CORSMiddleware -> OriginGuardMiddleware
+        -> InternalErrorMiddleware -> routes
 
 An ``exception_handler(Exception)`` would run in Starlette's outermost ``ServerErrorMiddleware``,
 outside CORS, so the browser would see a 500 without ``Access-Control-Allow-Origin`` and report a
 network error. ``InternalErrorMiddleware`` sits *inside* CORS instead, so the generic 500 carries
 the CORS headers like every other response.
+
+There is no auth in v1: the API is meant for localhost only. ``OriginGuardMiddleware`` stops other
+web pages from driving it through the owner's browser (a cross-site multipart ``POST`` is a CORS
+"simple request", sent without a preflight).
 """
 
 import asyncio
@@ -23,6 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -42,6 +48,9 @@ from sluice.settings import get_settings
 logger = logging.getLogger(__name__)
 
 INTERNAL_DETAIL: Final = "Internal error."
+FORBIDDEN_ORIGIN_DETAIL: Final = "Origin not allowed."
+SAFE_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
+"""Methods the Origin guard lets through; CORS alone keeps foreign pages from reading them."""
 MAX_DETAIL_CHARS: Final = 500
 """Longest validation ``detail``; FastAPI messages are short, this only bounds pathological ones."""
 MAX_LOGGED_CHAIN: Final = 8
@@ -175,6 +184,34 @@ class InternalErrorMiddleware:
             await error_response(500, INTERNAL_DETAIL, "internal")(scope, receive, send)
 
 
+class OriginGuardMiddleware:
+    """Refuses unsafe-method requests whose ``Origin`` is not an allowed UI origin (Ruling F2p4).
+
+    ``CORSMiddleware`` only withholds ``Access-Control-Allow-Origin``; the request itself still
+    runs. Here a ``POST`` (or any method outside :data:`SAFE_METHODS`) carrying an ``Origin``
+    header that is not exactly one of ``ui_origins`` gets ``403 {"detail": "Origin not allowed.",
+    "code": "forbidden_origin"}`` before the body is read. Requests without ``Origin`` (curl, the
+    CLI, scripts) pass: browsers always send it on cross-origin ``POST``. ``Origin: null``
+    (sandboxed frames, ``file:``) is refused like any other foreign origin.
+    """
+
+    def __init__(self, app: ASGIApp, allowed_origins: list[str]) -> None:
+        self.app = app
+        self.allowed = frozenset(allowed_origins)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("method") not in SAFE_METHODS:
+            origin = Headers(scope=scope).get("origin")
+            if origin is not None and origin not in self.allowed:
+                logger.warning(
+                    "refused %s %s from a foreign origin", scope.get("method"), scope.get("path")
+                )
+                response = error_response(403, FORBIDDEN_ORIGIN_DETAIL, "forbidden_origin")
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create the event hub; with the worker enabled, recover interrupted runs, then start it.
@@ -255,6 +292,7 @@ def create_app(
 
     # Added first = inner: the 500 it produces still passes through CORS.
     app.add_middleware(InternalErrorMiddleware)
+    app.add_middleware(OriginGuardMiddleware, allowed_origins=list(settings.ui_origins))
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.ui_origins),

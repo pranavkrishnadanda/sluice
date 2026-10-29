@@ -179,6 +179,8 @@ make api                               # FastAPI on http://localhost:8080
 cd frontend && NEXT_PUBLIC_SLUICE_API_URL=http://localhost:8080 bun run dev
 ```
 
+There is no auth in v1: the API is meant for localhost only (it binds `127.0.0.1`). `POST` requests whose `Origin` is not an allowed UI origin are refused with `403`, so other web pages cannot queue runs through your browser; requests without an `Origin` (curl, scripts) are accepted.
+
 The API allows CORS from `http://localhost:3000` and `:3100` by default; for a UI on any other origin, start it with that origin listed, e.g. `SLUICE_UI_ORIGINS=http://localhost:3210,http://127.0.0.1:3210 make api`. See [`frontend/README.md`](frontend/README.md) for the live-backend end-to-end test.
 
 ## Read more

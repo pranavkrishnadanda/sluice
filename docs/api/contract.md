@@ -45,6 +45,7 @@ responses and its own connection copy for network errors and 5xx.
 
 | Status | When |
 | --- | --- |
+| `403` | A non-`GET` request (e.g. `POST /runs`) whose `Origin` header is not an allowed UI origin: `code` is `forbidden_origin`, answered before the body is read. Requests without `Origin` (curl, scripts) are allowed |
 | `404` | Unknown run id (any `/runs/{id}/...` route) |
 | `409` | `GET /runs/{id}/preview` when there is no preview to page: `code` is `not_loaded` (the run has not emitted `loaded`), `not_ready` (loaded, the preview is still being written; retry shortly) or `no_preview` (the run finished without a preview). See [Preview](#preview) |
 | `413` | Upload larger than **100 MB** |
@@ -66,7 +67,9 @@ responses and its own connection copy for network errors and 5xx.
   `http://localhost:3000`) on **every** route, including the SSE stream and
   error responses, and answers preflight requests allowing the
   `Last-Event-ID` request header. There are no cookies
-  (`Access-Control-Allow-Credentials` is not needed) and no auth in v1.
+  (`Access-Control-Allow-Credentials` is not needed) and no auth in v1: the
+  API is meant for localhost only. Non-`GET` requests from any other origin
+  are refused with `403 forbidden_origin` (see [Errors](#errors)).
 
 ## Types
 

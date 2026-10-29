@@ -463,6 +463,75 @@ def test_post_runs_oversized_non_file_parts_are_413(
 
 
 # --------------------------------------------------------------------------------------------
+# POST /runs: Origin guard (Ruling F2p4; a cross-site form POST is a CORS "simple request")
+# --------------------------------------------------------------------------------------------
+
+EVIL_ORIGIN = "https://evil.example"
+
+
+def test_post_runs_from_foreign_origin_is_403_and_nothing_stored(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore, worker: FakeWorker
+) -> None:
+    res = client.post(
+        "/runs",
+        files={"file": ("orders.csv", CSV, "text/csv")},
+        data={"table": "orders"},
+        headers={"Origin": EVIL_ORIGIN},
+    )
+    assert res.status_code == 403
+    assert res.json() == {"detail": "Origin not allowed.", "code": "forbidden_origin"}
+    assert worker.notified == 0
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_from_foreign_origin_is_refused_before_reading_the_body(
+    store: RouteStore, blobs: LocalBlobStore
+) -> None:
+    body = CountingBody(4 * CHUNK)
+    origin = [(b"origin", EVIL_ORIGIN.encode())]
+    status, payload = asyncio.run(_drive(_app(store, blobs), body, origin))
+    assert (status, payload["code"]) == (403, "forbidden_origin")
+    assert body.pulled == 0
+    _assert_nothing_kept(store, blobs)
+
+
+@pytest.mark.parametrize("origin", ["null", "http://localhost:3000.evil.example", "HTTP://x"])
+def test_post_runs_from_odd_origins_is_403(
+    client: TestClient, store: RouteStore, origin: str
+) -> None:
+    res = client.post(
+        "/runs",
+        files={"file": ("orders.csv", CSV, "text/csv")},
+        data={"table": "orders"},
+        headers={"Origin": origin},
+    )
+    assert res.status_code == 403
+    assert store.runs == {}
+
+
+def test_post_runs_from_ui_origin_is_201_with_cors_header(client: TestClient) -> None:
+    ui = "http://localhost:3000"
+    res = client.post(
+        "/runs",
+        files={"file": ("orders.csv", CSV, "text/csv")},
+        data={"table": "orders"},
+        headers={"Origin": ui},
+    )
+    assert res.status_code == 201
+    assert res.headers["access-control-allow-origin"] == ui
+
+
+def test_post_runs_without_origin_is_allowed(client: TestClient) -> None:
+    assert _post(client).status_code == 201  # curl, the CLI and scripts send no Origin
+
+
+def test_get_runs_from_foreign_origin_keeps_cors_only_behaviour(client: TestClient) -> None:
+    res = client.get("/runs", headers={"Origin": EVIL_ORIGIN})
+    assert res.status_code == 200
+    assert "access-control-allow-origin" not in res.headers
+
+
+# --------------------------------------------------------------------------------------------
 # File names
 # --------------------------------------------------------------------------------------------
 
