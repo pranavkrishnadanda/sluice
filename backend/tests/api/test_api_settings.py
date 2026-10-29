@@ -25,7 +25,7 @@ def test_api_settings_defaults() -> None:
     assert settings.ui_origins == list(DEFAULT_UI_ORIGINS)
     assert settings.max_upload_bytes == 100 * 1024 * 1024
     assert settings.concurrency == 1
-    assert settings.keepalive_s == 15.0
+    assert settings.keepalive_s == 10.0
     assert settings.landing_bucket == "sluice-landing"
 
 
