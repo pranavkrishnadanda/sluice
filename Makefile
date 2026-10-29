@@ -1,4 +1,4 @@
-.PHONY: test test-all test-integration lint fmt cases eval-rules results up down ps sandbox-image api
+.PHONY: test test-all test-integration lint fmt cases eval-rules results up up-obs down ps sandbox-image api
 
 # Default selection (pyproject addopts) excludes integration, live and slow.
 test:
@@ -43,8 +43,13 @@ COMPOSE = docker compose --env-file backend/.env
 up:
 	$(COMPOSE) up -d --wait
 
+# `up` plus Phoenix (traces UI and OTLP collector on 127.0.0.1:56006). Export traces by setting
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:56006 in backend/.env (see .env.example).
+up-obs:
+	$(COMPOSE) --profile observability up -d --wait
+
 down:
-	$(COMPOSE) down
+	$(COMPOSE) --profile observability down
 
 ps:
 	$(COMPOSE) ps

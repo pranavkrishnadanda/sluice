@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sluice import tracing
 from sluice.api.schemas import ErrorBody
 from sluice.api.settings import ApiSettings
 
@@ -203,6 +204,7 @@ def create_app(
         blobs: The blob store (typed in Task 2); kept on ``app.state.blobs``.
         worker: Start the in-process job worker. Tests pass ``False``.
     """
+    tracing.setup_tracing()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
     if settings is None:
         settings = ApiSettings()
     app = FastAPI(title="Sluice API", version="1")
