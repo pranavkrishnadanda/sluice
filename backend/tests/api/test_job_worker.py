@@ -1036,3 +1036,38 @@ def test_recover_run_holding_run_finished_after_loaded_answers_no_preview(
 
     assert store.get_run("r1").status == "succeeded"  # type: ignore[union-attr]
     assert _preview_code(store, blobs) == "no_preview"
+
+
+# --------------------------------------------------------------------------------------------
+# Decompression bomb (Ruling F3p4): refused from the footer before the worker reads the file
+# --------------------------------------------------------------------------------------------
+
+
+def test_worker_fails_a_parquet_bomb_without_reading_it(
+    blobs: LocalBlobStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io as std_io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from sluice import io as sluice_io
+    from sluice.runs.execute import DECODED_TOO_LARGE_SUMMARY
+
+    store = FakeStore()
+    store.add("r1")
+    buffer = std_io.BytesIO()
+    pq.write_table(pa.table({"o_orderkey": pa.nulls(sluice_io.MAX_PARQUET_ROWS + 1)}), buffer)
+    row = store.runs["r1"]
+    store.runs["r1"] = row.model_copy(update={"blob_key": "uploads/r1/input.parquet"})
+    blobs.put_bytes("uploads/r1/input.parquet", buffer.getvalue())
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("the worker must not read a refused file in full")
+
+    monkeypatch.setattr(sluice_io.pl, "read_parquet", refuse)
+    _run(lambda: _drive(store, blobs, execute_run, "r1"))
+    assert store.types("r1") == ["run_started", "run_finished"]
+    terminal = store.events_after("r1", 0)[-1]
+    assert (terminal.status, terminal.summary) == ("failed", DECODED_TOO_LARGE_SUMMARY)  # type: ignore[attr-defined]
+    assert store.get_run("r1").status == "failed"  # type: ignore[union-attr]

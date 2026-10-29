@@ -13,7 +13,8 @@ Upload (``docs/api/contract.md``, "Upload"):
   displayed (:func:`sanitise_file_name`) and never touches a path.
 * Order: ``unknown table`` is known as soon as the ``table`` field arrives (before the file when
   the client sends it first); the extension is checked on the file part's headers, before any
-  of its bytes are stored. After the stream: parse check (``read_input``) and SHA-256 in a
+  of its bytes are stored. After the stream: parse check (``read_input``, which checks a
+  Parquet footer for a decompression bomb before reading the data) and SHA-256 in a
   thread, then the row is inserted and the worker is woken. Any failure after the blob was
   written deletes it.
 
@@ -47,7 +48,7 @@ from sluice.api.errors import ApiError
 from sluice.api.schemas import DataPreview, RunSummary, Transform
 from sluice.api.store import MAX_FILE_NAME_CHARS, TERMINAL_STATUSES, RunRow, RunStore
 from sluice.contracts.model import Contract, load_contract
-from sluice.io import read_input
+from sluice.io import DecodedTooLarge, read_input
 from sluice.runs.execute import file_sha256
 from sluice.runs.preview import PREVIEW_MAX_LIMIT, page_preview
 
@@ -68,6 +69,9 @@ TOO_LARGE_DETAIL: Final = "File too large: the limit is 100 MB."
 UNSUPPORTED_DETAIL: Final = "Unsupported file format: upload a .csv, .json or .parquet file."
 UNKNOWN_TABLE_DETAIL: Final = "Unknown table: choose orders or lineitem."
 UNPARSEABLE_DETAIL: Final = "The file could not be read in its format."
+DECODED_TOO_LARGE_DETAIL: Final = (
+    "File too large once decoded: the limit is 5,000,000 rows or 1 GiB of data."
+)
 RUN_NOT_FOUND: Final = "Run not found."
 NOT_LOADED_DETAIL: Final = "The preview is available once the run has loaded its data."
 NOT_READY_DETAIL: Final = "The preview is not ready yet."
@@ -340,10 +344,17 @@ async def _receive(
 
 
 def _check_and_hash(blobs: BlobStore, key: str) -> str:
-    """Parse-check the stored upload and return its SHA-256 (blocking)."""
+    """Parse-check the stored upload and return its SHA-256 (blocking).
+
+    A Parquet file is first checked from its footer (``read_input`` -> ``check_decoded_size``,
+    Ruling F3p4), so a decompression bomb is refused without being read in full.
+    """
     with blobs.open_local(key) as path:
         try:
             read_input(path)
+        except DecodedTooLarge:
+            _log.info("upload %s declares too much data", key)
+            raise ApiError(422, DECODED_TOO_LARGE_DETAIL, "too_large_decoded") from None
         except MemoryError:
             raise
         except Exception as exc:  # polars, decoding and shape errors alike mean "unparseable"

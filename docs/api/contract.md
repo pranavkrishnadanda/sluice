@@ -51,6 +51,7 @@ responses and its own connection copy for network errors and 5xx.
 | `413` | Upload larger than **100 MB** |
 | `415` | Upload with an unsupported file format |
 | `422` | Unknown `table`, a missing form field, or a file that cannot be parsed in its format |
+| `422` | `code: "too_large_decoded"`: a `.parquet` upload whose footer declares more than **5,000,000 rows** or more than **1 GiB** of decoded data (checked before the data is read) |
 
 ## Base URL, CORS and configuration
 
@@ -166,6 +167,9 @@ Path parameters are URL-encoded. Unknown run ids return `404`.
   may also check the content). Anything else is `415`.
 - Size limit: **100 MB**; larger uploads are `413`.
 - An unknown `table` or an unparseable file is `422`.
+- A `.parquet` file is also `422` (`too_large_decoded`) when its footer
+  declares more than 5,000,000 rows or more than 1 GiB of decoded data: a
+  small, highly compressed file can expand far beyond 100 MB in memory.
 - The new run's `rows` is `null` until the file has been profiled.
 
 ### Run summaries

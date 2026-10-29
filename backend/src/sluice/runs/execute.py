@@ -26,7 +26,9 @@ Outcome (Rulings F1, L1, C1-C4c, unchanged from the plan-2 CLI):
   output, for the rules-only system). ``failed`` loads nothing and claims no key; any other
   status is handed to ``load_fn`` (which re-checks the key under its locks);
 * an exception emits ``run_finished(failed)`` (the summary names only the exception type: messages
-  can carry connection strings or host paths) and is re-raised.
+  can carry connection strings or host paths) and is re-raised. A Parquet input whose footer
+  declares too much data (:class:`~sluice.io.DecodedTooLarge`, Ruling F3p4) is refused before
+  anything reads it in full, with :data:`DECODED_TOO_LARGE_SUMMARY`.
 
 Blocking: the system call and the load are synchronous (seconds to minutes); the API worker
 runs this in a thread. Memory: the input frame (read once here for the row count, again by the
@@ -56,7 +58,7 @@ from sluice.contracts.model import Contract, load_contract
 from sluice.drift.cases import load_reference
 from sluice.evals.runner import SYSTEMS
 from sluice.evals.types import CaseInput, SystemOutput
-from sluice.io import read_input
+from sluice.io import DecodedTooLarge, check_decoded_size, read_input
 from sluice.load.iceberg import LoadResult, find_load, load_output
 from sluice.settings import Settings, get_settings
 
@@ -73,6 +75,7 @@ _log = logging.getLogger(__name__)
 
 HASH_CHUNK_BYTES: Final = 1 << 20
 OWN_EVENTS: Final = frozenset({"run_started", "loaded", "run_finished"})
+DECODED_TOO_LARGE_SUMMARY: Final = "the file is too large once decoded"
 """Event types :func:`execute_run` emits itself; a pipeline's own are never forwarded."""
 
 RunFn = Callable[[CaseInput], SystemOutput]
@@ -249,13 +252,19 @@ def execute_run(
             RunStarted(run_id=run_id, file_name=path.name, table=table, rows=_count_rows(path))  # type: ignore[arg-type]
         )
         try:
+            check_decoded_size(path)  # footer only; _count_rows above already refused it
             ending = _run_and_load(
                 path, contract, run_id, log, run_fn, load_fn, loaded_fn, settings_fn,
                 reference_fn, on_transform,
             )  # fmt: skip
         except Exception as exc:
             root.set_attribute("sluice.status", "failed")
-            log.publish(log.finished("failed", type(exc).__name__))
+            summary = (
+                DECODED_TOO_LARGE_SUMMARY
+                if isinstance(exc, DecodedTooLarge)
+                else type(exc).__name__
+            )
+            log.publish(log.finished("failed", summary))
             raise
         root.set_attribute("sluice.status", ending.outcome.status)
         if ending.loaded is not None:

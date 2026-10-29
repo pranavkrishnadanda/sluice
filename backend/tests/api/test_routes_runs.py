@@ -27,6 +27,7 @@ from sluice.agent.events import EventLog, EventModel
 from sluice.api.app import create_app
 from sluice.api.blobs import LocalBlobStore
 from sluice.api.routes_runs import (
+    DECODED_TOO_LARGE_DETAIL,
     MAX_FIELD_BYTES,
     PREVIEW_SAVE_GRACE_S,
     TOO_LARGE_DETAIL,
@@ -295,6 +296,29 @@ def test_post_runs_unparseable_is_422_and_blob_deleted(
     res = _post(client, name=name, data=data)
     assert res.status_code == 422
     assert res.json()["code"] == "unparseable"
+    _assert_nothing_kept(store, blobs)
+
+
+def test_post_runs_parquet_declaring_too_much_data_is_422_too_large_decoded(
+    client: TestClient, store: RouteStore, blobs: LocalBlobStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling F3p4: a few KB of Parquet declaring 5M+ rows is refused from its footer."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from sluice import io as sluice_io
+
+    buffer = io.BytesIO()
+    pq.write_table(pa.table({"o_orderkey": pa.nulls(sluice_io.MAX_PARQUET_ROWS + 1)}), buffer)
+    assert len(buffer.getvalue()) < 64 * 1024
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("no full read of a refused upload")
+
+    monkeypatch.setattr(sluice_io.pl, "read_parquet", refuse)
+    res = _post(client, name="bomb.parquet", data=buffer.getvalue())
+    assert res.status_code == 422
+    assert res.json() == {"detail": DECODED_TOO_LARGE_DETAIL, "code": "too_large_decoded"}
     _assert_nothing_kept(store, blobs)
 
 
