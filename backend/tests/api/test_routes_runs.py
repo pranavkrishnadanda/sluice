@@ -695,7 +695,7 @@ def _finished_loaded_run(store: RouteStore, *, finished_s_ago: float) -> None:
 def test_get_preview_finished_but_preview_not_saved_yet_is_409_not_ready(
     client: TestClient, store: RouteStore
 ) -> None:
-    # run_finished (and the terminal status) come before the preview is written (B2).
+    # run_finished (and the terminal status) come before the preview is written.
     _finished_loaded_run(store, finished_s_ago=0.5)
     store.append_transform("r1", _transform("n-a", 1, True))  # live transforms, no preview
     res = client.get("/runs/r1/preview")

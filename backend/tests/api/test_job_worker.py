@@ -34,8 +34,9 @@ from sluice.agent import events as ev
 from sluice.agent.events import EventLog, EventModel
 from sluice.agent.pipeline import transform_id
 from sluice.api.blobs import LocalBlobStore
+from sluice.api.errors import ApiError
 from sluice.api.hub import EventHub
-from sluice.api.routes_runs import _transforms
+from sluice.api.routes_runs import _preview, _transforms
 from sluice.api.store import TERMINAL_STATUSES, RunRow
 from sluice.api.worker import RESTART_SUMMARY, Worker
 from sluice.contracts.model import Contract
@@ -727,7 +728,7 @@ def test_recover_closes_every_interrupted_run(blobs: LocalBlobStore) -> None:
 
 
 # --------------------------------------------------------------------------------------------
-# Live transforms and the finished status (Task 8 fix round 1: B1, B2)
+# Live transforms, and the terminal status before run_finished is delivered
 # --------------------------------------------------------------------------------------------
 
 
@@ -900,3 +901,138 @@ def test_worker_transform_hook_store_failure_does_not_fail_the_run(
 
     assert store.finished == [("r1", "succeeded", 0.0)]
     assert [t["transform_id"] for t in store.artefacts["r1"].transforms] == ["r1-n1-1"]
+
+
+# --------------------------------------------------------------------------------------------
+# Failed and recovered runs settle their preview (no_preview at once, not after the grace)
+# --------------------------------------------------------------------------------------------
+
+
+def _preview_code(store: FakeStore, blobs: LocalBlobStore) -> str | None:
+    """The preview route's 409 ``code`` for ``r1`` (``None`` if it returned a page)."""
+    try:
+        _preview(store, blobs, "r1", 0, 10)  # type: ignore[arg-type]
+    except ApiError as exc:
+        return exc.code
+    return None
+
+
+def _loaded() -> ev.Loaded:
+    return ev.Loaded(rows_loaded=1, rows_quarantined=0, snapshot_id="s")
+
+
+def test_worker_run_failing_after_loaded_answers_no_preview_at_once(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    record = _transform("n1", 1, True)
+    inner = scripted([started("r1"), _loaded()], raises=RuntimeError("boom"))
+
+    def execute(path: Path, table: str, *, run_id: str, emit: Any, **kw: Any) -> RunOutcome:
+        kw["on_transform"](record)
+        return inner(path, table, run_id=run_id, emit=emit, **kw)
+
+    _run(lambda: _drive(store, blobs, execute, "r1"))
+
+    assert store.get_run("r1").status == "failed"  # type: ignore[union-attr]
+    assert _preview_code(store, blobs) == "no_preview"
+    assert [t["transform_id"] for t in store.artefacts["r1"].transforms] == ["r1-n1-1"]
+
+
+def test_worker_run_missing_its_run_finished_after_loaded_answers_no_preview(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+
+    def execute(path: Path, table: str, *, run_id: str, emit: Any, **kw: Any) -> RunOutcome:
+        log = EventLog()
+        emit(log.emit(started("r1")))
+        emit(log.emit(_loaded()))
+        return RunOutcome(result=None, status="succeeded", output=None, cost_usd=0.0, tokens=0)
+
+    _run(lambda: _drive(store, blobs, execute, "r1"))
+
+    assert store.terminals("r1")[0].summary == "MissingRunFinished"
+    assert _preview_code(store, blobs) == "no_preview"
+
+
+def test_worker_run_cancelled_after_loaded_answers_no_preview(blobs: LocalBlobStore) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    entered, release = threading.Event(), threading.Event()
+
+    def execute(path: Path, table: str, *, run_id: str, emit: Any, **kw: Any) -> Any:
+        log = EventLog()
+        emit(log.emit(started("r1")))
+        emit(log.emit(_loaded()))
+        entered.set()
+        release.wait(5)
+        emit(log.emit(finished()))  # refused: the run was closed
+        raise AssertionError("unreachable")
+
+    async def go() -> None:
+        worker = _worker(store, blobs, EventHub(), execute)
+        await worker.start()
+        await asyncio.to_thread(entered.wait, 5)
+        try:
+            await worker.stop(timeout_s=0.05)
+        finally:
+            release.set()
+        await asyncio.sleep(0.1)
+
+    _run(go)
+    assert store.terminals("r1")[0].summary == "CancelledError"
+    assert _preview_code(store, blobs) == "no_preview"
+
+
+def test_worker_settling_a_failed_run_is_best_effort(blobs: LocalBlobStore) -> None:
+    store = FakeStore()
+    store.add("r1")
+    _upload(blobs, "r1")
+    store.fail_save = True
+    execute = scripted([started("r1"), _loaded()], raises=RuntimeError("boom"))
+
+    _run(lambda: _drive(store, blobs, execute, "r1"))
+
+    assert store.finished == [("r1", "failed", 0.0)]
+    assert len(store.terminals("r1")) == 1
+
+
+def test_recover_interrupted_run_after_loaded_answers_no_preview(blobs: LocalBlobStore) -> None:
+    store = FakeStore()
+    store.add("r1", status="running")
+    store.append_event("r1", _stamp(started("r1"), 1))
+    store.append_event("r1", _stamp(_loaded(), 2))
+    store.append_transform("r1", _transform("n1", 1, True))
+
+    async def go() -> None:
+        await _worker(store, blobs, EventHub(), scripted([])).recover()
+
+    _run(go)
+
+    assert store.get_run("r1").status == "failed"  # type: ignore[union-attr]
+    assert _preview_code(store, blobs) == "no_preview"
+    assert [t["transform_id"] for t in store.artefacts["r1"].transforms] == ["r1-n1-1"]
+
+
+def test_recover_run_holding_run_finished_after_loaded_answers_no_preview(
+    blobs: LocalBlobStore,
+) -> None:
+    store = FakeStore()
+    store.add("r1", status="running")
+    store.append_event("r1", _stamp(started("r1"), 1))
+    store.append_event("r1", _stamp(_loaded(), 2))
+    store.append_event("r1", _stamp(finished("succeeded"), 3))
+
+    async def go() -> None:
+        await _worker(store, blobs, EventHub(), scripted([])).recover()
+
+    _run(go)
+
+    assert store.get_run("r1").status == "succeeded"  # type: ignore[union-attr]
+    assert _preview_code(store, blobs) == "no_preview"

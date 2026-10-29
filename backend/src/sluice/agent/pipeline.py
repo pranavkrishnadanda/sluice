@@ -510,6 +510,8 @@ def _hand_over_transform(run: _Run, outcome: _NodeOutcome, attempt: int) -> None
     hook = run.case.on_transform
     if hook is None or not outcome.transforms:
         return
+    # _attempt appends at most one record per attempt, and attempts of a node run in order,
+    # so the last record is this attempt's if it produced code; else it is an earlier one's.
     record = outcome.transforms[-1]
     if record["attempt"] == attempt:
         hook(dict(record))

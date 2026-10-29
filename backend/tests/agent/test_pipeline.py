@@ -1050,7 +1050,7 @@ def test_pipeline_meta_mapping_without_a_model_mapping_follows_the_rules(indian:
     assert result.out.meta["mapping"]["o_totalprice"] == "o_totalprice"
 
 
-# --------------------------------------------------------------------------- plan 4 (Task 8)
+# --------------------------------------------------------------------------- live transform hook
 
 
 def _trail(case: Case, script: Script) -> tuple[Result, list[tuple[str, Any]]]:

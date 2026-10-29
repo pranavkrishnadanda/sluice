@@ -276,6 +276,23 @@ def test_save_artefacts_reconciles_live_transforms_by_id(store: RunStore) -> Non
     ]
 
 
+def test_save_artefacts_without_preview_or_transforms_settles_and_keeps_live_ones(
+    store: RunStore,
+) -> None:
+    # The worker's settle step for a failed, cancelled or recovered run.
+    _create(store, "r1")
+    store.append_transform("r1", _record("t1", 1, False))
+    store.save_artefacts("r1", preview_key=None, transforms=[])
+    art = store.get_artefacts("r1")
+    assert art is not None
+    assert (art.preview_key, art.saved) == (None, True)
+    assert [t["transform_id"] for t in art.transforms] == ["t1"]
+    _create(store, "r2")  # no live transforms: the row is created, settled and empty
+    store.save_artefacts("r2", preview_key=None, transforms=[])
+    art = store.get_artefacts("r2")
+    assert art is not None and art.saved and art.transforms == []
+
+
 def test_ensure_schema_marks_artefacts_saved_before_the_column_existed(store: RunStore) -> None:
     _create(store, "r1")
     with psycopg.connect(store._dsn, connect_timeout=5, autocommit=True) as conn:

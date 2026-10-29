@@ -38,6 +38,7 @@ class FakeStore:
         self.commit_then_fail: Callable[[EventModel], bool] = lambda _e: False
         """Store the event, then raise as if the connection dropped before the commit ack."""
         self.fail_transform = False
+        self.fail_save = False
 
     def add(self, run_id: str, *, status: str = "queued", cost: float = 0.0) -> None:
         self.runs[run_id] = RunRow(
@@ -130,6 +131,8 @@ class FakeStore:
     ) -> None:
         """Like ``RunStore.save_artefacts``: ``transforms`` win by id, others are kept."""
         with self.lock:
+            if self.fail_save:
+                raise ConnectionError("postgres is down")
             ids = {t.get("transform_id") for t in transforms}
             current = self.artefacts.get(run_id)
             kept = [] if current is None else current.transforms

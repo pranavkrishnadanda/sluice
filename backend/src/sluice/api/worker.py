@@ -215,6 +215,7 @@ class Worker:
         last = events[-1] if events else None
         if isinstance(last, RunFinished):
             self._store.finish(row.id, last.status, last.cost_usd)
+            self._settle(row.id)
             return
         terminal = RunFinished(
             status="failed",
@@ -226,6 +227,7 @@ class Worker:
         )
         self._store.append_event(row.id, terminal)
         self._store.finish(row.id, "failed", row.cost_usd)
+        self._settle(row.id)
 
     # ---- scheduling ------------------------------------------------------------------------
 
@@ -248,7 +250,13 @@ class Worker:
         try:
             await asyncio.to_thread(self._run_sync, row, state)
         except asyncio.CancelledError:
-            await asyncio.to_thread(self._close_failed, row.id, state, "CancelledError")
+            closed_here = await asyncio.to_thread(
+                self._close_failed, row.id, state, "CancelledError"
+            )
+            # Settle only a run this coroutine closed: after the run's own run_finished its
+            # thread may still be saving the real preview, which must not be overwritten.
+            if closed_here:
+                await asyncio.to_thread(self._settle, row.id)
             raise
         finally:
             self._hub.close(row.id)
@@ -273,13 +281,16 @@ class Worker:
             # or by the cancelling coroutine (already finished; RunNotActive is ignored).
             if state.finished is not None:
                 self._finish_once(row.id, state)
+            self._settle(row.id)
             return
         except Exception as exc:
             _log.warning("run %s raised %s", row.id, _type_name(exc))
             self._close_failed(row.id, state, _type_name(exc))
+            self._settle(row.id)
             return
         if state.finished is None:  # execute returned without a stored terminal event
             self._close_failed(row.id, state, "MissingRunFinished")
+            self._settle(row.id)
             return
         self._save_and_finish(row.id, state, *artefacts)
 
@@ -298,7 +309,8 @@ class Worker:
             self._track(run_id, state, stamped)
 
     def _publish(self, run_id: str, state: _RunState, event: EventModel) -> None:
-        """Publish a stored event; a ``run_finished`` is first ``store.finish``-ed (B2).
+        """Publish a stored event; a ``run_finished`` is first ``store.finish``-ed, so a client
+        that refetches ``GET /runs`` on receiving it already sees the terminal status.
 
         Caller holds ``state.lock``. A failed ``finish`` is logged and retried once the run's
         thread is done; the event is published either way (it is stored).
@@ -314,6 +326,8 @@ class Worker:
         Best effort: a store failure is logged (the end-of-run save carries every record), and
         records from a run already closed are dropped.
         """
+        # Read without state.lock: the hook runs on the run's own thread, and a stale False
+        # only lets one more (idempotent, harmless) append through after a concurrent close.
         if state.closed:
             return
         try:
@@ -344,17 +358,34 @@ class Worker:
             except Exception as exc:  # informational only; the run goes on
                 _log.warning("progress update of run %s failed: %s", run_id, _type_name(exc))
 
-    def _close_failed(self, run_id: str, state: _RunState, summary: str) -> None:
-        """Append our own ``run_finished(failed)`` unless one is recorded, then finish."""
+    def _close_failed(self, run_id: str, state: _RunState, summary: str) -> bool:
+        """Append our own ``run_finished(failed)`` unless one is recorded, then finish.
+
+        Returns ``True`` when this call stored the terminal event (none was recorded before).
+        """
         with state.lock:
             state.closed = True
-            if state.finished is None:
+            created = state.finished is None
+            if created:
                 state.finished = self._append_terminal(run_id, state, summary)
             terminal = state.finished
         if terminal is None:
             _log.error("run %s: no run_finished could be stored; left for recovery", run_id)
-            return
+            return False
         self._finish_once(run_id, state)
+        return created
+
+    def _settle(self, run_id: str) -> None:
+        """Mark the artefacts of a run that ends without a preview as saved (best effort).
+
+        Without this a failed, cancelled or recovered run that had emitted ``loaded`` would
+        answer ``409 not_ready`` until the route's grace period ran out, instead of
+        ``no_preview`` at once. ``save_artefacts`` keeps the transforms appended live.
+        """
+        try:
+            self._store.save_artefacts(run_id, preview_key=None, transforms=[])
+        except Exception as exc:
+            _log.error("run %s: settling the artefacts failed: %s", run_id, _type_name(exc))
 
     def _append_terminal(self, run_id: str, state: _RunState, summary: str) -> RunFinished | None:
         """Store and publish ``run_finished(failed)`` at the next ``seq`` (caller holds lock).
