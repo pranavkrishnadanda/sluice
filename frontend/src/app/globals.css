@@ -374,6 +374,23 @@ html[data-reduce-transparency] .glass {
   backdrop-filter: none;
 }
 
+/*
+ * With solid glass there is nothing for the blurred colour blobs to show
+ * through, so drop them and keep the plain --bg gradient. Besides sparing
+ * three 72px blur filters, this keeps the layer under every panel uniform:
+ * a blob's box no longer sits under some lines of a text block and not
+ * others, which leaves axe unable to resolve (and so to check) its contrast.
+ */
+@media (prefers-reduced-transparency: reduce) {
+  .blob {
+    display: none;
+  }
+}
+
+html[data-reduce-transparency] .blob {
+  display: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   ::before,
