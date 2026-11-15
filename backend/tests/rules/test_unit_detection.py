@@ -11,6 +11,7 @@ import pytest
 from sluice.contracts.model import Contract, load_contract
 from sluice.rules.fixers import apply_rules
 from sluice.rules.profile import (
+    UNIT_MIN_PAISE_MEDIAN,
     UNIT_MIN_VALUES,
     approx,
     magnitude,
@@ -178,9 +179,37 @@ def test_profile_unit_issue_never_shows_an_exact_median(orders: Contract) -> Non
     assert not any(p in detail for p in prices)
 
 
-def test_profile_reports_a_genuine_whole_rupee_column_as_paise_known_limitation(
+def test_profile_no_unit_issue_for_genuine_whole_rupee_column(
     orders: Contract,
 ) -> None:
-    """Pins today's behaviour: H2a cannot tell whole rupees from whole paise (documented)."""
+    """Mostly whole rupees are valid input; forcing a unit repair would divide them by 100."""
     whole_rupees = [str(1_500 + 50 * i) for i in range(60)]  # real INR, no paise at all
-    assert "o_totalprice" in profile(_orders_frame(whole_rupees), orders).unit_issues
+    assert not profile(_orders_frame(whole_rupees), orders).unit_issues
+
+
+def test_profile_no_unit_issue_for_unbounded_low_value_whole_rupees(lineitem: Contract) -> None:
+    prices = [str(1_500 + i) for i in range(60)]
+    df = pl.DataFrame(
+        {
+            "l_orderkey": [str(i) for i in range(60)],
+            "l_linenumber": ["1"] * 60,
+            "l_extendedprice": prices,
+        }
+    )
+
+    assert not profile(df, lineitem).unit_issues
+
+
+def test_profile_unit_issue_for_unbounded_high_magnitude_whole_paise(
+    lineitem: Contract,
+) -> None:
+    prices = [str(int(UNIT_MIN_PAISE_MEDIAN) + 1_000 * i) for i in range(60)]
+    df = pl.DataFrame(
+        {
+            "l_orderkey": [str(i) for i in range(60)],
+            "l_linenumber": ["1"] * 60,
+            "l_extendedprice": prices,
+        }
+    )
+
+    assert "l_extendedprice" in profile(df, lineitem).unit_issues

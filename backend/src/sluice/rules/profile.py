@@ -12,14 +12,11 @@ Ties: an exact name match always wins. Otherwise, if two or more input columns n
 same contract column, none of them is matched (ambiguity is never resolved by guessing).
 
 Unit check (Ruling H2a): for a matched contract column with ``unit: INR`` and dtype ``decimal``
-the profile also reports, in ``unit_issues``, values that look like whole paise (the drift op
-``unit_paise``: rupees x 100 with no fractional part). It is a report only: the rules never act
-on it, so :func:`sluice.rules.fixers.apply_rules` output does not depend on it.
-
-Known limitation (deliberate, H2a): the check only sees the share of whole numbers, never the
-unit, so a genuine INR column in which at least 98% of the amounts are whole rupees (``1500``,
-``2300``) is reported as paise too. With Ruling U1 such a file is then quarantined whole unless
-a unit node is accepted. The contracts' money columns carry paise as decimals, so this is rare.
+the profile also reports, in ``unit_issues``, high-confidence values that look like whole paise
+(the drift op ``unit_paise``: rupees x 100 with no fractional part). It is a report only: the
+rules never act on it, so :func:`sluice.rules.fixers.apply_rules` output does not depend on it.
+The profile deliberately does not report plausible whole-rupee values as paise: Ruling U1 makes
+a reported unit issue mandatory to repair, so false positives can corrupt or quarantine good data.
 
 Complexity: O(rows x columns) for the null/distinct statistics, O(columns) for matching, plus one
 vectorised O(rows) pass (and an O(rows log rows) median/quantile) per INR column.
@@ -45,6 +42,8 @@ UNIT_MIN_VALUES: Final = 50
 """Fewest parseable values the paise check needs before it says anything."""
 UNIT_WHOLE_SHARE: Final = 0.98
 """Share of whole-number values at or above which an INR column looks like paise."""
+UNIT_MIN_PAISE_MEDIAN: Final = 100_000.0
+"""Smallest median for a no-max INR column before whole numbers are suspicious enough."""
 
 _NUMBER_NOISE = r"[,\s]"  # Indian grouping commas and whitespace, removed before parsing
 _NUMBER = r"^-?[0-9]+(\.[0-9]+)?$"  # ASCII digits only, like the rules (no Devanagari digits)
@@ -203,18 +202,31 @@ def approx(value: float) -> str:
     return f"≈ {rounded:g}"
 
 
+def _unit_magnitude_suspicious(stats: Magnitude, spec: ColumnSpec) -> bool:
+    """Whether the column is too large to be ordinary whole rupees for this contract."""
+    if spec.max is not None:
+        return stats.p95 > spec.max
+    return stats.median >= UNIT_MIN_PAISE_MEDIAN
+
+
 def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
     """Why ``series`` looks like whole paise for an INR decimal column, else ``None``.
 
     Fires when at least :data:`UNIT_MIN_VALUES` cells parse and at least
-    :data:`UNIT_WHOLE_SHARE` of them are whole numbers (Ruling H2a). Genuine rupee amounts
-    carry paise as decimals, so almost none of them are whole. Limitation: a genuine INR column
-    of mostly whole-rupee amounts is reported too (see the module docstring).
+    :data:`UNIT_WHOLE_SHARE` of them are whole numbers (Ruling H2a), and the values are too
+    large to be ordinary whole rupees for the contract. Genuine rupee amounts carry paise as
+    decimals, but all-whole input can still be valid; only escalate when the magnitude makes the
+    paise interpretation high-confidence enough for the forced-repair path.
     """
     if spec.unit != UNIT_CHECKED or spec.dtype != "decimal":
         return None
     stats = magnitude(series)
-    if stats is None or stats.count < UNIT_MIN_VALUES or stats.whole_share < UNIT_WHOLE_SHARE:
+    if (
+        stats is None
+        or stats.count < UNIT_MIN_VALUES
+        or stats.whole_share < UNIT_WHOLE_SHARE
+        or not _unit_magnitude_suspicious(stats, spec)
+    ):
         return None
     share = int(stats.whole_share * 100)  # floored: never shows 98% for 97.9%
     return (
