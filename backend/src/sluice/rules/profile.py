@@ -43,7 +43,7 @@ UNIT_MIN_VALUES: Final = 50
 UNIT_WHOLE_SHARE: Final = 0.98
 """Share of whole-number values at or above which an INR column looks like paise."""
 UNIT_MIN_PAISE_MEDIAN: Final = 100_000.0
-"""Smallest median for a no-max INR column before whole numbers are suspicious enough."""
+"""Smallest median before whole-number INR values are suspicious enough."""
 
 _NUMBER_NOISE = r"[,\s]"  # Indian grouping commas and whitespace, removed before parsing
 _NUMBER = r"^-?[0-9]+(\.[0-9]+)?$"  # ASCII digits only, like the rules (no Devanagari digits)
@@ -204,9 +204,9 @@ def approx(value: float) -> str:
 
 def _unit_magnitude_suspicious(stats: Magnitude, spec: ColumnSpec) -> bool:
     """Whether the column is too large to be ordinary whole rupees for this contract."""
-    if spec.max is not None:
-        return stats.p95 > spec.max
-    return stats.median >= UNIT_MIN_PAISE_MEDIAN
+    return stats.median >= UNIT_MIN_PAISE_MEDIAN or (
+        spec.max is not None and stats.p95 > spec.max
+    )
 
 
 def unit_issue(series: pl.Series, spec: ColumnSpec) -> str | None:
