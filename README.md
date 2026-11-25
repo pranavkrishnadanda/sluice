@@ -190,3 +190,11 @@ The API allows CORS from `http://localhost:3000` and `:3100` by default; for a U
 - [Plan 2: agent pipeline](docs/superpowers/plans/2026-10-28-sluice-v1-p2-agent-pipeline.md)
 - [Plan 4: API server, live UI, traces](docs/superpowers/plans/2026-10-29-sluice-v1-p4-api.md)
 - [API and event contract](docs/api/contract.md)
+
+## How it was built
+
+Designed and directed by Pranav Krishna Danda, using an agent-driven plan and spec workflow. Most of the code was written with AI coding agents (Claude) under that design; every change is checked by the test suite and CI, and accuracy claims are graded by code against exact ground truth.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
